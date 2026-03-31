@@ -211,6 +211,7 @@ bool solveForSubInventory(int target_rows, const vector<int>& sub_inv, const int
         for (int row_idx : sol) {
             if (all_actions[row_idx].rot_idx == -1) continue;
             for (const auto& pt : all_actions[row_idx].absolute_coords) {
+                // 已彻底修复此处：使用 pt.x 和 pt.y
                 temp_board[pt.x][pt.y] = all_actions[row_idx].shape_type + 1; // 1-7代表颜色
             }
         }
@@ -321,22 +322,75 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
     }
 
     if (global_best_score != -1) {
-        // 拓扑排序：生成符合物理重力支撑的序列
+        // 1. 提取完美矩形用到的核心方块
+        vector<Action> final_actions;
+        int used_count[7] = {0};
+        for(int r : global_best_solution) {
+            if (global_best_actions[r].rot_idx == -1) continue;
+            final_actions.push_back(global_best_actions[r]);
+            used_count[global_best_actions[r].shape_type]++;
+        }
+
+        // 2. 映射当前棋盘 (用于物理支撑和防碰撞检测)
         int board_piece[14][10];
         for(int i=0; i<14; ++i) for(int j=0; j<10; ++j) board_piece[i][j] = current_board[i][j] > 0 ? -2 : -1; 
         
-        for(int r : global_best_solution) {
-            if (global_best_actions[r].rot_idx == -1) continue;
-            for(auto pt : global_best_actions[r].absolute_coords) 
-                board_piece[pt.x][pt.y] = global_best_actions[r].piece_id;
+        for(const auto& act : final_actions) {
+            for(auto pt : act.absolute_coords) 
+                board_piece[pt.x][pt.y] = act.piece_id;
+        }
+
+        // 3. 【核心提分补丁】：贪心放置剩余方块 (凑齐34块以触发比赛时间奖励)
+        int next_piece_id = 100; // 给剩余方块分配独立的新ID，避免和前35个冲突
+        for (int type = 0; type < 7; ++type) {
+            int leftover = current_inventory[type] - used_count[type];
+            for (int k = 0; k < leftover; ++k) {
+                auto unique_rots = getUniqueRotations(BASE_SHAPES[type]);
+                bool placed = false;
+                
+                // 从棋盘底部往上扫描，只要找到能放的地方就塞进去
+                for (int r = 13; r >= 0 && !placed; --r) {
+                    for (int c = 0; c < 10 && !placed; ++c) {
+                        for (int rot_idx = 0; rot_idx < unique_rots.size() && !placed; ++rot_idx) {
+                            auto& shape = unique_rots[rot_idx];
+                            bool valid = true;
+                            bool fully_supported = true;
+                            vector<Point> abs_coords;
+                            
+                            for (auto& p : shape) {
+                                int nr = r + p.y;
+                                int nc = c + p.x;
+                                // 检查碰撞与越界
+                                if (nr < 0 || nr >= 14 || nc < 0 || nc >= 10 || board_piece[nr][nc] != -1) {
+                                    valid = false; break;
+                                }
+                                // 检查绝对支撑：为了机械臂物理安全，要求每个悬空网格正下方都必须有方块 (!= -1 代表下方有自己或已有障碍物)
+                                if (nr < 13 && board_piece[nr+1][nc] == -1) {
+                                    fully_supported = false; 
+                                }
+                                abs_coords.push_back({nr, nc});
+                            }
+                            
+                            // 找到合法且物理绝对安全的支撑点
+                            if (valid && fully_supported) {
+                                Action act = {next_piece_id++, type, rot_idx, r, c, abs_coords};
+                                final_actions.push_back(act);
+                                for (auto& pt : abs_coords) board_piece[pt.x][pt.y] = act.piece_id;
+                                placed = true;
+                            }
+                        }
+                    }
+                }
+            }
         }
                 
-        vector<int> adj[40]; int in_degree[40] = {0};
+        // 4. 生成符合重力规则的自底向上拓扑排序序列
+        vector<int> adj[200]; int in_degree[200] = {0}; // 容量扩大以适应附加的方块ID (100+)
         for(int r=0; r<13; ++r) {
             for(int c=0; c<10; ++c) {
                 int curr = board_piece[r][c];
                 int below = board_piece[r+1][c];
-                // 如果当前悬空块需要已有的障碍物支撑，则不需要加入依赖关系
+                // 如果当前悬空块需要下方支撑，记录拓扑依赖关系
                 if(curr >= 0 && below >= 0 && curr != below) {
                     bool exist = false;
                     for(int t : adj[below]) if(t == curr) exist = true;
@@ -346,9 +400,8 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
         }
         
         queue<int> q; vector<int> seq;
-        for(int r : global_best_solution) {
-            if (global_best_actions[r].rot_idx == -1) continue;
-            int pid = global_best_actions[r].piece_id;
+        for(const auto& act : final_actions) {
+            int pid = act.piece_id;
             if(in_degree[pid] == 0) q.push(pid);
         }
         while(!q.empty()) {
@@ -356,11 +409,10 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
             for(int v : adj[u]) if(--in_degree[v] == 0) q.push(v);
         }
 
-        // 打包发送给控制节点
+        // 5. 打包发送给控制节点
         std_msgs::Int32MultiArray plan_msg;
         plan_msg.data.push_back(seq.size());
         
-        // 定义方块名称映射，方便直观打印日志
         const char* SHAPE_NAMES[] = {
             "linear_red", "grid_orange", "T_shape_brown", 
             "L_right_purple", "L_left_yellow", "Z_left_blue", "Z_right_green"
@@ -368,19 +420,18 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
 
         ROS_INFO("====== Starting output of detailed pick-and-place sequence ======");
         for(int i=0; i<seq.size(); ++i) {
-            for(int r : global_best_solution) {
-                if(global_best_actions[r].piece_id == seq[i]) {
-                    int shape = global_best_actions[r].shape_type;
-                    int rot = global_best_actions[r].rot_idx;
-                    int start_r = global_best_actions[r].start_r;
-                    int start_c = global_best_actions[r].start_c;
+            for(const auto& act : final_actions) {
+                if(act.piece_id == seq[i]) {
+                    int shape = act.shape_type;
+                    int rot = act.rot_idx;
+                    int start_r = act.start_r;
+                    int start_c = act.start_c;
 
-                    plan_msg.data.push_back(shape); // ID
-                    plan_msg.data.push_back(rot);   // Way(旋转 0-3)
-                    plan_msg.data.push_back(start_r); // 放置网格起点的 r
-                    plan_msg.data.push_back(start_c); // 放置网格起点的 c
+                    plan_msg.data.push_back(shape); 
+                    plan_msg.data.push_back(rot);   
+                    plan_msg.data.push_back(start_r); 
+                    plan_msg.data.push_back(start_c); 
                     
-                    // 打印日志
                     ROS_INFO("action [%2d/%lu]: select block => %-18s | place grid => row:%2d column:%2d | rotation => %3d 度", 
                              i + 1, seq.size(), SHAPE_NAMES[shape], start_r, start_c, rot * 90);
                     break;
@@ -390,7 +441,7 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
         ROS_INFO("===============================================================");
         
         plan_pub.publish(plan_msg);
-        ROS_INFO("Plan SUCCESS! Target Rows: %d, Max Score: %d. Sent %lu steps to Controller.", optimal_target_rows, global_best_score, seq.size());
+        ROS_INFO("Plan SUCCESS! Perfect Rows: %d, Max Score: %d. Sent %lu steps (including leftovers) to Controller.", optimal_target_rows, global_best_score, seq.size());
     } else {
         ROS_WARN("Failed to find a valid placement plan with current blocks.");
     }
