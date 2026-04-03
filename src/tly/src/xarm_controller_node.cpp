@@ -6,7 +6,7 @@
 
 // --- 【核心物理映射参数】 ---
 // 你需要根据实验室真实情况用直尺测量这些值！
-const double GRID_SIZE = 0.03;       // 假设每个方块的边长是 30mm (0.03米)
+const double GRID_SIZE = 0.017;       // 假设每个方块的边长是 17mm (0.017米)
 const double BOARD_ORIGIN_X = 0.400; // 棋盘左上角格子的物理世界 X 坐标 (米)
 const double BOARD_ORIGIN_Y = 0.000; // 棋盘左上角格子的物理世界 Y 坐标 (米)
 const double PLACE_Z = 0.050;        // 放置时机械臂吸盘的物理 Z 高度 (米)
