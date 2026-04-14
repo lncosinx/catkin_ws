@@ -1,0 +1,19 @@
+<launch>
+    <arg name="eye_on_hand" default="true" />
+    
+    <include file="$(find easy_handeye)/launch/calibrate.launch">
+        <arg name="eye_on_hand" value="$(arg eye_on_hand)" />
+        
+        <arg name="namespace_prefix" value="xarm6_realsense_calibration" />
+
+        <arg name="robot_base_frame" value="link_base" />
+        
+        <arg name="robot_effector_frame" value="link6" />
+
+        <arg name="tracking_base_frame" value="camera_color_optical_frame" />
+        
+        <arg name="tracking_marker_frame" value="aruco_marker_frame" />
+
+        <arg name="freehand_robot_movement" value="true" />
+    </include>
+</launch>

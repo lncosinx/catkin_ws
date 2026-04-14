@@ -4,3 +4,4 @@ src/xarm_ros/
 .devcontainer/
 .vscode/
 src/realsense-ros/
+images/

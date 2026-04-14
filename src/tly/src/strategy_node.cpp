@@ -28,6 +28,7 @@ struct PlanConfig {
     int max_restarts;
 };
 
+// 【积木形状定义省略内部...】
 vector<vector<Point>> BASE_SHAPES = {
     {{0,0}, {1,0}, {2,0}, {3,0}}, // 0: 红色一字形
     {{0,0}, {1,0}, {0,1}, {1,1}}, // 1: 橙色田字形
@@ -39,7 +40,7 @@ vector<vector<Point>> BASE_SHAPES = {
 };
 
 // ==============================================================================
-// DLX 极速精确覆盖引擎
+// DLX 极速精确覆盖引擎 (省略未改动的方法...)
 // ==============================================================================
 const int MAX_NODES = 500000;
 struct DLXNode { int r, c, up, down, left, right; };
@@ -321,9 +322,11 @@ void generateSubInventories(int type, int current_sum, int target_sum, vector<in
 ros::Publisher plan_pub;
 bool is_planning = false;
 
+struct BlockInfo { int u, v, ang; }; // 统一存放每个积木的物理属性
+
 void visionCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
     if (is_planning) return; 
-    if (msg->data.size() != 147) return;
+    if (msg->data.size() < 147) return;
 
     is_planning = true;
     ROS_INFO("===============================================================");
@@ -344,6 +347,20 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
             current_board[r][c] = msg->data[idx++];
         }
     }
+    
+    // 【核心修复1】：按照 4 个元素 (shape, u, v, angle) 去解析视觉数据，防止数组错位！
+    vector<BlockInfo> available_blocks[7];
+    if (msg->data.size() > 147) {
+        int num_blocks = msg->data[idx++];
+        for (int i = 0; i < num_blocks && idx + 3 < msg->data.size(); ++i) {
+            int shape = msg->data[idx++];
+            int u = msg->data[idx++];
+            int v = msg->data[idx++];
+            int ang = msg->data[idx++]; // 读出绝对角度
+            available_blocks[shape].push_back({u, v, ang});
+        }
+        ROS_INFO("Parsed true pixel coordinates AND angle for %d scattered blocks.", num_blocks);
+    }
 
     if (total_blocks == 0) {
         ROS_WARN("No blocks recognized. Idle.");
@@ -351,7 +368,6 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
     }
 
     vector<PlanConfig> plans;
-    
     if (total_blocks >= 34) {
         plans.push_back({34, 0, {{0,6},{0,7},{0,8},{0,9}}, 260, 5000000, 10}); 
     }
@@ -459,7 +475,6 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
             }
         }
         
-        // 【核心修复】：3D打印机模式！带有空间坐标感知的优先队列！
         int p_bottom[200] = {0};
         int p_left[200] = {0};
         for(const auto& act : final_actions) {
@@ -467,14 +482,13 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
             int max_r = -1;
             int min_c = 999;
             for(auto& pt : act.absolute_coords) {
-                if(pt.x > max_r) max_r = pt.x; // x 是行 (向下递增)
-                if(pt.y < min_c) min_c = pt.y; // y 是列 (向右递增)
+                if(pt.x > max_r) max_r = pt.x; 
+                if(pt.y < min_c) min_c = pt.y; 
             }
             p_bottom[pid] = max_r;
             p_left[pid] = min_c;
         }
 
-        // 定义比较规则：优先处理底部（行号大的），同行优先处理左边（列号小的）
         auto cmp = [&](int a, int b) {
             if (p_bottom[a] != p_bottom[b]) return p_bottom[a] < p_bottom[b]; 
             return p_left[a] > p_left[b]; 
@@ -504,13 +518,37 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
         for(int i=0; i<seq.size(); ++i) {
             for(const auto& act : final_actions) {
                 if(act.piece_id == seq[i]) {
+                    int pu = 0, pv = 0, p_ang = 0;
+                    if (!available_blocks[act.shape_type].empty()) {
+                        pu = available_blocks[act.shape_type].back().u;
+                        pv = available_blocks[act.shape_type].back().v;
+                        p_ang = available_blocks[act.shape_type].back().ang;
+                        available_blocks[act.shape_type].pop_back();
+                    } else {
+                        ROS_WARN("No pixel coordinate found for shape %d! Using 0,0.", act.shape_type);
+                    }
+
+                    // 【核心修复2】：重新引入 Center-to-Center！求放置网格的真实中心
+                    int min_r = 999, max_r = -1, min_c = 999, max_c = -1;
+                    for(auto& pt : act.absolute_coords) {
+                        if(pt.x < min_r) min_r = pt.x;
+                        if(pt.x > max_r) max_r = pt.x;
+                        if(pt.y < min_c) min_c = pt.y;
+                        if(pt.y > max_c) max_c = pt.y;
+                    }
+                    int center_r_x2 = min_r + max_r; 
+                    int center_c_x2 = min_c + max_c;
+
                     plan_msg.data.push_back(act.shape_type); 
                     plan_msg.data.push_back(act.real_way);   
-                    plan_msg.data.push_back(act.start_r); 
-                    plan_msg.data.push_back(act.start_c); 
+                    plan_msg.data.push_back(center_r_x2); // 不发左上角，改发包围盒中心行 * 2
+                    plan_msg.data.push_back(center_c_x2); // 不发左上角，改发包围盒中心列 * 2
+                    plan_msg.data.push_back(pu); 
+                    plan_msg.data.push_back(pv); 
+                    plan_msg.data.push_back(p_ang);       // 【补上丢失的角度】
                     
-                    ROS_INFO("action [%2d/%lu]: select block => %-18s | place grid => row:%2d column:%2d | rotation => %3d degree", 
-                             i + 1, seq.size(), SHAPE_NAMES[act.shape_type], act.start_r, act.start_c, act.real_way * 90);
+                    ROS_INFO("action [%2d/%lu]: select block => %-18s | place grid center(x2) => row:%2d col:%2d | pick_yaw:%3d", 
+                             i + 1, seq.size(), SHAPE_NAMES[act.shape_type], center_r_x2, center_c_x2, p_ang);
                     break;
                 }
             }
@@ -530,9 +568,11 @@ int main(int argc, char** argv) {
     ros::NodeHandle nh;
 
     plan_pub = nh.advertise<std_msgs::Int32MultiArray>("/tetris_plan", 10, true);
-    ros::Subscriber vision_sub = nh.subscribe("/vision_data", 1, visionCallback);
+    
+    // 【核心修复3】：把订阅频道改回正确的 /vision/board_state ！！！
+    ros::Subscriber vision_sub = nh.subscribe("/vision/board_state", 1, visionCallback);
 
-    ROS_INFO("Strategy Node Started. Awaiting Int32MultiArray(size 147) on '/vision_data'...");
+    ROS_INFO("Strategy Node Started. Awaiting Int32MultiArray on '/vision/board_state'...");
 
     ros::spin();
     return 0;
