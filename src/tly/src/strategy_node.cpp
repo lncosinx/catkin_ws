@@ -1,5 +1,6 @@
 #include <ros/ros.h>
 #include <std_msgs/Int32MultiArray.h>
+#include <std_msgs/Bool.h>
 #include <vector>
 #include <queue>
 #include <algorithm>
@@ -321,11 +322,21 @@ void generateSubInventories(int type, int current_sum, int target_sum, vector<in
 // ==============================================================================
 ros::Publisher plan_pub;
 bool is_planning = false;
+bool is_robot_busy = false; 
+bool task_completed = false;
+
+void statusCallback(const std_msgs::Bool::ConstPtr& msg) {
+    is_robot_busy = msg->data;
+    if (!is_robot_busy && !task_completed) {
+        ROS_INFO("[STATUS] Robot IDLE. Strategy Engine ready for the first vision frame.");
+    }
+}
 
 struct BlockInfo { int u, v, ang; }; // 统一存放每个积木的物理属性
 
 void visionCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
-    if (is_planning) return; 
+    if (task_completed) return; 
+    if (is_planning || is_robot_busy) return; 
     if (msg->data.size() < 147) return;
 
     is_planning = true;
@@ -386,7 +397,7 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
     PlanConfig optimal_plan;
 
     for (const auto& plan : plans) {
-        ROS_INFO(">>> 评估战略: 目标使用 %d 块, 起始行: %d, 理论极限得分: %d 分", plan.target_blocks, plan.start_r, plan.max_possible_score);
+        ROS_INFO(">>> Evaluation Strategy: Target usage of %d blocks, Starting row: %d, Theoretical maximum score: %d points.", plan.target_blocks, plan.start_r, plan.max_possible_score);
         
         vector<vector<int>> valid_subs;
         vector<int> current_sub;
@@ -409,7 +420,7 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
             }
         }
         if (global_best_score != -1) {
-            ROS_INFO("★ 战略锁定！成功找到得分高达 %d 分的完美解。", global_best_score);
+            ROS_INFO("Strategic Lock-on! Successfully found the perfect solution with a score of %d points.", global_best_score);
             break; 
         }
     }
@@ -555,7 +566,9 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
         }
         ROS_INFO("===============================================================");
         plan_pub.publish(plan_msg);
-        ROS_INFO("[SUCCESS] Max Score Achieved: %d 分! Sent %lu blocks to execution.", global_best_score, seq.size());
+        ROS_INFO("[SUCCESS] Max Score Achieved: %d points! Sent %lu blocks to execution.", global_best_score, seq.size());
+        task_completed = true; 
+        is_planning = false;
     } else {
         ROS_WARN("Failed to find any valid placement plan with current blocks.");
     }

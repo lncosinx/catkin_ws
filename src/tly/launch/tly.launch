@@ -15,13 +15,19 @@
 
     <include file="$(find xarm_description)/launch/xarm6_upload.launch" />
 
-    <node pkg="tf2_ros" type="static_transform_publisher" name="camera_to_link6_tf" 
-          args="0.0481108 -0.0242403 0.0212136 0.0215310 0.0272684 0.7157493 0.6974924 link6 camera_color_optical_frame" />
+    <include file="$(find easy_handeye)/launch/publish.launch">
+        <arg name="eye_on_hand" value="true" />
+        <arg name="namespace_prefix" value="xarm6_realsense_calibration" /> [cite: 4]
+    </include>
 
     <node pkg="tly" type="vision_processor_node.py" name="vision_processor_node" output="screen" />
 
-    <node pkg="tly" type="strategy_node" name="strategy_node" output="screen" />
+    <node pkg="tly" type="strategy_node" name="strategy_node" 
+          launch-prefix="bash -c 'sleep 15; $0 $@'" 
+          output="screen" />
 
-    <node pkg="tly" type="xarm_controller_node" name="xarm_controller_node" output="screen" />
+    <node pkg="tly" type="xarm_controller_node" name="xarm_controller_node" 
+          launch-prefix="bash -c 'sleep 25; $0 $@'" 
+          output="screen" />
 
 </launch>

@@ -1,4 +1,5 @@
 #include <ros/ros.h>
+#include <std_msgs/Bool.h>
 #include <std_msgs/Int32MultiArray.h>
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <tf2_ros/transform_listener.h>
@@ -9,24 +10,24 @@
 
 // --- 【物理映射参数】 ---
 const double GRID_SIZE = 0.017;       // 网格边长 17mm
-const double BOARD_ORIGIN_X = 0.400;  // 棋盘左上角 X 物理坐标 (需通过TF或手工校准)
-const double BOARD_ORIGIN_Y = 0.000;  // 棋盘左上角 Y 物理坐标
-const double PLACE_Z = 0.050;         // 放置高度
-const double HOVER_Z = 0.150;         // 安全悬停高度
+const double BOARD_ORIGIN_X = 0.0777;  // 棋盘左上角 X 物理坐标 (需通过TF或手工校准)
+const double BOARD_ORIGIN_Y = -0.5287;  // 棋盘左上角 Y 物理坐标
+const double PLACE_Z = 0.0774;         // 放置高度
+const double HOVER_Z = 0.1774;         // 安全悬停高度
 
 // --- 【Realsense 相机内参】 (你需要从 /camera/color/camera_info 话题获取真实值) ---
-const double CAM_FX = 910.0; 
-const double CAM_FY = 910.0;
-const double CAM_CX = 640.0; // 假设是 1280x720 分辨率
-const double CAM_CY = 360.0;
-const double TABLE_Z_IN_CAMERA = 0.35; // 假设拍照时，相机距离桌面的垂直深度是 35cm (最好订阅 depth 图获取真实Z)
+const double CAM_FX = 911.8016; 
+const double CAM_FY = 911.2428;
+const double CAM_CX = 634.7139; // 假设是 1280x720 分辨率
+const double CAM_CY = 357.0596;
+const double TABLE_Z_IN_CAMERA = 0.49; // 假设拍照时，相机距离桌面的垂直深度是 35cm (最好订阅 depth 图获取真实Z)
 
 class TetrisRobotController {
 private:
     ros::NodeHandle nh_;
     ros::Subscriber plan_sub_;
     ros::ServiceClient io_client_;
-    
+    ros::Publisher status_pub_;
     tf2_ros::Buffer tf_buffer_;
     tf2_ros::TransformListener tf_listener_;
     
@@ -42,6 +43,11 @@ public:
         plan_sub_ = nh_.subscribe("/tetris_plan", 1, &TetrisRobotController::planCallback, this);
         
         io_client_ = nh_.serviceClient<xarm_msgs::SetDigitalIO>("/xarm/set_cgpio_digital");
+        status_pub_ = nh_.advertise<std_msgs::Bool>("/robot_status", 1, true);
+        // 初始化时发布一次 False (空闲)，告诉策略节点可以开始规划了
+        std_msgs::Bool init_msg;
+        init_msg.data = false;
+        status_pub_.publish(init_msg);
         
         ROS_INFO("TF2 Listener initialized. Controller Ready.");
     }
@@ -98,8 +104,14 @@ public:
     void planCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
         if (msg->data.empty()) return;
 
-        int total_steps = msg->data[0];
-        ROS_INFO("Received new plan! Total steps: %d", total_steps);
+        // 【核心加锁】：开始执行动作前，向全网广播自己处于 Busy 状态
+        std_msgs::Bool status_msg;
+        status_msg.data = true;
+        status_pub_.publish(status_msg);
+
+
+         int total_steps = msg->data[0];
+        ROS_INFO("Received new plan! Total steps: %d. Robot is now BUSY.", total_steps);
 
         int data_index = 1;
         for (int i = 0; i < total_steps; ++i) {
@@ -153,7 +165,7 @@ public:
             
             // 【核心修正】：Center-to-Center 完美映射！除以 2 还原真实物理中心
             place_pose.position.x = BOARD_ORIGIN_X + (center_r_x2 / 2.0) * GRID_SIZE;
-            place_pose.position.y = BOARD_ORIGIN_Y + (center_c_x2 / 2.0) * GRID_SIZE;
+            place_pose.position.y = BOARD_ORIGIN_Y - (center_c_x2 / 2.0) * GRID_SIZE;
             place_pose.position.z = PLACE_Z;
 
             double yaw_angle = way * (3.14159 / 2.0); 
@@ -176,7 +188,19 @@ public:
             ROS_INFO("Step %d Completed.", i+1);
         }
         
-        ROS_INFO("All steps executed successfully.");
+        ROS_INFO("All 34 steps executed successfully. Returning to initial position...");
+
+        // 【新增】：34个动作全部做完后，控制机械臂回到初始位置！
+        // 如果你的 xArm SRDF 配置里定义了 "home" 位态，这行可以直接生效：
+        move_group_.setNamedTarget("home"); 
+        move_group_.move();
+        
+        ROS_INFO("Robot returned to HOME state. Mission entirely finished.");
+
+        // 【核心修改】：故意不发送 Idle(False) 信号。
+        // 机器人干完活就休息，不再“叫醒”策略节点，整个工程完美收官结束。
+        // status_msg.data = false;
+        // status_pub_.publish(status_msg); 
     }
 };
 

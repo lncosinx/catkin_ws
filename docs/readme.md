@@ -9,10 +9,15 @@ roslaunch xarm6_moveit_config realMove_exec.launch robot_ip:=192.168.1.228
 roslaunch realsense2_camera rs_camera.launch align_depth:=true
 roslaunch xarm_description xarm6_upload.launch
 rosrun tly vision_processor_node
-rosrun tly tetris_strategy_node
+rosrun tly strategy_node
 rosrun tly xarm_controller_node
-rosrun tf2_ros static_transform_publisher 0.0481108 -0.0242403 0.0212136 0.0215310 0.0272684 0.7157493 0.6974924 link6 camera_color_optical_frame
+roslaunch easy_handeye publish.launch eye_on_hand:=true namespace_prefix:=xarm6_realsense_calibration
 ```
+
+```bash
+rostopic echo /camera/color/camera_info
+```
+在输出的信息中找到 K 矩阵，它包含 9 个数字：[fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]。把你看到的这四个对应位置的值填进去
 
 注意：rosrun tf2_ros static_transform_publisher的参数来源于/root/.ros/easy_handeye/xarm6_realsense_calibration_eye_on_hand.yaml
 不保证上述节点完全可用，请根据实际修改
@@ -24,7 +29,7 @@ rosrun tf2_ros static_transform_publisher 0.0481108 -0.0242403 0.0212136 0.02153
 
 若在Windows上使用docker容器，请参考：https://learn.microsoft.com/en-us/windows/wsl/install，安装wsl，并参考：https://learn.microsoft.com/en-us/windows/wsl/tutorials/wsl-containers，安装docker
 
-参考[text](wsl_usb.md)使用usbipd_win来挂载usb设备，不要将wsl的网络模式设置为mirror，可能会连不上机械臂，请设置为nat
+参考[wsl_usb.md](wsl_usb.md)使用usbipd_win来挂载usb设备，不要将wsl的网络模式设置为mirror，可能会连不上机械臂，请设置为nat
 
 在 Windows 上导入镜像
 
@@ -52,7 +57,7 @@ docker images
 
 vscode安装相关插件：WSL, Dev Containers, Docker
 
-在Windows上使用[text](../.devcontainer/devcontainer.json)生成容器，请将[text](../.devcontainer/devcontainer.json)修改为下面的内容：
+在Windows上使用[devcontainer.json](../.devcontainer/devcontainer.json)生成容器，请将[devcontainer.json](../.devcontainer/devcontainer.json)修改为下面的内容：
 ```text
 {
     "name": "xArm-Full-Workspace",
