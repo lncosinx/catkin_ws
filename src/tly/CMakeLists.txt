@@ -39,6 +39,11 @@ catkin_install_python(PROGRAMS
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
+catkin_install_python(PROGRAMS
+  scripts/table_tf_broadcaster.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
 # =========================================================
 # 1. 编译策略节点 (Strategy Node)
 #    纯粹的算力节点，不需要链接 MoveIt!，只需要 std_msgs 通信

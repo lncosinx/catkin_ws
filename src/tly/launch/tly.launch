@@ -20,6 +20,12 @@
         <arg name="namespace_prefix" value="xarm6_realsense_calibration" /> [cite: 4]
     </include>
 
+     <!-- 1. 加载我们在标定工具里生成的 yaml 配置文件到 ROS 参数服务器 -->
+    <rosparam file="$(find tly)/config/tetris_config.yaml" command="load" />
+
+    <!-- 2. 启动动态 TF 广播节点，在后台静默修正物理倾角 -->
+    <node pkg="tly" type="table_tf_broadcaster.py" name="table_tf_broadcaster" output="screen" />
+
     <node pkg="tly" type="vision_processor_node.py" name="vision_processor_node" output="screen" />
 
     <node pkg="tly" type="strategy_node" name="strategy_node" 

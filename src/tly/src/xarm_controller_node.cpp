@@ -8,19 +8,8 @@
 #include <geometry_msgs/PointStamped.h>
 #include <xarm_msgs/SetDigitalIO.h>
 
-// --- 【物理映射参数】 ---
-const double GRID_SIZE = 0.017;       // 网格边长 17mm
-const double BOARD_ORIGIN_X = 0.0777;  // 棋盘左上角 X 物理坐标 (需通过TF或手工校准)
-const double BOARD_ORIGIN_Y = -0.5287;  // 棋盘左上角 Y 物理坐标
-const double PLACE_Z = 0.0774;         // 放置高度
-const double HOVER_Z = 0.1774;         // 安全悬停高度
-
-// --- 【Realsense 相机内参】 (你需要从 /camera/color/camera_info 话题获取真实值) ---
-const double CAM_FX = 911.8016; 
-const double CAM_FY = 911.2428;
-const double CAM_CX = 634.7139; // 假设是 1280x720 分辨率
-const double CAM_CY = 357.0596;
-const double TABLE_Z_IN_CAMERA = 0.49; // 假设拍照时，相机距离桌面的垂直深度是 35cm (最好订阅 depth 图获取真实Z)
+const double VELOCITY = 0.01;
+const double ACCELEARTION = 0.01;
 
 class TetrisRobotController {
 private:
@@ -33,38 +22,51 @@ private:
     
     moveit::planning_interface::MoveGroupInterface move_group_;
 
+    // 动态加载的参数
+    double GRID_SIZE, BOARD_ORIGIN_X, BOARD_ORIGIN_Y;
+    double PICK_Z, PLACE_Z, HOVER_Z; // 【新增】：加入 PICK_Z
+    double CAM_FX, CAM_FY, CAM_CX, CAM_CY, TABLE_Z_IN_CAMERA;
+
 public:
     TetrisRobotController() : 
         tf_listener_(tf_buffer_), 
         move_group_("xarm6") 
     {
-        move_group_.setMaxVelocityScalingFactor(0.4);
-        move_group_.setMaxAccelerationScalingFactor(0.4);
-        plan_sub_ = nh_.subscribe("/tetris_plan", 1, &TetrisRobotController::planCallback, this);
+        // 1. 从 ROS 参数服务器加载配置文件 (如果没读到，使用后备默认值)
+        nh_.param("/tetris/GRID_SIZE", GRID_SIZE, 0.017);
+        nh_.param("/tetris/BOARD_ORIGIN_X", BOARD_ORIGIN_X, 0.0);
+        nh_.param("/tetris/BOARD_ORIGIN_Y", BOARD_ORIGIN_Y, 0.0);
+        nh_.param("/tetris/PICK_Z", PICK_Z, 0.0);  // 【新增】：从参数服务器读取抓取高度
+        nh_.param("/tetris/PLACE_Z", PLACE_Z, 0.0);
+        nh_.param("/tetris/HOVER_Z", HOVER_Z, 0.1);
+        nh_.param("/tetris/CAM_FX", CAM_FX, 911.8016);
+        nh_.param("/tetris/CAM_FY", CAM_FY, 911.2428);
+        nh_.param("/tetris/CAM_CX", CAM_CX, 634.7139);
+        nh_.param("/tetris/CAM_CY", CAM_CY, 357.0596);
+        nh_.param("/tetris/TABLE_Z_IN_CAMERA", TABLE_Z_IN_CAMERA, 0.49);
+
+        // 2. 将规划的“绝对参考系”切换为我们的自定义桌面坐标系！
+        move_group_.setPoseReferenceFrame("table_frame");
+        move_group_.setMaxVelocityScalingFactor(VELOCITY);
+        move_group_.setMaxAccelerationScalingFactor(ACCELEARTION);
         
-        io_client_ = nh_.serviceClient<xarm_msgs::SetDigitalIO>("/xarm/set_cgpio_digital");
+        plan_sub_ = nh_.subscribe("/tetris_plan", 1, &TetrisRobotController::planCallback, this);
+        io_client_ = nh_.serviceClient<xarm_msgs::SetDigitalIO>("/xarm/set_controller_dout");
         status_pub_ = nh_.advertise<std_msgs::Bool>("/robot_status", 1, true);
-        // 初始化时发布一次 False (空闲)，告诉策略节点可以开始规划了
+        
         std_msgs::Bool init_msg;
         init_msg.data = false;
         status_pub_.publish(init_msg);
         
-        ROS_INFO("TF2 Listener initialized. Controller Ready.");
+        ROS_INFO("Controller Ready. Operating in [table_frame] coordinate system.");
     }
 
     void setSuctionCup(bool on) {
         xarm_msgs::SetDigitalIO srv;
-        srv.request.io_num = 0; // 保持你的旧设定，如果接在 CO 上记得加 8
+        srv.request.io_num = 1; 
         srv.request.value = on ? 1 : 0; 
-        
-        if (io_client_.call(srv)) {
-            if (srv.response.ret == 0) {
-                ROS_INFO("Suction cup (DO0) turned %s.", on ? "ON" : "OFF");
-            } else {
-                ROS_WARN("IO call succeeded, but returned xArm error code: %d", srv.response.ret);
-            }
-        } else {
-            ROS_ERROR("Failed to call xArm IO service! Check if xarm driver is running.");
+        if (!io_client_.call(srv)) {
+            ROS_ERROR("Failed to call xArm IO service!");
         }
     }
 
@@ -80,20 +82,21 @@ public:
         pt_in_cam.point.y = y_c;
         pt_in_cam.point.z = z_c;
 
-        geometry_msgs::PointStamped pt_in_base;
+        geometry_msgs::PointStamped pt_in_table;
 
         try {
-            tf_buffer_.transform(pt_in_cam, pt_in_base, "link_base", ros::Duration(1.0));
+            // 直接将像素目标转化为 table_frame (桌面平面) 上的点
+            tf_buffer_.transform(pt_in_cam, pt_in_table, "table_frame", ros::Duration(1.0));
         } catch (tf2::TransformException &ex) {
             ROS_ERROR("TF Conversion failed: %s", ex.what());
             return false;
         }
 
-        out_pose.position.x = pt_in_base.point.x;
-        out_pose.position.y = pt_in_base.point.y;
-        out_pose.position.z = PLACE_Z; 
+        out_pose.position.x = pt_in_table.point.x;
+        out_pose.position.y = pt_in_table.point.y;
+        out_pose.position.z = PICK_Z; // 【核心修改】：抓取时(通过视觉转换的坐标)，Z高度必须使用 PICK_Z
 
-        // 默认朝向（稍后在代码中会被角度偏置覆盖）
+        // 默认朝向：末端向下直指桌面
         tf2::Quaternion q;
         q.setRPY(3.14159, 0, 0); 
         out_pose.orientation = tf2::toMsg(q);
@@ -104,43 +107,27 @@ public:
     void planCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
         if (msg->data.empty()) return;
 
-        // 【核心加锁】：开始执行动作前，向全网广播自己处于 Busy 状态
         std_msgs::Bool status_msg;
         status_msg.data = true;
         status_pub_.publish(status_msg);
 
-
-         int total_steps = msg->data[0];
-        ROS_INFO("Received new plan! Total steps: %d. Robot is now BUSY.", total_steps);
+        int total_steps = msg->data[0];
+        ROS_INFO("Received new plan! Total steps: %d.", total_steps);
 
         int data_index = 1;
         for (int i = 0; i < total_steps; ++i) {
-            int id  = msg->data[data_index++]; 
+            int id = msg->data[data_index++]; 
             int way = msg->data[data_index++]; 
-            
-            // 【核心修正】：读取策略发过来的网格中心点 (*2)
             int center_r_x2 = msg->data[data_index++]; 
             int center_c_x2 = msg->data[data_index++]; 
-            
             int pixel_u = msg->data[data_index++]; 
             int pixel_v = msg->data[data_index++];
-            
-            // 【核心修正】：补上被遗漏的角度读取！
             int pick_angle = msg->data[data_index++]; 
 
-            ROS_INFO("Step %d: Pick ID=%d at pixel(%d,%d) angle:%d, Place GridCenter(%d, %d)", 
-                      i+1, id, pixel_u, pixel_v, pick_angle, center_r_x2, center_c_x2);
-
-            // ==========================================
-            // 1. 抓取动作 (Pick)
-            // ==========================================
+            // 1. Pick
             geometry_msgs::Pose pick_pose;
-            if (!transformPixelToRobotBase(pixel_u, pixel_v, pick_pose)) {
-                ROS_ERROR("Aborting execution due to TF error.");
-                return;
-            }
+            if (!transformPixelToRobotBase(pixel_u, pixel_v, pick_pose)) return;
 
-            // 用吸盘的偏航角完美抵消零件在桌面的随机旋转
             double pick_yaw = pick_angle * (3.14159 / 180.0);
             tf2::Quaternion q_pick;
             q_pick.setRPY(3.14159, 0, pick_yaw); 
@@ -152,20 +139,15 @@ public:
             move_group_.setPoseTarget(hover_pick); move_group_.move();
             move_group_.setPoseTarget(pick_pose);  move_group_.move();
             
-            ROS_INFO(">>> Sucker turned ON <<<");
-            setSuctionCup(true); 
-            ros::Duration(0.5).sleep(); 
-
+            setSuctionCup(true); ros::Duration(0.5).sleep(); 
             move_group_.setPoseTarget(hover_pick); move_group_.move();
 
-            // ==========================================
-            // 2. 放置动作 (Place) 
-            // ==========================================
+            // 2. Place
             geometry_msgs::Pose place_pose;
             
-            // 【核心修正】：Center-to-Center 完美映射！除以 2 还原真实物理中心
+            // 【核心修正】：因为我们新标定的 Y 轴在算法里指代了相反方向，所以这里用减号
             place_pose.position.x = BOARD_ORIGIN_X + (center_r_x2 / 2.0) * GRID_SIZE;
-            place_pose.position.y = BOARD_ORIGIN_Y - (center_c_x2 / 2.0) * GRID_SIZE;
+            place_pose.position.y = BOARD_ORIGIN_Y - (center_c_x2 / 2.0) * GRID_SIZE; 
             place_pose.position.z = PLACE_Z;
 
             double yaw_angle = way * (3.14159 / 2.0); 
@@ -179,39 +161,20 @@ public:
             move_group_.setPoseTarget(hover_place); move_group_.move();
             move_group_.setPoseTarget(place_pose);  move_group_.move();
 
-            ROS_INFO(">>> Sucker turned OFF <<<");
-            setSuctionCup(false); 
-            ros::Duration(0.5).sleep();
-
+            setSuctionCup(false); ros::Duration(0.5).sleep();
             move_group_.setPoseTarget(hover_place); move_group_.move();
-            
-            ROS_INFO("Step %d Completed.", i+1);
         }
         
-        ROS_INFO("All 34 steps executed successfully. Returning to initial position...");
-
-        // 【新增】：34个动作全部做完后，控制机械臂回到初始位置！
-        // 如果你的 xArm SRDF 配置里定义了 "home" 位态，这行可以直接生效：
         move_group_.setNamedTarget("home"); 
         move_group_.move();
-        
-        ROS_INFO("Robot returned to HOME state. Mission entirely finished.");
-
-        // 【核心修改】：故意不发送 Idle(False) 信号。
-        // 机器人干完活就休息，不再“叫醒”策略节点，整个工程完美收官结束。
-        // status_msg.data = false;
-        // status_pub_.publish(status_msg); 
     }
 };
 
 int main(int argc, char** argv) {
     ros::init(argc, argv, "xarm_controller_node");
-    
     ros::AsyncSpinner spinner(2);
     spinner.start();
-
     TetrisRobotController controller;
     ros::waitForShutdown();
-    
     return 0;
 }
