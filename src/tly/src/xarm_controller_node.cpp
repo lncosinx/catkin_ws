@@ -22,6 +22,8 @@ private:
     
     moveit::planning_interface::MoveGroupInterface move_group_;
 
+    geometry_msgs::TransformStamped cam_to_table_tx_; // 保存拍照瞬间的相机状态
+
     // 动态加载的参数
     double GRID_SIZE, BOARD_ORIGIN_X, BOARD_ORIGIN_Y;
     double PICK_Z, PLACE_Z, HOVER_Z; // 【新增】：加入 PICK_Z
@@ -70,43 +72,67 @@ public:
         }
     }
 
+
+    // 2. 彻底重写坐标系转换函数（使用严谨的数学射线求交）
     bool transformPixelToRobotBase(int u, int v, geometry_msgs::Pose& out_pose) {
-        double z_c = TABLE_Z_IN_CAMERA; 
-        double x_c = (u - CAM_CX) * z_c / CAM_FX;
-        double y_c = (v - CAM_CY) * z_c / CAM_FY;
+        // 步骤 A: 计算相机坐标系下的 3D 射线方向向量
+        double ray_x_cam = (u - CAM_CX) / CAM_FX;
+        double ray_y_cam = (v - CAM_CY) / CAM_FY;
+        double ray_z_cam = 1.0;
 
-        geometry_msgs::PointStamped pt_in_cam;
-        pt_in_cam.header.frame_id = "camera_color_optical_frame";
-        pt_in_cam.header.stamp = ros::Time(0); 
-        pt_in_cam.point.x = x_c;
-        pt_in_cam.point.y = y_c;
-        pt_in_cam.point.z = z_c;
+        // 步骤 B: 提取相机的旋转矩阵，将射线旋转到桌面坐标系(table_frame)
+        tf2::Quaternion q_cam;
+        tf2::fromMsg(cam_to_table_tx_.transform.rotation, q_cam);
+        tf2::Matrix3x3 m_cam(q_cam);
+        
+        tf2::Vector3 ray_cam(ray_x_cam, ray_y_cam, ray_z_cam);
+        tf2::Vector3 ray_table = m_cam * ray_cam; // 现在的射线方向是相对于桌面的
 
-        geometry_msgs::PointStamped pt_in_table;
+        // 步骤 C: 提取相机的三维空间位置
+        tf2::Vector3 cam_pos(
+            cam_to_table_tx_.transform.translation.x,
+            cam_to_table_tx_.transform.translation.y,
+            cam_to_table_tx_.transform.translation.z
+        );
 
-        try {
-            // 直接将像素目标转化为 table_frame (桌面平面) 上的点
-            tf_buffer_.transform(pt_in_cam, pt_in_table, "table_frame", ros::Duration(1.0));
-        } catch (tf2::TransformException &ex) {
-            ROS_ERROR("TF Conversion failed: %s", ex.what());
+        // 步骤 D: 射线与目标高度平面 (Z = PICK_Z) 求交点
+        // 数学公式: cam_pos.z + t * ray_table.z = PICK_Z
+        if (std::abs(ray_table.z()) < 1e-6) {
+            ROS_ERROR("Camera is looking parallel to the table, cannot intersect!");
+            return false;
+        }
+        
+        double t = (PICK_Z - cam_pos.z()) / ray_table.z();
+        if (t < 0) {
+            ROS_ERROR("The object is behind the camera? Please check TF tree.");
             return false;
         }
 
-        out_pose.position.x = pt_in_table.point.x;
-        out_pose.position.y = pt_in_table.point.y;
-        out_pose.position.z = PICK_Z; // 【核心修改】：抓取时(通过视觉转换的坐标)，Z高度必须使用 PICK_Z
+        // 步骤 E: 计算出物理世界中绝对准确的 X 和 Y
+        tf2::Vector3 intersect_pt = cam_pos + ray_table * t;
+
+        out_pose.position.x = intersect_pt.x();
+        out_pose.position.y = intersect_pt.y();
+        out_pose.position.z = PICK_Z; // 高度严格锁定为积木厚度
 
         // 默认朝向：末端向下直指桌面
-        tf2::Quaternion q;
-        q.setRPY(3.14159, 0, 0); 
-        out_pose.orientation = tf2::toMsg(q);
+        tf2::Quaternion q_down;
+        q_down.setRPY(3.14159, 0, 0); 
+        out_pose.orientation = tf2::toMsg(q_down);
 
         return true;
     }
 
     void planCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
         if (msg->data.empty()) return;
-
+        
+        try {
+        cam_to_table_tx_ = tf_buffer_.lookupTransform("table_frame", "camera_color_optical_frame", ros::Time(0), ros::Duration(3.0));
+    } catch (tf2::TransformException &ex) {
+        ROS_ERROR("Failed to lock observation camera pose: %s", ex.what());
+        return;
+    }
+        
         std_msgs::Bool status_msg;
         status_msg.data = true;
         status_pub_.publish(status_msg);
@@ -146,7 +172,7 @@ public:
             geometry_msgs::Pose place_pose;
             
             // 【核心修正】：因为我们新标定的 Y 轴在算法里指代了相反方向，所以这里用减号
-            place_pose.position.x = BOARD_ORIGIN_X + (center_r_x2 / 2.0) * GRID_SIZE;
+            place_pose.position.x = BOARD_ORIGIN_X - (center_r_x2 / 2.0) * GRID_SIZE;
             place_pose.position.y = BOARD_ORIGIN_Y - (center_c_x2 / 2.0) * GRID_SIZE; 
             place_pose.position.z = PLACE_Z;
 

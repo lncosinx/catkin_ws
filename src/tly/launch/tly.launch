@@ -1,39 +1,38 @@
 <launch>
     <arg name="robot_ip" default="192.168.1.228" />
 
-    <include file="$(find xarm_bringup)/launch/xarm6_server.launch">
-        <arg name="robot_ip" value="$(arg robot_ip)" />
-    </include>
-
+    <!-- 1. 启动官方的真机 MoveIt 控制环境 -->
     <include file="$(find xarm6_moveit_config)/launch/realMove_exec.launch">
         <arg name="robot_ip" value="$(arg robot_ip)" />
     </include>
-
+    
+    <!-- 2. 启动 Realsense 相机 -->
     <include file="$(find realsense2_camera)/launch/rs_camera.launch">
         <arg name="align_depth" value="true" />
     </include>
 
-    <include file="$(find xarm_description)/launch/xarm6_upload.launch" />
-
+    <!-- 3. 启动手眼标定发布器 -->
     <include file="$(find easy_handeye)/launch/publish.launch">
         <arg name="eye_on_hand" value="true" />
-        <arg name="namespace_prefix" value="xarm6_realsense_calibration" /> [cite: 4]
+        <arg name="namespace_prefix" value="xarm6_realsense_calibration" />
     </include>
 
-     <!-- 1. 加载我们在标定工具里生成的 yaml 配置文件到 ROS 参数服务器 -->
+    <!-- 4. 加载我们在标定工具里生成的 yaml 配置文件到 ROS 参数服务器 -->
     <rosparam file="$(find tly)/config/tetris_config.yaml" command="load" />
 
-    <!-- 2. 启动动态 TF 广播节点，在后台静默修正物理倾角 -->
+    <!-- 5. 启动动态 TF 广播节点，在后台静默修正物理倾角 -->
     <node pkg="tly" type="table_tf_broadcaster.py" name="table_tf_broadcaster" output="screen" />
 
+    <!-- 6. 视觉识别节点 -->
     <node pkg="tly" type="vision_processor_node.py" name="vision_processor_node" output="screen" />
 
+    <!-- 7. 策略算法节点 (延时15秒等待相机和TF就绪) -->
     <node pkg="tly" type="strategy_node" name="strategy_node" 
           launch-prefix="bash -c 'sleep 15; $0 $@'" 
           output="screen" />
 
+    <!-- 8. 运动控制节点 (延时25秒等待策略节点就绪) -->
     <node pkg="tly" type="xarm_controller_node" name="xarm_controller_node" 
           launch-prefix="bash -c 'sleep 25; $0 $@'" 
           output="screen" />
-
 </launch>
