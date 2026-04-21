@@ -51,7 +51,7 @@ def draw_grid():
     print("\n按任意键退出...")
 
 if __name__ == "__main__":
-    img = cv2.imread("/root/catkin_ws/src/tly/images/15_Color.png") # 换成你的原图名字
+    img = cv2.imread("/root/catkin_ws/src/tly/images/1_Color.png") # 换成你的原图名字
     if img is None:
         print("找不到图片")
         exit()

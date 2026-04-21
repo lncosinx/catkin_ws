@@ -14,3 +14,5 @@ TF补偿及相关参数设置，按照要求操作，结果保存在[config文�
 ```bash
 rosrun tly calibration_tool.py
 ```
+
+rosrun tly single_block_test.py

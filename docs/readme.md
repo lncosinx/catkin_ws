@@ -32,6 +32,7 @@ roslaunch xarm6_moveit_config realMove_exec.launch robot_ip:=192.168.1.228
 roslaunch realsense2_camera rs_camera.launch align_depth:=true
 roslaunch xarm_description xarm6_upload.launch
 rosrun tly vision_processor_node.py
+rosrun tly single_block_test.py
 rosrun tly strategy_node
 rosrun tly xarm_controller_node
 roslaunch easy_handeye publish.launch eye_on_hand:=true namespace_prefix:=xarm6_realsense_calibration

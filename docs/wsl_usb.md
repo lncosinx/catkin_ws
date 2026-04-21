@@ -37,13 +37,13 @@ usbipd list
    你会看到一个设备列表，找到你想要连接到 WSL 的那个设备，并记下它的 **BUSID**（例如 2-1）。  
 3. 共享该设备（绑定）：  
 ```powerShell  
-usbipd bind \-\-busid \<BUSID\>
+usbipd bind --busid <BUSID>
 ```
 
    *注意：这个步骤通常只需要对该设备执行一次，以后即使拔插也无需重新绑定。*  
 4. 将设备附加到 WSL：  
 ```powerShell  
-   usbipd attach \-\-wsl \-\-busid \<BUSID\>
+   usbipd attach --wsl --busid <BUSID>
 ```
 
    *注意：执行此命令时，确保你的 WSL 正在后台运行。*
@@ -62,7 +62,7 @@ lsusb
 当你用完设备，或者想让 Windows 重新接管该 USB 设备时，可以在 Windows PowerShell 中运行：
 
 ```powerShell
-usbipd detach \-\-busid \<BUSID\>
+usbipd detach --busid <BUSID>
 ```
 
 *(或者直接拔下该 USB 设备也会自动断开连接。)*

@@ -28,11 +28,15 @@
 
     <!-- 7. 策略算法节点 (延时15秒等待相机和TF就绪) -->
     <node pkg="tly" type="strategy_node" name="strategy_node" 
-          launch-prefix="bash -c 'sleep 15; $0 $@'" 
+          launch-prefix="bash -c 'sleep 1; $0 $@'" 
           output="screen" />
+
+    <!-- <node pkg="tly" type="single_block_test.py" name="single_block_tester" 
+          launch-prefix="bash -c 'sleep 15; $0 $@'" 
+          output="screen" /> -->
 
     <!-- 8. 运动控制节点 (延时25秒等待策略节点就绪) -->
     <node pkg="tly" type="xarm_controller_node" name="xarm_controller_node" 
-          launch-prefix="bash -c 'sleep 25; $0 $@'" 
+          launch-prefix="bash -c 'sleep 2; $0 $@'" 
           output="screen" />
 </launch>

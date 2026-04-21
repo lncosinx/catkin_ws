@@ -8,30 +8,14 @@ import math
 from sensor_msgs.msg import Image
 from std_msgs.msg import Int32MultiArray
 from cv_bridge import CvBridge, CvBridgeError
+from tly.srv import GetPrecisePose, GetPrecisePoseResponse
 
 class VisionProcessorNode:
     def __init__(self):
         rospy.init_node('vision_processor_node', anonymous=True)
         
         self.bridge = CvBridge()
-        
-        # --- 配置参数 ---
-        self.board_grid_points = [
-            [(373, 54), (391, 53), (410, 52), (428, 52), (447, 51), (466, 51), (485, 50), (504, 50), (523, 49), (543, 49)],
-            [(373, 72), (392, 71), (410, 71), (429, 70), (448, 70), (467, 69), (486, 69), (505, 68), (524, 68), (543, 67)],
-            [(374, 90), (392, 90), (411, 89), (430, 89), (448, 88), (467, 88), (486, 87), (505, 87), (524, 87), (544, 86)],
-            [(374, 109), (393, 108), (411, 108), (430, 107), (449, 107), (468, 107), (487, 106), (506, 106), (525, 105), (544, 105)],
-            [(375, 127), (393, 127), (412, 126), (431, 126), (449, 126), (468, 125), (487, 125), (506, 124), (526, 124), (545, 124)],
-            [(375, 146), (394, 145), (412, 145), (431, 145), (450, 144), (469, 144), (488, 143), (507, 143), (526, 143), (546, 142)],
-            [(376, 164), (394, 164), (413, 163), (432, 163), (451, 163), (470, 162), (489, 162), (508, 162), (527, 162), (546, 161)],
-            [(376, 182), (395, 182), (414, 182), (432, 182), (451, 181), (470, 181), (489, 181), (508, 181), (527, 180), (547, 180)],
-            [(377, 201), (395, 201), (414, 200), (433, 200), (452, 200), (471, 200), (490, 200), (509, 199), (528, 199), (547, 199)],
-            [(377, 219), (396, 219), (415, 219), (433, 219), (452, 219), (471, 219), (490, 218), (509, 218), (529, 218), (548, 218)],
-            [(378, 238), (397, 238), (415, 238), (434, 238), (453, 237), (472, 237), (491, 237), (510, 237), (529, 237), (549, 237)],
-            [(378, 256), (397, 256), (416, 256), (435, 256), (453, 256), (472, 256), (492, 256), (511, 256), (530, 256), (549, 256)],
-            [(379, 275), (398, 275), (416, 275), (435, 275), (454, 275), (473, 275), (492, 275), (511, 275), (531, 275), (550, 275)],
-            [(380, 294), (398, 294), (417, 294), (436, 294), (455, 294), (474, 294), (493, 294), (512, 294), (531, 294), (551, 294)],
-        ]
+       
         
         self.color_ranges = {
             0: ("Red", np.array([156, 63, 100]), np.array([0, 255, 201]), (0, 0, 255)),
@@ -46,16 +30,23 @@ class VisionProcessorNode:
         self.image_sub = rospy.Subscriber("/camera/color/image_raw", Image, self.image_callback, queue_size=1)
         self.state_pub = rospy.Publisher("/vision/board_state", Int32MultiArray, queue_size=10)
         self.debug_image_pub = rospy.Publisher("/vision/debug_image", Image, queue_size=1)
+        # 1. 缓存最新一帧图像，供 Service 随时调用
+        self.latest_cv_image = None 
+        
+        # 2. 注册精调服务
+        self.precise_srv = rospy.Service('/vision/get_precise_pose', GetPrecisePose, self.handle_precise_pose)
 
         rospy.loginfo("🚀 Vision Node (Gravity Center & Edge Angle Edition) Ready.")
 
     def image_callback(self, data):
+        # 每次收到图像，先存下来
         try:
-            cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+            self.latest_cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
         except CvBridgeError as e:
             rospy.logerr(f"CvBridge Error: {e}")
             return
-
+        
+        cv_image = self.latest_cv_image.copy()
         scale_percent = 50 
         width = int(cv_image.shape[1] * scale_percent / 100)
         height = int(cv_image.shape[0] * scale_percent / 100)
@@ -94,11 +85,8 @@ class VisionProcessorNode:
             
             color_masks[shape_id] = mask
 
-            split_x = 390 
-            mask_left_only = mask.copy()
-            mask_left_only[:, split_x:] = 0
-
-            contours, _ = cv2.findContours(mask_left_only, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # 直接使用完整的 mask 寻找轮廓
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for cnt in contours:
                 if cv2.contourArea(cnt) > 250:
                     inventory[shape_id] += 1
@@ -161,29 +149,6 @@ class VisionProcessorNode:
                     
                     blocks_info.extend([shape_id, cX_orig, cY_orig, int(true_angle)])
 
-        # 读取右侧白板状态
-        flat_points = [pt for row in self.board_grid_points for pt in row] if isinstance(self.board_grid_points[0], list) else self.board_grid_points
-        
-        for i, (cx, cy) in enumerate(flat_points):
-            best_color_id = -1
-            max_pixels = 0
-            y1, y2 = max(0, cy - 2), min(height, cy + 3)
-            x1, x2 = max(0, cx - 2), min(width, cx + 3)
-
-            for shape_id in range(7):
-                roi_mask = color_masks[shape_id][y1:y2, x1:x2]
-                white_pixels = cv2.countNonZero(roi_mask)
-                if white_pixels > max_pixels and white_pixels >= 5:
-                    max_pixels = white_pixels
-                    best_color_id = shape_id
-
-            if best_color_id != -1:
-                board_state[i] = best_color_id + 1
-                draw_color = self.color_ranges[best_color_id][3]
-                cv2.circle(result_img, (cx, cy), 6, draw_color, -1)
-            else:
-                cv2.circle(result_img, (cx, cy), 2, (0, 255, 0), -1)
-
         vision_data_array = inventory + board_state + [len(blocks_info) // 4] + blocks_info
         msg = Int32MultiArray()
         msg.data = vision_data_array
@@ -194,6 +159,91 @@ class VisionProcessorNode:
             self.debug_image_pub.publish(debug_msg)
         except CvBridgeError as e:
             rospy.logerr(f"CvBridge Error during debug image publish: {e}")
+
+    def handle_precise_pose(self, req):
+        if self.latest_cv_image is None:
+            rospy.logwarn("Precise Vision: No image received yet.")
+            return GetPrecisePoseResponse(success=False, dx=0, dy=0, angle=0)
+            
+        img = self.latest_cv_image.copy()
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        
+        # 画面中心点（即相机光心正下方）
+        center_x, center_y = img.shape[1] // 2, img.shape[0] // 2
+        
+        # 提取请求的特定颜色的掩码
+        shape_id = req.target_shape_type
+        if shape_id not in self.color_ranges:
+            return GetPrecisePoseResponse(success=False, dx=0, dy=0, angle=0)
+            
+        name, lower, upper, _ = self.color_ranges[shape_id]
+        
+        # 🌟 加入完整的 HSV 跨界拼接逻辑
+        if lower[0] <= upper[0]:
+            mask = cv2.inRange(hsv, lower, upper)
+        else:
+            lower1, upper1 = np.copy(lower), np.copy(upper)
+            upper1[0] = 179
+            mask1 = cv2.inRange(hsv, lower1, upper1)
+            lower2, upper2 = np.copy(lower), np.copy(upper)
+            lower2[0] = 0
+            mask2 = cv2.inRange(hsv, lower2, upper2)
+            mask = cv2.bitwise_or(mask1, mask2)
+        
+        # 同样进行形态学防粘连处理
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((7,7), np.uint8))
+        
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        best_cnt = None
+        min_dist = float('inf')
+        best_cx, best_cy = 0, 0
+        
+        # 寻找距离画面正中心最近的那个方块（即当前吸盘正下方的目标）
+        for cnt in contours:
+            if cv2.contourArea(cnt) > 250:
+                # === 🌟 精调服务也必须使用距离变换，寻找最肉点！ ===
+                single_mask = np.zeros(mask.shape, dtype=np.uint8)
+                cv2.drawContours(single_mask, [cnt], -1, 255, -1)
+                dist_transform = cv2.distanceTransform(single_mask, cv2.DIST_L2, 5)
+                _, _, _, max_loc = cv2.minMaxLoc(dist_transform)
+                
+                cx, cy = max_loc # 这个就是我们吸盘该吸的精确物理中心
+                
+                dist = math.hypot(cx - center_x, cy - center_y)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_cnt = cnt
+                    best_cx = cx
+                    best_cy = cy
+                        
+        if best_cnt is None:
+            rospy.logwarn(f"Precise Vision: Target {name} block not found near center!")
+            return GetPrecisePoseResponse(success=False, dx=0, dy=0, angle=0)
+
+        # 重新提取最长边绝对角度
+        epsilon = 0.02 * cv2.arcLength(best_cnt, True)
+        approx = cv2.approxPolyDP(best_cnt, epsilon, True)
+        max_len = 0
+        best_angle = 0
+        for i in range(len(approx)):
+            p1 = approx[i][0]
+            p2 = approx[(i+1)%len(approx)][0]
+            dx_edge = p2[0] - p1[0]
+            dy_edge = p2[1] - p1[1]
+            length = math.hypot(dx_edge, dy_edge)
+            if length > max_len:
+                max_len = length
+                best_angle = np.degrees(math.atan2(dy_edge, dx_edge))
+        true_angle = int(best_angle % 180)
+        
+        # 计算偏移量：方块重心位置 - 画面正中心位置
+        dx = best_cx - center_x
+        dy = best_cy - center_y
+        
+        rospy.loginfo(f" Precise Vision Triggered! Target: {name}, dx={dx}, dy={dy}, angle={true_angle}")
+        return GetPrecisePoseResponse(success=True, dx=dx, dy=dy, angle=true_angle)
 
 if __name__ == '__main__':
     try:

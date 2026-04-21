@@ -539,27 +539,25 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
                         ROS_WARN("No pixel coordinate found for shape %d! Using 0,0.", act.shape_type);
                     }
 
-                    // 【核心修复2】：重新引入 Center-to-Center！求放置网格的真实中心
-                    int min_r = 999, max_r = -1, min_c = 999, max_c = -1;
+                    // 替换为求 4 个积木坐标的绝对总和：
+                    int sum_r = 0, sum_c = 0;
                     for(auto& pt : act.absolute_coords) {
-                        if(pt.x < min_r) min_r = pt.x;
-                        if(pt.x > max_r) max_r = pt.x;
-                        if(pt.y < min_c) min_c = pt.y;
-                        if(pt.y > max_c) max_c = pt.y;
+                        sum_r += pt.x;
+                        sum_c += pt.y;
                     }
-                    int center_r_x2 = min_r + max_r; 
-                    int center_c_x2 = min_c + max_c;
 
+                    // 修改发送的数据逻辑
                     plan_msg.data.push_back(act.shape_type); 
                     plan_msg.data.push_back(act.real_way);   
-                    plan_msg.data.push_back(center_r_x2); // 不发左上角，改发包围盒中心行 * 2
-                    plan_msg.data.push_back(center_c_x2); // 不发左上角，改发包围盒中心列 * 2
+                    plan_msg.data.push_back(sum_r); // 原来是 center_r_x2
+                    plan_msg.data.push_back(sum_c); // 原来是 center_c_x2
                     plan_msg.data.push_back(pu); 
                     plan_msg.data.push_back(pv); 
                     plan_msg.data.push_back(p_ang);       // 【补上丢失的角度】
                     
-                    ROS_INFO("action [%2d/%lu]: select block => %-18s | place grid center(x2) => row:%2d col:%2d | pick_yaw:%3d", 
-                             i + 1, seq.size(), SHAPE_NAMES[act.shape_type], center_r_x2, center_c_x2, p_ang);
+                    ROS_INFO("action [%2d/%lu]: select block => %-18s | place grid => row:%2d col:%2d | rotation => %3d degree", 
+                             i + 1, seq.size(), SHAPE_NAMES[act.shape_type], act.start_r, act.start_c, act.real_way * 90);
+                    break;
                     break;
                 }
             }

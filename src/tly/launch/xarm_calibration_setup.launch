@@ -1,12 +1,15 @@
 <launch>
     <arg name="robot_ip" default="192.168.1.228" />
     <arg name="marker_id" default="26" />
-    <arg name="marker_size" default="0.175" /> <include file="$(find xarm_bringup)/launch/xarm6_server.launch">
+    <arg name="marker_size" default="0.174" /> 
+
+    <include file="$(find xarm_bringup)/launch/xarm6_server.launch">
         <arg name="robot_ip" value="$(arg robot_ip)" />
     </include>
 
     <include file="$(find realsense2_camera)/launch/rs_camera.launch">
         <arg name="align_depth" value="true" />
+        <arg name="filters" value="spatial,temporal,hole_filling" />
     </include>
 
     <include file="$(find xarm_description)/launch/xarm6_upload.launch" />
@@ -14,8 +17,8 @@
     <node pkg="aruco_ros" type="single" name="aruco_single">
         <remap from="/image" to="/camera/color/image_raw" />
         <remap from="/camera_info" to="/camera/color/camera_info" />
-        
-        <param name="image_is_rectified" value="True"/>
+
+        <param name="image_is_rectified" value="False"/>
         <param name="marker_id"          value="$(arg marker_id)"/>
         <param name="marker_size"        value="$(arg marker_size)"/>
         <param name="camera_frame"       value="camera_color_optical_frame"/>
@@ -29,5 +32,4 @@
     </node>
 
     <include file="$(find tly)/launch/calibrate_xarm.launch" />
-
 </launch>

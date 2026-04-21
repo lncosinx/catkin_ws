@@ -7,7 +7,7 @@ add_compile_options(-std=c++14)
 # 开启 O3 最高级别优化！对于纯算力的 DLX 算法，这能让速度提升几十倍
 set(CMAKE_CXX_FLAGS "-O3 ${CMAKE_CXX_FLAGS}")
 
-# 寻找相关的 catkin 依赖包 (新增了 geometry_msgs, sensor_msgs, cv_bridge)
+# 🌟 1. 新增 message_generation 依赖
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
@@ -21,10 +21,26 @@ find_package(catkin REQUIRED COMPONENTS
   tf2_ros
   tf2_geometry_msgs
   xarm_msgs
+  message_generation 
 )
 
+# 🌟 2. 声明要编译的 Service 文件
+# 确保在 tly 包的根目录下创建了 srv 文件夹，并把 GetPrecisePose.srv 放进去！
+add_service_files(
+  FILES
+  GetPrecisePose.srv
+)
+
+# 🌟 3. 生成消息，依赖基础消息包
+generate_messages(
+  DEPENDENCIES
+  std_msgs
+  geometry_msgs
+)
+
+# 🌟 4. 在导出包时新增 message_runtime
 catkin_package(
-  CATKIN_DEPENDS roscpp rospy std_msgs geometry_msgs sensor_msgs cv_bridge moveit_ros_planning_interface tf2 xarm_msgs
+  CATKIN_DEPENDS roscpp rospy std_msgs geometry_msgs sensor_msgs cv_bridge moveit_ros_planning_interface tf2 xarm_msgs message_runtime
 )
 
 # 定义包含目录
@@ -44,19 +60,23 @@ catkin_install_python(PROGRAMS
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
+catkin_install_python(PROGRAMS
+  scripts/single_block_test.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
 # =========================================================
-# 1. 编译策略节点 (Strategy Node)
-#    纯粹的算力节点，不需要链接 MoveIt!，只需要 std_msgs 通信
+# 编译策略节点 (Strategy Node)
 # =========================================================
 add_executable(strategy_node src/strategy_node.cpp)
+# 这里的 ${${PROJECT_NAME}_EXPORTED_TARGETS} 确保了先生成 srv 头文件，再编译 cpp
 add_dependencies(strategy_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 target_link_libraries(strategy_node
   ${catkin_LIBRARIES}
 )
 
 # =========================================================
-# 2. 编译执行控制节点 (Controller Node)
-#    需要调用 MoveIt! API 控制真实机械臂，以及使用 TF2
+# 编译执行控制节点 (Controller Node)
 # =========================================================
 add_executable(xarm_controller_node src/xarm_controller_node.cpp)
 add_dependencies(xarm_controller_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
