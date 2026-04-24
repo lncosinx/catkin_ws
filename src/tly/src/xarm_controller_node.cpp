@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <array>
 
 struct PixelPoint
 {
@@ -175,10 +176,25 @@ private:
     bool use_cell_max_place_z_ = true;
     double place_z_extra_margin_ = 0.0;
 
+    // Pixel-position dependent affine correction for pick XY in table_frame.
+    bool use_pick_affine_correction_ = true;
+    bool pick_affine_loaded_ = false;
+    double pick_affine_cx_ = 0.0;
+    double pick_affine_cy_ = 0.0;
+    double pick_affine_x_[3] = {0.0, 0.0, 0.0};
+    double pick_affine_y_[3] = {0.0, 0.0, 0.0};
+
     double tcp_pick_offset_x_ = 0.0;
     double tcp_pick_offset_y_ = 0.0;
+    double tcp_pick_offset_z_ = 0.0;
     double tcp_place_offset_x_ = 0.0;
     double tcp_place_offset_y_ = 0.0;
+
+    // Per-shape/per-target-way pick yaw calibration.
+    // This fixes cases where the vision angle for an asymmetric piece is correct in
+    // position but 180 deg ambiguous for only some planned orientations.
+    // corr[shape][way] is added to the visual pick angle before building pick_pose.
+    std::array<std::array<int, 4>, 7> pick_yaw_corr_by_shape_way_{};
 
     bool use_precise_service_ = false;
     bool assume_image_rectified_ = false;
@@ -221,6 +237,7 @@ private:
         pnh_.param("control_period", control_period_, control_period_);
         pnh_.param("use_precise_service", use_precise_service_, use_precise_service_);
         pnh_.param("use_true_pick_plane", use_true_pick_plane_, use_true_pick_plane_);
+        pnh_.param("use_pick_affine_correction", use_pick_affine_correction_, use_pick_affine_correction_);
         pnh_.param("use_cell_max_place_z", use_cell_max_place_z_, use_cell_max_place_z_);
         pnh_.param("place_z_extra_margin", place_z_extra_margin_, place_z_extra_margin_);
         pnh_.param("assume_image_rectified", assume_image_rectified_, assume_image_rectified_);
@@ -231,8 +248,11 @@ private:
         pnh_.param("suction_off_wait", suction_off_wait_, suction_off_wait_);
         pnh_.param("tcp_pick_offset_x", tcp_pick_offset_x_, tcp_pick_offset_x_);
         pnh_.param("tcp_pick_offset_y", tcp_pick_offset_y_, tcp_pick_offset_y_);
+        pnh_.param("tcp_pick_offset_z", tcp_pick_offset_z_, tcp_pick_offset_z_);
         pnh_.param("tcp_place_offset_x", tcp_place_offset_x_, tcp_place_offset_x_);
         pnh_.param("tcp_place_offset_y", tcp_place_offset_y_, tcp_place_offset_y_);
+
+        loadPickYawCalibrationParams();
 
         nh_.param("/tetris/GRID_SIZE", GRID_SIZE_, GRID_SIZE_);
         nh_.param("/tetris/BOARD_ORIGIN_X", BOARD_ORIGIN_X_, BOARD_ORIGIN_X_);
@@ -243,15 +263,91 @@ private:
 
         loadBoardMapIfAvailable();
         loadPickPlaneIfAvailable();
+        loadPickAffineCorrectionIfAvailable();
         ROS_INFO("[CTRL] use_true_pick_plane=%s pick_plane_loaded=%s base_frame=%s",
                  use_true_pick_plane_ ? "true" : "false",
                  pick_plane_loaded_ ? "true" : "false",
                  base_frame_.c_str());
         ROS_INFO("[CTRL] place_z: use_cell_max=%s extra_margin=%.4f",
                  use_cell_max_place_z_ ? "true" : "false", place_z_extra_margin_);
-        ROS_INFO("[CTRL] TCP offsets: pick=(%.4f, %.4f), place=(%.4f, %.4f)",
-                 tcp_pick_offset_x_, tcp_pick_offset_y_,
+        ROS_INFO("[CTRL] pick_affine: use=%s loaded=%s center=(%.2f, %.2f) coeff_x=(%.6g, %.6g, %.6g) coeff_y=(%.6g, %.6g, %.6g)",
+                 use_pick_affine_correction_ ? "true" : "false",
+                 pick_affine_loaded_ ? "true" : "false",
+                 pick_affine_cx_, pick_affine_cy_,
+                 pick_affine_x_[0], pick_affine_x_[1], pick_affine_x_[2],
+                 pick_affine_y_[0], pick_affine_y_[1], pick_affine_y_[2]);
+        ROS_INFO("[CTRL] TCP offsets: pick=(%.4f, %.4f, %.4f), place=(%.4f, %.4f)",
+                 tcp_pick_offset_x_, tcp_pick_offset_y_, tcp_pick_offset_z_,
                  tcp_place_offset_x_, tcp_place_offset_y_);
+    }
+
+    static int normalizeDeg360(int a)
+    {
+        a %= 360;
+        if (a < 0)
+            a += 360;
+        return a;
+    }
+
+    static int normalizeWay(int way)
+    {
+        way %= 4;
+        if (way < 0)
+            way += 4;
+        return way;
+    }
+
+    void loadPickYawCalibrationParams()
+    {
+        for (auto &row : pick_yaw_corr_by_shape_way_)
+            row.fill(0);
+
+        // Coarse per-shape correction, applied to all target ways of that shape.
+        // Shape IDs: 0=line, 1=square, 2=T, 3=L_left, 4=L_right, 5=Z_left, 6=Z_right.
+        for (int shape = 0; shape < 7; ++shape)
+        {
+            int corr = 0;
+            std::string key = "pick_yaw_corr_shape" + std::to_string(shape) + "_deg";
+            pnh_.param(key, corr, 0);
+            corr = normalizeDeg360(corr);
+            for (int way = 0; way < 4; ++way)
+                pick_yaw_corr_by_shape_way_[shape][way] = corr;
+        }
+
+        // Fine per-shape + per-target-way correction. This is what you should use
+        // when only SOME L pieces are 180 deg off. Example launch param:
+        //   <param name="pick_yaw_corr_shape3_way0_deg" value="180" />
+        // means: L_left planned with way=0 uses visual_pick_angle + 180 deg.
+        for (int shape = 0; shape < 7; ++shape)
+        {
+            for (int way = 0; way < 4; ++way)
+            {
+                int corr = pick_yaw_corr_by_shape_way_[shape][way];
+                std::string key = "pick_yaw_corr_shape" + std::to_string(shape) +
+                                  "_way" + std::to_string(way) + "_deg";
+                pnh_.param(key, corr, corr);
+                pick_yaw_corr_by_shape_way_[shape][way] = normalizeDeg360(corr);
+            }
+        }
+
+        ROS_INFO("[CTRL] pick yaw correction table deg: shape0=[%d,%d,%d,%d] shape1=[%d,%d,%d,%d] shape2=[%d,%d,%d,%d] shape3=[%d,%d,%d,%d] shape4=[%d,%d,%d,%d] shape5=[%d,%d,%d,%d] shape6=[%d,%d,%d,%d]",
+                 pick_yaw_corr_by_shape_way_[0][0], pick_yaw_corr_by_shape_way_[0][1], pick_yaw_corr_by_shape_way_[0][2], pick_yaw_corr_by_shape_way_[0][3],
+                 pick_yaw_corr_by_shape_way_[1][0], pick_yaw_corr_by_shape_way_[1][1], pick_yaw_corr_by_shape_way_[1][2], pick_yaw_corr_by_shape_way_[1][3],
+                 pick_yaw_corr_by_shape_way_[2][0], pick_yaw_corr_by_shape_way_[2][1], pick_yaw_corr_by_shape_way_[2][2], pick_yaw_corr_by_shape_way_[2][3],
+                 pick_yaw_corr_by_shape_way_[3][0], pick_yaw_corr_by_shape_way_[3][1], pick_yaw_corr_by_shape_way_[3][2], pick_yaw_corr_by_shape_way_[3][3],
+                 pick_yaw_corr_by_shape_way_[4][0], pick_yaw_corr_by_shape_way_[4][1], pick_yaw_corr_by_shape_way_[4][2], pick_yaw_corr_by_shape_way_[4][3],
+                 pick_yaw_corr_by_shape_way_[5][0], pick_yaw_corr_by_shape_way_[5][1], pick_yaw_corr_by_shape_way_[5][2], pick_yaw_corr_by_shape_way_[5][3],
+                 pick_yaw_corr_by_shape_way_[6][0], pick_yaw_corr_by_shape_way_[6][1], pick_yaw_corr_by_shape_way_[6][2], pick_yaw_corr_by_shape_way_[6][3]);
+    }
+
+    int correctedPickAngleDeg(int shape_type, int target_way, int raw_angle_deg) const
+    {
+        int a = normalizeDeg360(raw_angle_deg);
+        if (shape_type < 0 || shape_type >= 7)
+            return a;
+        int way = normalizeWay(target_way);
+        int corr = pick_yaw_corr_by_shape_way_[shape_type][way];
+        return normalizeDeg360(a + corr);
     }
 
     void cameraInfoCallback(const sensor_msgs::CameraInfo::ConstPtr &msg)
@@ -421,6 +517,88 @@ private:
                  base_frame_.c_str(),
                  pick_plane_point_base_.x(), pick_plane_point_base_.y(), pick_plane_point_base_.z(),
                  pick_plane_normal_base_.x(), pick_plane_normal_base_.y(), pick_plane_normal_base_.z());
+    }
+
+    bool readDoubleArray(XmlRpc::XmlRpcValue &value, std::vector<double> &out)
+    {
+        if (value.getType() != XmlRpc::XmlRpcValue::TypeArray)
+            return false;
+
+        out.clear();
+        for (int i = 0; i < value.size(); ++i)
+        {
+            double x;
+            if (!xmlRpcToDouble(value[i], x))
+                return false;
+            out.push_back(x);
+        }
+        return true;
+    }
+
+    void loadPickAffineCorrectionIfAvailable()
+    {
+        if (!use_pick_affine_correction_)
+            return;
+
+        XmlRpc::XmlRpcValue corr;
+        if (!nh_.getParam("/tetris/PICK_AFFINE_CORRECTION", corr) ||
+            corr.getType() != XmlRpc::XmlRpcValue::TypeStruct)
+        {
+            ROS_WARN("[CTRL] /tetris/PICK_AFFINE_CORRECTION not found. Pick affine correction disabled.");
+            pick_affine_loaded_ = false;
+            return;
+        }
+
+        if (corr.hasMember("enabled"))
+        {
+            try
+            {
+                bool enabled = static_cast<bool>(corr["enabled"]);
+                if (!enabled)
+                {
+                    ROS_WARN("[CTRL] PICK_AFFINE_CORRECTION exists but enabled=false.");
+                    pick_affine_loaded_ = false;
+                    return;
+                }
+            }
+            catch (...)
+            {
+                // Ignore malformed enabled field and continue parsing coefficients.
+            }
+        }
+
+        if (!corr.hasMember("pixel_center") || !corr.hasMember("coeff_x") || !corr.hasMember("coeff_y"))
+        {
+            ROS_WARN("[CTRL] PICK_AFFINE_CORRECTION lacks pixel_center/coeff_x/coeff_y. Disabled.");
+            pick_affine_loaded_ = false;
+            return;
+        }
+
+        std::vector<double> pc, cx, cy;
+        if (!readDoubleArray(corr["pixel_center"], pc) ||
+            !readDoubleArray(corr["coeff_x"], cx) ||
+            !readDoubleArray(corr["coeff_y"], cy) ||
+            pc.size() < 2 || cx.size() < 3 || cy.size() < 3)
+        {
+            ROS_WARN("[CTRL] Failed to parse PICK_AFFINE_CORRECTION arrays. Disabled.");
+            pick_affine_loaded_ = false;
+            return;
+        }
+
+        pick_affine_cx_ = pc[0];
+        pick_affine_cy_ = pc[1];
+        for (int i = 0; i < 3; ++i)
+        {
+            pick_affine_x_[i] = cx[i];
+            pick_affine_y_[i] = cy[i];
+        }
+
+        pick_affine_loaded_ = true;
+
+        ROS_INFO("[CTRL] Loaded pick affine correction: center=(%.3f, %.3f), x=(%.9g, %.9g, %.9g), y=(%.9g, %.9g, %.9g)",
+                 pick_affine_cx_, pick_affine_cy_,
+                 pick_affine_x_[0], pick_affine_x_[1], pick_affine_x_[2],
+                 pick_affine_y_[0], pick_affine_y_[1], pick_affine_y_[2]);
     }
 
     static double clampDouble(double x, double lo, double hi)
@@ -696,6 +874,24 @@ private:
         return pixelToTablePoint(px, observation_cam_to_table_, PICK_Z_, out_table);
     }
 
+    void applyPickAffineCorrection(const PixelPoint &px, geometry_msgs::Point &p) const
+    {
+        if (!use_pick_affine_correction_ || !pick_affine_loaded_)
+            return;
+
+        double du = static_cast<double>(px.u) - pick_affine_cx_;
+        double dv = static_cast<double>(px.v) - pick_affine_cy_;
+
+        double dx = pick_affine_x_[0] + pick_affine_x_[1] * du + pick_affine_x_[2] * dv;
+        double dy = pick_affine_y_[0] + pick_affine_y_[1] * du + pick_affine_y_[2] * dv;
+
+        p.x += dx;
+        p.y += dy;
+
+        ROS_INFO("[CTRL] pick affine correction for pixel=(%d,%d): du=%.1f dv=%.1f => dX=%.3f mm dY=%.3f mm",
+                 px.u, px.v, du, dv, dx * 1000.0, dy * 1000.0);
+    }
+
     geometry_msgs::Pose buildPickPose(const PixelPoint &px, int angle_deg) const
     {
         geometry_msgs::Point p;
@@ -704,8 +900,10 @@ private:
             throw std::runtime_error("pixelToPickPointTable failed");
         }
 
+        applyPickAffineCorrection(px, p);
+
         double yaw = angle_deg * M_PI / 180.0;
-        geometry_msgs::Pose pose = makeDownPose(p.x + tcp_pick_offset_x_, p.y + tcp_pick_offset_y_, p.z, yaw);
+        geometry_msgs::Pose pose = makeDownPose(p.x + tcp_pick_offset_x_, p.y + tcp_pick_offset_y_, p.z + tcp_pick_offset_z_, yaw);
         ROS_INFO("[CTRL] pick pixel=(%d,%d), angle=%d => table pick=(%.6f, %.6f, %.6f), yaw=%.1f deg",
                  px.u, px.v, angle_deg, pose.position.x, pose.position.y, pose.position.z, angle_deg * 1.0);
         return pose;
@@ -828,7 +1026,13 @@ private:
 
             try
             {
-                goal.pick_pose = buildPickPose(goal.pick_pixel, goal.pick_angle_deg);
+                int corrected_pick_angle = correctedPickAngleDeg(goal.shape_type, goal.way, goal.pick_angle_deg);
+                if (corrected_pick_angle != normalizeDeg360(goal.pick_angle_deg))
+                {
+                    ROS_WARN("[CTRL] pick yaw corrected: shape=%d way=%d raw=%d corrected=%d",
+                             goal.shape_type, goal.way, goal.pick_angle_deg, corrected_pick_angle);
+                }
+                goal.pick_pose = buildPickPose(goal.pick_pixel, corrected_pick_angle);
                 goal.place_pose = buildPlacePose(goal);
             }
             catch (const std::exception &e)

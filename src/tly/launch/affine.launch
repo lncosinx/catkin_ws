@@ -73,39 +73,4 @@
         <param name="publish_debug_pose_array" value="true" />
     </node>
 
-    <!-- 8. 控制节点 -->
-    <node pkg="tly" type="xarm_controller_node" name="xarm_controller_node" output="screen"
-          launch-prefix="bash -c 'sleep 10; exec $0 $@'">
-        <param name="camera_info_topic" value="/camera/color/camera_info" />
-        <param name="camera_frame" value="camera_color_optical_frame" />
-        <param name="table_frame" value="table_frame" />
-        <param name="base_frame" value="link_base" />
-        <param name="assume_image_rectified" value="true" />
-
-        <param name="use_true_pick_plane" value="true" />
-        <param name="use_board_map" value="true" />
-        <param name="use_cell_max_place_z" value="true" />
-        <param name="place_z_extra_margin" value="$(arg place_z_extra_margin)" />
-        <param name="use_precise_service" value="false" />
-
-        <param name="velocity_scale" value="0.05" />
-        <param name="acceleration_scale" value="0.05" />
-        <param name="planning_time" value="5.0" />
-
-        <param name="tcp_pick_offset_x" value="0.0" />
-        <param name="tcp_pick_offset_y" value="0.0" />
-        <param name="tcp_place_offset_x" value="-0.005" />
-        <param name="tcp_place_offset_y" value="-0.005" />
-        <param name="use_pick_affine_correction" value="true"/>
-    </node>
-
-    <!-- 9. 单块测试节点：等控制节点订阅 /tetris_plan 且 robot_status 空闲后发一次 plan -->
-    <node pkg="tly" type="single_block_test.py" name="single_block_tester" output="screen"
-          launch-prefix="bash -c 'sleep 16; exec $0 $@'">
-        <param name="target_row" value="$(arg target_row)" />
-        <param name="target_col" value="$(arg target_col)" />
-        <param name="target_way" value="$(arg target_way)" />
-        <param name="use_detected_angle" value="true" />
-        <param name="override_pick_angle" value="0" />
-    </node>
 </launch>

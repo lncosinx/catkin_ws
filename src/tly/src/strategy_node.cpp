@@ -478,6 +478,16 @@ bool is_planning = false;
 bool is_robot_busy = false;
 bool task_completed = false;
 
+// 等待视觉结果完整且连续稳定，避免只识别到 20~30 个方块时策略节点提前规划。
+int expected_total_blocks = 35;
+// 如果视觉长期只差 1 个，可以允许 34 个稳定后先规划，避免永远等待。
+// strategy 内部本来就支持 34 块特判方案。
+int min_usable_total_blocks = 34;
+int inventory_stable_required_frames = 5;
+int min_usable_stable_required_frames = 3;
+int inventory_stable_count = 0;
+vector<int> last_inventory(7, -1);
+
 void statusCallback(const std_msgs::Bool::ConstPtr &msg)
 {
     is_robot_busy = msg->data;
@@ -501,11 +511,6 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
     if (msg->data.size() < 147)
         return;
 
-    is_planning = true;
-    ROS_INFO("===============================================================");
-    ROS_INFO("=      Received Vision Data. Launching Dynamic Engine V3      =");
-    ROS_INFO("===============================================================");
-
     vector<int> current_inventory(7, 0);
     int total_blocks = 0;
     for (int i = 0; i < 7; ++i)
@@ -513,6 +518,59 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
         current_inventory[i] = msg->data[i];
         total_blocks += current_inventory[i];
     }
+
+    // 1) 数量太少时不规划；但允许“差 1 个”的 34 块稳定库存作为可用 fallback。
+    if (total_blocks < min_usable_total_blocks)
+    {
+        inventory_stable_count = 0;
+        last_inventory = current_inventory;
+        ROS_WARN_THROTTLE(1.0,
+                          "[WAIT_VISION] recognized %d/%d blocks, below min usable %d. inv=[%d,%d,%d,%d,%d,%d,%d]",
+                          total_blocks, expected_total_blocks, min_usable_total_blocks,
+                          current_inventory[0], current_inventory[1], current_inventory[2],
+                          current_inventory[3], current_inventory[4], current_inventory[5], current_inventory[6]);
+        return;
+    }
+
+    // 2) 库存数组连续 N 帧不变，避免刚识别满时仍在抖动。
+    if (current_inventory == last_inventory)
+        inventory_stable_count++;
+    else
+    {
+        inventory_stable_count = 1;
+        last_inventory = current_inventory;
+    }
+
+    int required_stable = (total_blocks >= expected_total_blocks)
+                              ? inventory_stable_required_frames
+                              : min_usable_stable_required_frames;
+
+    if (inventory_stable_count < required_stable)
+    {
+        ROS_WARN_THROTTLE(1.0,
+                          "[WAIT_VISION] recognized %d/%d blocks, stable frame %d/%d. inv=[%d,%d,%d,%d,%d,%d,%d]",
+                          total_blocks, expected_total_blocks,
+                          inventory_stable_count, required_stable,
+                          current_inventory[0], current_inventory[1], current_inventory[2],
+                          current_inventory[3], current_inventory[4], current_inventory[5], current_inventory[6]);
+        return;
+    }
+
+    if (total_blocks < expected_total_blocks)
+    {
+        ROS_WARN("[WAIT_VISION] fallback planning with %d/%d blocks after stable inventory. inv=[%d,%d,%d,%d,%d,%d,%d]",
+                 total_blocks, expected_total_blocks,
+                 current_inventory[0], current_inventory[1], current_inventory[2],
+                 current_inventory[3], current_inventory[4], current_inventory[5], current_inventory[6]);
+    }
+
+    is_planning = true;
+    ROS_INFO("===============================================================");
+    ROS_INFO("=      Vision inventory stable. Launching Dynamic Engine V3    =");
+    ROS_INFO("=      total=%d inv=[%d,%d,%d,%d,%d,%d,%d]", total_blocks,
+             current_inventory[0], current_inventory[1], current_inventory[2],
+             current_inventory[3], current_inventory[4], current_inventory[5], current_inventory[6]);
+    ROS_INFO("===============================================================");
 
     int current_board[14][10];
     int idx = 7;
@@ -821,6 +879,12 @@ int main(int argc, char **argv)
 {
     ros::init(argc, argv, "tetris_strategy_node");
     ros::NodeHandle nh;
+    ros::NodeHandle pnh("~");
+
+    pnh.param("expected_total_blocks", expected_total_blocks, expected_total_blocks);
+    pnh.param("min_usable_total_blocks", min_usable_total_blocks, min_usable_total_blocks);
+    pnh.param("inventory_stable_required_frames", inventory_stable_required_frames, inventory_stable_required_frames);
+    pnh.param("min_usable_stable_required_frames", min_usable_stable_required_frames, min_usable_stable_required_frames);
 
     plan_pub = nh.advertise<std_msgs::Int32MultiArray>("/tetris_plan", 10, true);
 
@@ -828,6 +892,9 @@ int main(int argc, char **argv)
     ros::Subscriber vision_sub = nh.subscribe("/vision/board_state", 1, visionCallback);
 
     ROS_INFO("Strategy Node Started. Awaiting Int32MultiArray on '/vision/board_state'...");
+    ROS_INFO("[WAIT_VISION] expected_total_blocks=%d min_usable=%d stable_required_frames=%d min_usable_stable_frames=%d",
+             expected_total_blocks, min_usable_total_blocks,
+             inventory_stable_required_frames, min_usable_stable_required_frames);
 
     ros::spin();
     return 0;
