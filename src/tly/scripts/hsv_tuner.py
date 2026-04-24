@@ -5,7 +5,7 @@ def nothing(x):
     pass
 
 def main():
-    image_path = "/root/catkin_ws/src/tly/images/15_Color.png"
+    image_path = "/root/catkin_ws/src/tly/images/5_Color.png"
     img = cv2.imread(image_path)
     if img is None:
         print("找不到图片！请检查路径。")

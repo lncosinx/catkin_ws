@@ -1,0 +1,43 @@
+<launch>
+    <arg name="robot_ip" default="192.168.1.228" />
+
+    <!-- 可选：9 或 16。建议 16，用于拟合散落/抓取区域真实平面 -->
+    <arg name="pick_surface_samples" default="16" />
+
+    <!-- 白板标定模式：A=9点，B=25点，C=140点。白板翘曲明显建议 C -->
+    <arg name="board_mode" default="C" />
+
+    <!-- 白板高度插值：C 模式建议 idw；A/B 可用 quadratic 或 idw -->
+    <arg name="height_interpolation" default="idw" />
+
+    <!-- 放置高度额外余量，单位 m；默认 0，需要防刮蹭时可设 0.001 -->
+    <arg name="place_z_margin" default="0.001" />
+
+    <arg name="config_path" default="$(find tly)/config/tetris_config.yaml" />
+
+    <!-- 1. 启动官方真机 MoveIt 控制环境，提供 link_base <- link_eef TF -->
+    <include file="$(find xarm6_moveit_config)/launch/realMove_exec.launch">
+        <arg name="robot_ip" value="$(arg robot_ip)" />
+    </include>
+
+    <!-- 2. 启动 RealSense，相机内参来自 /camera/color/camera_info -->
+    <include file="$(find realsense2_camera)/launch/rs_camera.launch">
+        <arg name="align_depth" value="true" />
+    </include>
+
+    <!-- 3. 启动增强标定工具 -->
+    <node pkg="tly" type="calibration_tool.py" name="calibration_tool" output="screen"
+          launch-prefix="bash -c 'sleep 5; exec $0 $@'">
+        <param name="base_frame" value="link_base" />
+        <param name="eef_frame" value="link_eef" />
+        <param name="config_path" value="$(arg config_path)" />
+
+        <param name="pick_surface_samples" value="$(arg pick_surface_samples)" />
+        <param name="board_mode" value="$(arg board_mode)" />
+        <param name="height_interpolation" value="$(arg height_interpolation)" />
+        <param name="place_z_margin" value="$(arg place_z_margin)" />
+
+        <param name="block_samples" value="3" />
+        <param name="board_surface_samples" value="5" />
+    </node>
+</launch>

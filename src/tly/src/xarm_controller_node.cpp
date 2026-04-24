@@ -1,369 +1,1065 @@
 #include <ros/ros.h>
 #include <std_msgs/Bool.h>
 #include <std_msgs/Int32MultiArray.h>
+#include <sensor_msgs/CameraInfo.h>
+
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
+
+#include <geometry_msgs/Pose.h>
 #include <geometry_msgs/PointStamped.h>
+#include <geometry_msgs/TransformStamped.h>
 #include <xarm_msgs/SetDigitalIO.h>
-#include <tly/GetPrecisePose.h> 
+#include <tly/GetPrecisePose.h>
+
+#include <opencv2/calib3d.hpp>
+#include <opencv2/core.hpp>
+
+#include <XmlRpcValue.h>
+
+#include <cmath>
+#include <cstdio>
 #include <queue>
+#include <string>
+#include <vector>
+#include <algorithm>
 
-const double VELOCITY = 0.05;
-const double ACCELEARTION = 0.05;
-
-// 1. 定义状态机枚举
-enum class RobotState {
-    IDLE,
-    FLY_TO_HOVER,
-    REQUEST_VISION,
-    EXECUTE_PICK,
-    EXECUTE_PLACE
+struct PixelPoint
+{
+    int u = 0;
+    int v = 0;
 };
 
-// 2. 定义任务结构体
-struct TaskGoal {
-    int shape_type;
-    int way;
-    geometry_msgs::Pose coarse_pick_pose; // 策略节点给的粗略坐标
-    geometry_msgs::Pose place_pose;       // 策略节点给的放置坐标
+struct GridCenter
+{
+    double row = 0.0;
+    double col = 0.0;
 };
 
-class TetrisRobotController {
+struct GridCell
+{
+    int row = 0;
+    int col = 0;
+};
+
+struct TaskGoal
+{
+    int shape_type = -1;
+    int way = 0;
+    int pick_angle_deg = 0;
+
+    PixelPoint pick_pixel;
+    GridCenter place_grid_center;
+
+    // Backward compatible: old plan has no explicit cells.
+    // New extended plan may include 4 target cells for better place-z calculation.
+    bool has_target_cells = false;
+    std::vector<GridCell> target_cells;
+
+    geometry_msgs::Pose pick_pose;
+    geometry_msgs::Pose place_pose;
+};
+
+class XarmTetrisController
+{
+public:
+    XarmTetrisController()
+        : pnh_("~"),
+          tf_listener_(tf_buffer_),
+          move_group_("xarm6")
+    {
+        loadParams();
+
+        move_group_.setPoseReferenceFrame(table_frame_);
+        move_group_.setMaxVelocityScalingFactor(velocity_scale_);
+        move_group_.setMaxAccelerationScalingFactor(acceleration_scale_);
+        move_group_.setPlanningTime(planning_time_);
+        move_group_.setNumPlanningAttempts(planning_attempts_);
+
+        camera_info_sub_ = nh_.subscribe(camera_info_topic_, 1, &XarmTetrisController::cameraInfoCallback, this);
+
+        ROS_INFO("[CTRL] Waiting for CameraInfo on %s ...", camera_info_topic_.c_str());
+        sensor_msgs::CameraInfoConstPtr cam_msg =
+            ros::topic::waitForMessage<sensor_msgs::CameraInfo>(camera_info_topic_, nh_, ros::Duration(5.0));
+
+        if (cam_msg)
+        {
+            cameraInfoCallback(cam_msg);
+            ROS_INFO("[CTRL] CameraInfo received before subscribing plan.");
+        }
+        else
+        {
+            ROS_WARN("[CTRL] CameraInfo not received within 5 seconds. Will still subscribe and wait later.");
+        }
+
+        plan_sub_ = nh_.subscribe(plan_topic_, 1, &XarmTetrisController::planCallback, this);
+
+        io_client_ = nh_.serviceClient<xarm_msgs::SetDigitalIO>(io_service_);
+        precise_client_ = nh_.serviceClient<tly::GetPrecisePose>(precise_service_);
+
+        status_pub_ = nh_.advertise<std_msgs::Bool>(status_topic_, 1, true);
+        publishBusy(false);
+
+        control_timer_ = nh_.createTimer(ros::Duration(control_period_), &XarmTetrisController::controlLoop, this);
+
+        ROS_INFO("[CTRL] Refactored xArm controller ready.");
+        ROS_INFO("[CTRL] plan=%s camera_info=%s table_frame=%s camera_frame=%s use_precise_service=%s",
+                 plan_topic_.c_str(), camera_info_topic_.c_str(), table_frame_.c_str(),
+                 camera_frame_.empty() ? "(from CameraInfo/Image TF)" : camera_frame_.c_str(),
+                 use_precise_service_ ? "true" : "false");
+    }
+
 private:
+    enum class State
+    {
+        IDLE,
+        TAKE_NEXT_TASK,
+        MOVE_TO_PICK_HOVER,
+        OPTIONAL_PRECISE_CORRECTION,
+        EXECUTE_PICK,
+        MOVE_TO_PLACE_HOVER,
+        EXECUTE_PLACE,
+        FINISH
+    };
+
     ros::NodeHandle nh_;
+    ros::NodeHandle pnh_;
     ros::Subscriber plan_sub_;
-    ros::ServiceClient io_client_;
+    ros::Subscriber camera_info_sub_;
     ros::Publisher status_pub_;
+    ros::ServiceClient io_client_;
+    ros::ServiceClient precise_client_;
+    ros::Timer control_timer_;
+
     tf2_ros::Buffer tf_buffer_;
     tf2_ros::TransformListener tf_listener_;
-    ros::ServiceClient vision_client_;
-    ros::Timer control_timer_;
-    
-    RobotState current_state_ = RobotState::IDLE;
-    std::queue<TaskGoal> task_queue_;
-    TaskGoal current_task_;
-    
-    geometry_msgs::Pose precise_pick_pose_; // 修正后的精确抓取坐标
-    
     moveit::planning_interface::MoveGroupInterface move_group_;
 
-    geometry_msgs::TransformStamped cam_to_table_tx_; // 保存拍照瞬间的相机状态
+    State state_ = State::IDLE;
+    std::queue<TaskGoal> tasks_;
+    TaskGoal current_task_;
 
-    // 动态加载的参数
-    double GRID_SIZE, BOARD_ORIGIN_X, BOARD_ORIGIN_Y;
-    double PICK_Z, PLACE_Z, HOVER_Z; // 【新增】：加入 PICK_Z
-    double CAM_FX, CAM_FY, CAM_CX, CAM_CY, TABLE_Z_IN_CAMERA;
-    double CAM_OFFSET_X, CAM_OFFSET_Y;
+    std::string plan_topic_ = "/tetris_plan";
+    std::string status_topic_ = "/robot_status";
+    std::string io_service_ = "/xarm/set_controller_dout";
+    std::string precise_service_ = "/vision/get_precise_pose";
+    std::string camera_info_topic_ = "/camera/color/camera_info";
+    std::string table_frame_ = "table_frame";
+    std::string base_frame_ = "link_base";
+    std::string camera_frame_ = "camera_color_optical_frame";
 
-public:
-    TetrisRobotController() : 
-        tf_listener_(tf_buffer_), 
-        move_group_("xarm6") 
+    double velocity_scale_ = 0.05;
+    double acceleration_scale_ = 0.05;
+    double planning_time_ = 5.0;
+    int planning_attempts_ = 5;
+    double control_period_ = 0.05;
+
+    double GRID_SIZE_ = 0.017;
+    double BOARD_ORIGIN_X_ = 0.0;
+    double BOARD_ORIGIN_Y_ = 0.0;
+    double PICK_Z_ = 0.0;
+    double PLACE_Z_ = 0.0;
+    double HOVER_Z_ = 0.10;
+
+    // True pick plane in base_frame. When available, pick pixels are projected
+    // onto this arbitrary 3D plane instead of assuming table_frame Z=PICK_Z.
+    bool use_true_pick_plane_ = true;
+    bool pick_plane_loaded_ = false;
+    tf2::Vector3 pick_plane_point_base_{0.0, 0.0, 0.0};
+    tf2::Vector3 pick_plane_normal_base_{0.0, 0.0, 1.0};
+
+    // If extended plan includes 4 target cells, use their PLACE_Z_MAP values.
+    bool use_cell_max_place_z_ = true;
+    double place_z_extra_margin_ = 0.0;
+
+    double tcp_pick_offset_x_ = 0.0;
+    double tcp_pick_offset_y_ = 0.0;
+    double tcp_place_offset_x_ = 0.0;
+    double tcp_place_offset_y_ = 0.0;
+
+    bool use_precise_service_ = false;
+    bool assume_image_rectified_ = false;
+    bool use_board_map_ = true;
+    bool stop_on_motion_failure_ = true;
+
+    int suction_io_num_ = 1;
+    double suction_on_wait_ = 0.35;
+    double suction_off_wait_ = 0.35;
+
+    bool camera_info_ready_ = false;
+    cv::Mat K_;
+    cv::Mat D_;
+    cv::Mat P_;
+
+    bool board_centers_loaded_ = false;
+    bool place_z_map_loaded_ = false;
+    std::vector<std::vector<geometry_msgs::Point>> board_centers_; // [14][10]
+    std::vector<std::vector<double>> place_z_map_;                 // [14][10]
+
+    geometry_msgs::TransformStamped observation_cam_to_table_;
+    geometry_msgs::TransformStamped observation_cam_to_base_;
+    geometry_msgs::TransformStamped observation_base_to_table_;
+    bool observation_tf_ready_ = false;
+
+    void loadParams()
     {
-        // 1. 从 ROS 参数服务器加载配置文件 (如果没读到，使用后备默认值)
-        nh_.param("/tetris/GRID_SIZE", GRID_SIZE, 0.017);
-        nh_.param("/tetris/BOARD_ORIGIN_X", BOARD_ORIGIN_X, 0.0);
-        nh_.param("/tetris/BOARD_ORIGIN_Y", BOARD_ORIGIN_Y, 0.0);
-        nh_.param("/tetris/PICK_Z", PICK_Z, 0.0);  // 【新增】：从参数服务器读取抓取高度
-        nh_.param("/tetris/PLACE_Z", PLACE_Z, 0.0);
-        nh_.param("/tetris/HOVER_Z", HOVER_Z, 0.1);
-        nh_.param("/tetris/CAM_FX", CAM_FX, 911.8016);
-        nh_.param("/tetris/CAM_FY", CAM_FY, 911.2428);
-        nh_.param("/tetris/CAM_CX", CAM_CX, 634.7139);
-        nh_.param("/tetris/CAM_CY", CAM_CY, 357.0596);
-        nh_.param("/tetris/TABLE_Z_IN_CAMERA", TABLE_Z_IN_CAMERA, 0.49);
-        nh_.param("/tetris/CAM_OFFSET_X", CAM_OFFSET_X, 0.06); 
-        nh_.param("/tetris/CAM_OFFSET_Y", CAM_OFFSET_Y, 0.00);
+        pnh_.param("plan_topic", plan_topic_, plan_topic_);
+        pnh_.param("status_topic", status_topic_, status_topic_);
+        pnh_.param("io_service", io_service_, io_service_);
+        pnh_.param("precise_service", precise_service_, precise_service_);
+        pnh_.param("camera_info_topic", camera_info_topic_, camera_info_topic_);
+        pnh_.param("table_frame", table_frame_, table_frame_);
+        pnh_.param("base_frame", base_frame_, base_frame_);
+        pnh_.param("camera_frame", camera_frame_, camera_frame_);
+        pnh_.param("velocity_scale", velocity_scale_, velocity_scale_);
+        pnh_.param("acceleration_scale", acceleration_scale_, acceleration_scale_);
+        pnh_.param("planning_time", planning_time_, planning_time_);
+        pnh_.param("planning_attempts", planning_attempts_, planning_attempts_);
+        pnh_.param("control_period", control_period_, control_period_);
+        pnh_.param("use_precise_service", use_precise_service_, use_precise_service_);
+        pnh_.param("use_true_pick_plane", use_true_pick_plane_, use_true_pick_plane_);
+        pnh_.param("use_cell_max_place_z", use_cell_max_place_z_, use_cell_max_place_z_);
+        pnh_.param("place_z_extra_margin", place_z_extra_margin_, place_z_extra_margin_);
+        pnh_.param("assume_image_rectified", assume_image_rectified_, assume_image_rectified_);
+        pnh_.param("use_board_map", use_board_map_, use_board_map_);
+        pnh_.param("stop_on_motion_failure", stop_on_motion_failure_, stop_on_motion_failure_);
+        pnh_.param("suction_io_num", suction_io_num_, suction_io_num_);
+        pnh_.param("suction_on_wait", suction_on_wait_, suction_on_wait_);
+        pnh_.param("suction_off_wait", suction_off_wait_, suction_off_wait_);
+        pnh_.param("tcp_pick_offset_x", tcp_pick_offset_x_, tcp_pick_offset_x_);
+        pnh_.param("tcp_pick_offset_y", tcp_pick_offset_y_, tcp_pick_offset_y_);
+        pnh_.param("tcp_place_offset_x", tcp_place_offset_x_, tcp_place_offset_x_);
+        pnh_.param("tcp_place_offset_y", tcp_place_offset_y_, tcp_place_offset_y_);
 
-        // 2. 将规划的“绝对参考系”切换为我们的自定义桌面坐标系！
-        move_group_.setPoseReferenceFrame("table_frame");
-        move_group_.setMaxVelocityScalingFactor(VELOCITY);
-        move_group_.setMaxAccelerationScalingFactor(ACCELEARTION);
-        vision_client_ = nh_.serviceClient<tly::GetPrecisePose>("/vision/get_precise_pose");
-        
-        // 开启一个 10Hz 的定时器来驱动状态机
-        control_timer_ = nh_.createTimer(ros::Duration(0.1), &TetrisRobotController::controlLoop, this);
-        
-        plan_sub_ = nh_.subscribe("/tetris_plan", 1, &TetrisRobotController::planCallback, this);
-        io_client_ = nh_.serviceClient<xarm_msgs::SetDigitalIO>("/xarm/set_controller_dout");
-        status_pub_ = nh_.advertise<std_msgs::Bool>("/robot_status", 1, true);
-        
-        std_msgs::Bool init_msg;
-        init_msg.data = false;
-        status_pub_.publish(init_msg);
-        
-        ROS_INFO("Controller Ready. Operating in [table_frame] coordinate system.");
+        nh_.param("/tetris/GRID_SIZE", GRID_SIZE_, GRID_SIZE_);
+        nh_.param("/tetris/BOARD_ORIGIN_X", BOARD_ORIGIN_X_, BOARD_ORIGIN_X_);
+        nh_.param("/tetris/BOARD_ORIGIN_Y", BOARD_ORIGIN_Y_, BOARD_ORIGIN_Y_);
+        nh_.param("/tetris/PICK_Z", PICK_Z_, PICK_Z_);
+        nh_.param("/tetris/PLACE_Z", PLACE_Z_, PLACE_Z_);
+        nh_.param("/tetris/HOVER_Z", HOVER_Z_, HOVER_Z_);
+
+        loadBoardMapIfAvailable();
+        loadPickPlaneIfAvailable();
+        ROS_INFO("[CTRL] use_true_pick_plane=%s pick_plane_loaded=%s base_frame=%s",
+                 use_true_pick_plane_ ? "true" : "false",
+                 pick_plane_loaded_ ? "true" : "false",
+                 base_frame_.c_str());
+        ROS_INFO("[CTRL] place_z: use_cell_max=%s extra_margin=%.4f",
+                 use_cell_max_place_z_ ? "true" : "false", place_z_extra_margin_);
+        ROS_INFO("[CTRL] TCP offsets: pick=(%.4f, %.4f), place=(%.4f, %.4f)",
+                 tcp_pick_offset_x_, tcp_pick_offset_y_,
+                 tcp_place_offset_x_, tcp_place_offset_y_);
     }
 
-    void setSuctionCup(bool on) {
-        xarm_msgs::SetDigitalIO srv;
-        srv.request.io_num = 1; 
-        srv.request.value = on ? 1 : 0; 
-        if (!io_client_.call(srv)) {
-            ROS_ERROR("Failed to call xArm IO service!");
+    void cameraInfoCallback(const sensor_msgs::CameraInfo::ConstPtr &msg)
+    {
+        K_ = cv::Mat(3, 3, CV_64F);
+        P_ = cv::Mat(3, 4, CV_64F);
+        for (int i = 0; i < 9; ++i)
+            K_.at<double>(i / 3, i % 3) = msg->K[i];
+        for (int i = 0; i < 12; ++i)
+            P_.at<double>(i / 4, i % 4) = msg->P[i];
+
+        D_ = cv::Mat(1, static_cast<int>(msg->D.size()), CV_64F);
+        for (size_t i = 0; i < msg->D.size(); ++i)
+            D_.at<double>(0, static_cast<int>(i)) = msg->D[i];
+
+        if (camera_frame_.empty())
+            camera_frame_ = msg->header.frame_id;
+        camera_info_ready_ = true;
+    }
+
+    static bool xmlRpcToDouble(XmlRpc::XmlRpcValue &v, double &out)
+    {
+        if (v.getType() == XmlRpc::XmlRpcValue::TypeDouble)
+        {
+            out = static_cast<double>(v);
+            return true;
+        }
+        if (v.getType() == XmlRpc::XmlRpcValue::TypeInt)
+        {
+            out = static_cast<int>(v);
+            return true;
+        }
+        return false;
+    }
+
+    bool readPointList(XmlRpc::XmlRpcValue &value, geometry_msgs::Point &p)
+    {
+        if (value.getType() != XmlRpc::XmlRpcValue::TypeArray || value.size() < 3)
+            return false;
+        double x, y, z;
+        if (!xmlRpcToDouble(value[0], x) || !xmlRpcToDouble(value[1], y) || !xmlRpcToDouble(value[2], z))
+            return false;
+        p.x = x;
+        p.y = y;
+        p.z = z;
+        return true;
+    }
+
+    void loadBoardMapIfAvailable()
+    {
+        if (!use_board_map_)
+            return;
+
+        XmlRpc::XmlRpcValue centers;
+        if (nh_.getParam("/tetris/BOARD_CENTERS_14x10_TABLE", centers) &&
+            centers.getType() == XmlRpc::XmlRpcValue::TypeArray && centers.size() == 14)
+        {
+            board_centers_.assign(14, std::vector<geometry_msgs::Point>(10));
+            bool ok = true;
+            for (int r = 0; r < 14 && ok; ++r)
+            {
+                if (centers[r].getType() != XmlRpc::XmlRpcValue::TypeArray || centers[r].size() != 10)
+                {
+                    ok = false;
+                    break;
+                }
+                for (int c = 0; c < 10; ++c)
+                {
+                    if (!readPointList(centers[r][c], board_centers_[r][c]))
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            board_centers_loaded_ = ok;
+            if (ok)
+                ROS_INFO("[CTRL] Loaded /tetris/BOARD_CENTERS_14x10_TABLE.");
+            else
+                ROS_WARN("[CTRL] BOARD_CENTERS_14x10_TABLE exists but parsing failed; fallback to GRID_SIZE.");
+        }
+
+        XmlRpc::XmlRpcValue zmap;
+        if (nh_.getParam("/tetris/PLACE_Z_MAP_14x10", zmap) &&
+            zmap.getType() == XmlRpc::XmlRpcValue::TypeArray && zmap.size() == 14)
+        {
+            place_z_map_.assign(14, std::vector<double>(10, PLACE_Z_));
+            bool ok = true;
+            for (int r = 0; r < 14 && ok; ++r)
+            {
+                if (zmap[r].getType() != XmlRpc::XmlRpcValue::TypeArray || zmap[r].size() != 10)
+                {
+                    ok = false;
+                    break;
+                }
+                for (int c = 0; c < 10; ++c)
+                {
+                    if (!xmlRpcToDouble(zmap[r][c], place_z_map_[r][c]))
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            place_z_map_loaded_ = ok;
+            if (ok)
+                ROS_INFO("[CTRL] Loaded /tetris/PLACE_Z_MAP_14x10.");
+            else
+                ROS_WARN("[CTRL] PLACE_Z_MAP_14x10 exists but parsing failed; fallback to PLACE_Z.");
         }
     }
 
+    bool readVector3List(XmlRpc::XmlRpcValue &value, tf2::Vector3 &out)
+    {
+        if (value.getType() != XmlRpc::XmlRpcValue::TypeArray || value.size() < 3)
+            return false;
 
-    // 2. 彻底重写坐标系转换函数（使用严谨的数学射线求交）
-    bool transformPixelToRobotBase(int u, int v, geometry_msgs::Pose& out_pose) {
-        // 步骤 A: 计算相机坐标系下的 3D 射线方向向量
-        double ray_x_cam = (u - CAM_CX) / CAM_FX;
-        double ray_y_cam = (v - CAM_CY) / CAM_FY;
-        double ray_z_cam = 1.0;
+        double x, y, z;
+        if (!xmlRpcToDouble(value[0], x) || !xmlRpcToDouble(value[1], y) || !xmlRpcToDouble(value[2], z))
+            return false;
 
-        // 步骤 B: 提取相机的旋转矩阵，将射线旋转到桌面坐标系(table_frame)
-        tf2::Quaternion q_cam;
-        tf2::fromMsg(cam_to_table_tx_.transform.rotation, q_cam);
-        tf2::Matrix3x3 m_cam(q_cam);
-        
-        tf2::Vector3 ray_cam(ray_x_cam, ray_y_cam, ray_z_cam);
-        tf2::Vector3 ray_table = m_cam * ray_cam; // 现在的射线方向是相对于桌面的
+        out = tf2::Vector3(x, y, z);
+        return true;
+    }
 
-        // 步骤 C: 提取相机的三维空间位置
+    void loadPickPlaneIfAvailable()
+    {
+        if (!use_true_pick_plane_)
+            return;
+
+        XmlRpc::XmlRpcValue plane;
+        if (!nh_.getParam("/tetris/PICK_SURFACE_PLANE_BASE", plane) ||
+            plane.getType() != XmlRpc::XmlRpcValue::TypeStruct)
+        {
+            ROS_WARN("[CTRL] /tetris/PICK_SURFACE_PLANE_BASE not found. Fallback to table_frame Z=PICK_Z.");
+            pick_plane_loaded_ = false;
+            return;
+        }
+
+        if (!plane.hasMember("point") || !plane.hasMember("normal"))
+        {
+            ROS_WARN("[CTRL] PICK_SURFACE_PLANE_BASE lacks point/normal. Fallback to table_frame Z=PICK_Z.");
+            pick_plane_loaded_ = false;
+            return;
+        }
+
+        tf2::Vector3 p, n;
+        if (!readVector3List(plane["point"], p) || !readVector3List(plane["normal"], n))
+        {
+            ROS_WARN("[CTRL] Failed to parse PICK_SURFACE_PLANE_BASE. Fallback to table_frame Z=PICK_Z.");
+            pick_plane_loaded_ = false;
+            return;
+        }
+
+        if (n.length() < 1e-9)
+        {
+            ROS_WARN("[CTRL] PICK_SURFACE_PLANE_BASE normal has zero length. Fallback to table_frame Z=PICK_Z.");
+            pick_plane_loaded_ = false;
+            return;
+        }
+
+        pick_plane_point_base_ = p;
+        pick_plane_normal_base_ = n.normalized();
+        pick_plane_loaded_ = true;
+
+        ROS_INFO("[CTRL] Loaded true pick plane in %s: point=(%.6f, %.6f, %.6f), normal=(%.6f, %.6f, %.6f)",
+                 base_frame_.c_str(),
+                 pick_plane_point_base_.x(), pick_plane_point_base_.y(), pick_plane_point_base_.z(),
+                 pick_plane_normal_base_.x(), pick_plane_normal_base_.y(), pick_plane_normal_base_.z());
+    }
+
+    static double clampDouble(double x, double lo, double hi)
+    {
+        return std::max(lo, std::min(hi, x));
+    }
+
+    geometry_msgs::Point bilinearBoardCenter(double row, double col) const
+    {
+        geometry_msgs::Point fallback;
+        fallback.x = BOARD_ORIGIN_X_ - row * GRID_SIZE_;
+        fallback.y = BOARD_ORIGIN_Y_ - col * GRID_SIZE_;
+        fallback.z = PLACE_Z_;
+
+        if (!board_centers_loaded_)
+            return fallback;
+
+        row = clampDouble(row, 0.0, 13.0);
+        col = clampDouble(col, 0.0, 9.0);
+
+        int r0 = static_cast<int>(std::floor(row));
+        int c0 = static_cast<int>(std::floor(col));
+        int r1 = std::min(13, r0 + 1);
+        int c1 = std::min(9, c0 + 1);
+        double tr = row - r0;
+        double tc = col - c0;
+
+        const auto &p00 = board_centers_[r0][c0];
+        const auto &p10 = board_centers_[r1][c0];
+        const auto &p01 = board_centers_[r0][c1];
+        const auto &p11 = board_centers_[r1][c1];
+
+        geometry_msgs::Point p;
+        p.x = (1 - tr) * (1 - tc) * p00.x + tr * (1 - tc) * p10.x + (1 - tr) * tc * p01.x + tr * tc * p11.x;
+        p.y = (1 - tr) * (1 - tc) * p00.y + tr * (1 - tc) * p10.y + (1 - tr) * tc * p01.y + tr * tc * p11.y;
+        p.z = (1 - tr) * (1 - tc) * p00.z + tr * (1 - tc) * p10.z + (1 - tr) * tc * p01.z + tr * tc * p11.z;
+        return p;
+    }
+
+    double bilinearPlaceZ(double row, double col) const
+    {
+        if (!place_z_map_loaded_)
+            return PLACE_Z_;
+
+        row = clampDouble(row, 0.0, 13.0);
+        col = clampDouble(col, 0.0, 9.0);
+
+        int r0 = static_cast<int>(std::floor(row));
+        int c0 = static_cast<int>(std::floor(col));
+        int r1 = std::min(13, r0 + 1);
+        int c1 = std::min(9, c0 + 1);
+        double tr = row - r0;
+        double tc = col - c0;
+
+        double z00 = place_z_map_[r0][c0];
+        double z10 = place_z_map_[r1][c0];
+        double z01 = place_z_map_[r0][c1];
+        double z11 = place_z_map_[r1][c1];
+
+        return (1 - tr) * (1 - tc) * z00 + tr * (1 - tc) * z10 + (1 - tr) * tc * z01 + tr * tc * z11;
+    }
+
+    double placeZFromTargetCells(const TaskGoal &goal) const
+    {
+        double z_center = bilinearPlaceZ(goal.place_grid_center.row, goal.place_grid_center.col);
+
+        if (!goal.has_target_cells || goal.target_cells.empty() || !place_z_map_loaded_ || !use_cell_max_place_z_)
+            return z_center + place_z_extra_margin_;
+
+        double z_max = -1e9;
+        for (const auto &cell : goal.target_cells)
+        {
+            int r = std::max(0, std::min(13, cell.row));
+            int c = std::max(0, std::min(9, cell.col));
+            z_max = std::max(z_max, place_z_map_[r][c]);
+        }
+
+        return z_max + place_z_extra_margin_;
+    }
+
+    geometry_msgs::Pose makeDownPose(double x, double y, double z, double yaw_rad) const
+    {
+        geometry_msgs::Pose pose;
+        pose.position.x = x;
+        pose.position.y = y;
+        pose.position.z = z;
+
+        tf2::Quaternion q;
+        q.setRPY(M_PI, 0.0, yaw_rad);
+        pose.orientation = tf2::toMsg(q);
+        return pose;
+    }
+
+    bool getCurrentCameraTransforms(geometry_msgs::TransformStamped &cam_to_table,
+                                    geometry_msgs::TransformStamped &cam_to_base,
+                                    geometry_msgs::TransformStamped &base_to_table)
+    {
+        if (camera_frame_.empty())
+        {
+            ROS_ERROR("[CTRL] camera_frame is empty and CameraInfo has not arrived.");
+            return false;
+        }
+
+        try
+        {
+            cam_to_table = tf_buffer_.lookupTransform(table_frame_, camera_frame_, ros::Time(0), ros::Duration(1.0));
+            base_to_table = tf_buffer_.lookupTransform(table_frame_, base_frame_, ros::Time(0), ros::Duration(1.0));
+
+            if (use_true_pick_plane_ && pick_plane_loaded_)
+            {
+                cam_to_base = tf_buffer_.lookupTransform(base_frame_, camera_frame_, ros::Time(0), ros::Duration(1.0));
+            }
+
+            return true;
+        }
+        catch (const tf2::TransformException &ex)
+        {
+            ROS_ERROR("[CTRL] TF lookup failed. table=%s base=%s camera=%s: %s",
+                      table_frame_.c_str(), base_frame_.c_str(), camera_frame_.c_str(), ex.what());
+            return false;
+        }
+    }
+
+    bool pixelToNormalizedRay(double u, double v, cv::Vec3d &ray) const
+    {
+        if (!camera_info_ready_)
+            return false;
+
+        if (assume_image_rectified_)
+        {
+            double fx = P_.at<double>(0, 0);
+            double fy = P_.at<double>(1, 1);
+            double cx = P_.at<double>(0, 2);
+            double cy = P_.at<double>(1, 2);
+            if (std::abs(fx) < 1e-9 || std::abs(fy) < 1e-9)
+                return false;
+            ray = cv::Vec3d((u - cx) / fx, (v - cy) / fy, 1.0);
+            return true;
+        }
+
+        std::vector<cv::Point2d> src;
+        src.emplace_back(u, v);
+        std::vector<cv::Point2d> undistorted;
+        cv::undistortPoints(src, undistorted, K_, D_);
+        if (undistorted.empty())
+            return false;
+        ray = cv::Vec3d(undistorted[0].x, undistorted[0].y, 1.0);
+        return true;
+    }
+
+    bool pixelToTablePoint(const PixelPoint &px,
+                           const geometry_msgs::TransformStamped &cam_to_table,
+                           double plane_z,
+                           geometry_msgs::Point &out) const
+    {
+        cv::Vec3d ray_cam;
+        if (!pixelToNormalizedRay(px.u, px.v, ray_cam))
+        {
+            ROS_ERROR("[CTRL] Cannot project pixel (%d,%d): CameraInfo unavailable or invalid.", px.u, px.v);
+            return false;
+        }
+
+        tf2::Quaternion q;
+        tf2::fromMsg(cam_to_table.transform.rotation, q);
+        tf2::Matrix3x3 R(q);
+
+        tf2::Vector3 ray_table;
+        ray_table.setX(R[0][0] * ray_cam[0] + R[0][1] * ray_cam[1] + R[0][2] * ray_cam[2]);
+        ray_table.setY(R[1][0] * ray_cam[0] + R[1][1] * ray_cam[1] + R[1][2] * ray_cam[2]);
+        ray_table.setZ(R[2][0] * ray_cam[0] + R[2][1] * ray_cam[1] + R[2][2] * ray_cam[2]);
+
         tf2::Vector3 cam_pos(
-            cam_to_table_tx_.transform.translation.x,
-            cam_to_table_tx_.transform.translation.y,
-            cam_to_table_tx_.transform.translation.z
-        );
+            cam_to_table.transform.translation.x,
+            cam_to_table.transform.translation.y,
+            cam_to_table.transform.translation.z);
 
-        // 步骤 D: 射线与目标高度平面 (Z = PICK_Z) 求交点
-        // 数学公式: cam_pos.z + t * ray_table.z = PICK_Z
-        if (std::abs(ray_table.z()) < 1e-6) {
-            ROS_ERROR("Camera is looking parallel to the table, cannot intersect!");
-            return false;
-        }
-        
-        double t = (PICK_Z - cam_pos.z()) / ray_table.z();
-        if (t < 0) {
-            ROS_ERROR("The object is behind the camera? Please check TF tree.");
+        double denom = ray_table.z();
+        if (std::abs(denom) < 1e-9)
+        {
+            ROS_ERROR("[CTRL] Camera ray is parallel to plane Z=%.6f.", plane_z);
             return false;
         }
 
-        // 步骤 E: 计算出物理世界中初步的 X 和 Y (基于射线的理论交点)
-        tf2::Vector3 intersect_pt = cam_pos + ray_table * t;
+        double t = (plane_z - cam_pos.z()) / denom;
+        if (t < 0.0)
+        {
+            ROS_ERROR("[CTRL] Pixel ray intersects behind camera. Check TF/camera frame.");
+            return false;
+        }
 
-        // ==========================================
-        // 🔧 工业级终极补偿：平移 + 缩放 (两步法)
-        // ==========================================
-        
-        // 1. 静态补偿 (只负责修复画面【正中心】的绝对偏移)
-        // 先全部重置为 0 开始调
-        double COMP_X = -0.0045;   
-        double COMP_Y = 0.0035;  
+        tf2::Vector3 p = cam_pos + ray_table * t;
+        out.x = p.x();
+        out.y = p.y();
+        out.z = p.z();
+        return true;
+    }
 
-        // 计算方块落在距离相机正下方（视野中心）有多远
-        double dist_x = intersect_pt.x() - cam_pos.x();
-        double dist_y = intersect_pt.y() - cam_pos.y();
+    bool pixelToTruePickPlaneTablePoint(const PixelPoint &px,
+                                        const geometry_msgs::TransformStamped &cam_to_base,
+                                        const geometry_msgs::TransformStamped &base_to_table,
+                                        geometry_msgs::Point &out_table) const
+    {
+        cv::Vec3d ray_cam;
+        if (!pixelToNormalizedRay(px.u, px.v, ray_cam))
+        {
+            ROS_ERROR("[CTRL] Cannot project pixel (%d,%d): CameraInfo unavailable or invalid.", px.u, px.v);
+            return false;
+        }
 
-        // 2. 动态发散系数 (负责修复【越靠画面边缘偏得越多】的问题)
-        // 填入极小的小数，例如 0.05 或 -0.03
-        double SCALE_X = 0.155; 
-        double SCALE_Y = 0.2; 
+        tf2::Quaternion q;
+        tf2::fromMsg(cam_to_base.transform.rotation, q);
+        tf2::Matrix3x3 R(q);
 
-        // 最终坐标 = 理论坐标 + 固定平移 + 随距离放大的畸变修正
-        out_pose.position.x = intersect_pt.x() + COMP_X + (dist_x * SCALE_X);
-        out_pose.position.y = intersect_pt.y() + COMP_Y + (dist_y * SCALE_Y);
-        out_pose.position.z = PICK_Z;
+        tf2::Vector3 ray_base;
+        ray_base.setX(R[0][0] * ray_cam[0] + R[0][1] * ray_cam[1] + R[0][2] * ray_cam[2]);
+        ray_base.setY(R[1][0] * ray_cam[0] + R[1][1] * ray_cam[1] + R[1][2] * ray_cam[2]);
+        ray_base.setZ(R[2][0] * ray_cam[0] + R[2][1] * ray_cam[1] + R[2][2] * ray_cam[2]);
 
-        // 默认朝向：末端向下直指桌面
-        tf2::Quaternion q_down;
-        q_down.setRPY(3.14159, 0, 0); 
-        out_pose.orientation = tf2::toMsg(q_down);
+        tf2::Vector3 cam_pos_base(
+            cam_to_base.transform.translation.x,
+            cam_to_base.transform.translation.y,
+            cam_to_base.transform.translation.z);
+
+        double denom = pick_plane_normal_base_.dot(ray_base);
+        if (std::abs(denom) < 1e-9)
+        {
+            ROS_ERROR("[CTRL] Camera ray is parallel to true pick plane.");
+            return false;
+        }
+
+        double t = pick_plane_normal_base_.dot(pick_plane_point_base_ - cam_pos_base) / denom;
+        if (t < 0.0)
+        {
+            ROS_ERROR("[CTRL] Pixel ray intersects true pick plane behind camera. Check TF/camera frame.");
+            return false;
+        }
+
+        tf2::Vector3 hit_base = cam_pos_base + ray_base * t;
+
+        geometry_msgs::PointStamped p_base, p_table;
+        p_base.header.frame_id = base_frame_;
+        p_base.header.stamp = ros::Time(0);
+        p_base.point.x = hit_base.x();
+        p_base.point.y = hit_base.y();
+        p_base.point.z = hit_base.z();
+
+        try
+        {
+            tf2::doTransform(p_base, p_table, base_to_table);
+        }
+        catch (const tf2::TransformException &ex)
+        {
+            ROS_ERROR("[CTRL] Failed to transform true pick hit base->table: %s", ex.what());
+            return false;
+        }
+
+        out_table = p_table.point;
+
+        ROS_INFO("[CTRL] true pick plane hit: base=(%.6f, %.6f, %.6f) -> table=(%.6f, %.6f, %.6f)",
+                 hit_base.x(), hit_base.y(), hit_base.z(),
+                 out_table.x, out_table.y, out_table.z);
 
         return true;
     }
 
-    void planCallback(const std_msgs::Int32MultiArray::ConstPtr& msg) {
-        if (msg->data.empty()) return;
-        
-        try {
-            cam_to_table_tx_ = tf_buffer_.lookupTransform("table_frame", "camera_color_optical_frame", ros::Time(0), ros::Duration(3.0));
-        } catch (tf2::TransformException &ex) {
-            ROS_ERROR("Failed to lock observation camera pose: %s", ex.what());
+    bool pixelToPickPointTable(const PixelPoint &px, geometry_msgs::Point &out_table) const
+    {
+        if (use_true_pick_plane_ && pick_plane_loaded_)
+        {
+            return pixelToTruePickPlaneTablePoint(px, observation_cam_to_base_, observation_base_to_table_, out_table);
+        }
+
+        return pixelToTablePoint(px, observation_cam_to_table_, PICK_Z_, out_table);
+    }
+
+    geometry_msgs::Pose buildPickPose(const PixelPoint &px, int angle_deg) const
+    {
+        geometry_msgs::Point p;
+        if (!pixelToPickPointTable(px, p))
+        {
+            throw std::runtime_error("pixelToPickPointTable failed");
+        }
+
+        double yaw = angle_deg * M_PI / 180.0;
+        geometry_msgs::Pose pose = makeDownPose(p.x + tcp_pick_offset_x_, p.y + tcp_pick_offset_y_, p.z, yaw);
+        ROS_INFO("[CTRL] pick pixel=(%d,%d), angle=%d => table pick=(%.6f, %.6f, %.6f), yaw=%.1f deg",
+                 px.u, px.v, angle_deg, pose.position.x, pose.position.y, pose.position.z, angle_deg * 1.0);
+        return pose;
+    }
+
+    geometry_msgs::Pose buildPlacePose(const TaskGoal &goal) const
+    {
+        double center_row = goal.place_grid_center.row;
+        double center_col = goal.place_grid_center.col;
+        int way = goal.way;
+
+        geometry_msgs::Point center = bilinearBoardCenter(center_row, center_col);
+        double z = placeZFromTargetCells(goal);
+        double yaw = way * M_PI / 2.0;
+
+        geometry_msgs::Pose pose = makeDownPose(
+            center.x + tcp_place_offset_x_,
+            center.y + tcp_place_offset_y_,
+            z,
+            yaw);
+
+        ROS_INFO("[CTRL] place grid center=(%.3f, %.3f), way=%d => table place=(%.6f, %.6f, %.6f), yaw=%.1f deg, has_cells=%s",
+                 center_row, center_col, way, pose.position.x, pose.position.y, pose.position.z,
+                 way * 90.0, goal.has_target_cells ? "true" : "false");
+
+        if (goal.has_target_cells)
+        {
+            std::string cells = "";
+            for (const auto &cell : goal.target_cells)
+            {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "(%d,%d) ", cell.row, cell.col);
+                cells += buf;
+            }
+            ROS_INFO("[CTRL] target cells: %s", cells.c_str());
+        }
+
+        return pose;
+    }
+
+    void planCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
+    {
+        if (msg->data.empty())
+            return;
+
+        if (!camera_info_ready_)
+        {
+            ROS_WARN("[CTRL] Received plan but CameraInfo is not ready yet. Ignoring this plan.");
             return;
         }
-        
-        std_msgs::Bool status_msg;
-        status_msg.data = true;
-        status_pub_.publish(status_msg);
 
-        int total_steps = msg->data[0];
-        ROS_INFO("Received new plan! Preparing %d steps for state machine...", total_steps);
+        geometry_msgs::TransformStamped cam_to_table;
+        geometry_msgs::TransformStamped cam_to_base;
+        geometry_msgs::TransformStamped base_to_table;
+        if (!getCurrentCameraTransforms(cam_to_table, cam_to_base, base_to_table))
+        {
+            ROS_WARN("[CTRL] Received plan but required TF is not ready. Ignoring this plan.");
+            return;
+        }
 
-        // 🌟 清空旧队列，防止接收到新规划时任务堆积
-        while(!task_queue_.empty()) task_queue_.pop();
+        observation_cam_to_table_ = cam_to_table;
+        observation_cam_to_base_ = cam_to_base;
+        observation_base_to_table_ = base_to_table;
+        observation_tf_ready_ = true;
 
-        int data_index = 1;
-        for (int i = 0; i < total_steps; ++i) {
-            int id = msg->data[data_index++]; 
-            int way = msg->data[data_index++]; 
-            int sum_r = msg->data[data_index++]; 
-            int sum_c = msg->data[data_index++];
-            int pixel_u = msg->data[data_index++]; 
-            int pixel_v = msg->data[data_index++];
-            int pick_angle = msg->data[data_index++]; 
+        while (!tasks_.empty())
+            tasks_.pop();
 
-            // 1. 初始化任务目标
+        int total = msg->data[0];
+        int expected_old = 1 + total * 7;
+        int expected_ext = 1 + total * 15;
+        bool extended_plan = false;
+
+        if (static_cast<int>(msg->data.size()) >= expected_ext)
+        {
+            extended_plan = true;
+        }
+        else if (static_cast<int>(msg->data.size()) >= expected_old)
+        {
+            extended_plan = false;
+        }
+        else
+        {
+            ROS_ERROR("[CTRL] Invalid plan length: got %lu, expected at least %d old-format or %d extended-format.",
+                      msg->data.size(), expected_old, expected_ext);
+            return;
+        }
+
+        ROS_INFO("[CTRL] Received plan with %d steps. format=%s. Captured observation camera TF.",
+                 total, extended_plan ? "extended-15" : "old-7");
+
+        int idx = 1;
+        for (int i = 0; i < total; ++i)
+        {
             TaskGoal goal;
-            goal.shape_type = id;
-            goal.way = way;
+            goal.shape_type = msg->data[idx++];
+            goal.way = msg->data[idx++];
 
-            // 2. 计算粗略 Pick 坐标（用于悬停）
-            if (!transformPixelToRobotBase(pixel_u, pixel_v, goal.coarse_pick_pose)) {
-                ROS_WARN("Failed to calc coarse pose for block %d, skipping.", i);
+            int sum_r = msg->data[idx++];
+            int sum_c = msg->data[idx++];
+            goal.place_grid_center.row = sum_r / 4.0;
+            goal.place_grid_center.col = sum_c / 4.0;
+
+            goal.pick_pixel.u = msg->data[idx++];
+            goal.pick_pixel.v = msg->data[idx++];
+            goal.pick_angle_deg = msg->data[idx++];
+
+            if (extended_plan)
+            {
+                goal.has_target_cells = true;
+                goal.target_cells.clear();
+                for (int k = 0; k < 4; ++k)
+                {
+                    GridCell cell;
+                    cell.row = msg->data[idx++];
+                    cell.col = msg->data[idx++];
+                    goal.target_cells.push_back(cell);
+                }
+            }
+
+            try
+            {
+                goal.pick_pose = buildPickPose(goal.pick_pixel, goal.pick_angle_deg);
+                goal.place_pose = buildPlacePose(goal);
+            }
+            catch (const std::exception &e)
+            {
+                ROS_WARN("[CTRL] Skip task %d: %s", i, e.what());
                 continue;
             }
-            // 【核心修正】：悬停时，强制法兰盘朝向正前方 (Yaw=0)，不要提前旋转！
-            // 这保证了相机坐标系的 X/Y 轴与桌面的 X/Y 轴平行，从而让后续的 dx, dy, angle 补偿完美对应。
-            tf2::Quaternion q_hover;
-            q_hover.setRPY(3.14159, 0, 0); 
-            goal.coarse_pick_pose.orientation = tf2::toMsg(q_hover);
 
-            // 3. 计算最终放置 Place 坐标
-            goal.place_pose.position.x = BOARD_ORIGIN_X - (sum_r / 4.0) * GRID_SIZE;
-            goal.place_pose.position.y = BOARD_ORIGIN_Y - (sum_c / 4.0) * GRID_SIZE; 
-            goal.place_pose.position.z = PLACE_Z;
-            double yaw_angle = way * (3.14159 / 2.0); 
-            tf2::Quaternion q_place;
-            q_place.setRPY(3.14159, 0, yaw_angle); 
-            goal.place_pose.orientation = tf2::toMsg(q_place);
-
-            // 4. 将任务塞进队列（此时机械臂不动！）
-            task_queue_.push(goal);
+            tasks_.push(goal);
         }
-        
-        ROS_INFO("Successfully queued %lu tasks.", task_queue_.size());
-    
-        // 5. 如果状态机处于空闲，点火起飞！交由 controlLoop 接管控制权
-        if (current_state_ == RobotState::IDLE && !task_queue_.empty()) {
-            ROS_INFO("State Machine: Transitioning from IDLE to FLY_TO_HOVER");
-            current_state_ = RobotState::FLY_TO_HOVER;
+
+        ROS_INFO("[CTRL] Queued %lu executable tasks.", tasks_.size());
+        if (!tasks_.empty())
+        {
+            publishBusy(true);
+            state_ = State::TAKE_NEXT_TASK;
         }
     }
 
-    // 状态机核心驱动逻辑
-    void controlLoop(const ros::TimerEvent&) {
-        switch (current_state_) {
-            case RobotState::IDLE:
-                // 等待新任务
-                break;
+    void publishBusy(bool busy)
+    {
+        std_msgs::Bool msg;
+        msg.data = busy;
+        status_pub_.publish(msg);
+    }
 
-            case RobotState::FLY_TO_HOVER:
-                if (task_queue_.empty()) {
-                    current_state_ = RobotState::IDLE;
-                    break;
-                }
-                current_task_ = task_queue_.front();
-                task_queue_.pop();
+    bool setSuction(bool on)
+    {
+        xarm_msgs::SetDigitalIO srv;
+        srv.request.io_num = suction_io_num_;
+        srv.request.value = on ? 1 : 0;
+        if (!io_client_.call(srv))
+        {
+            ROS_ERROR("[CTRL] Failed to call suction IO service.");
+            return false;
+        }
+        ros::Duration(on ? suction_on_wait_ : suction_off_wait_).sleep();
+        return true;
+    }
 
-                {
-                    geometry_msgs::Pose hover_pose = current_task_.coarse_pick_pose;
-                    hover_pose.position.z = HOVER_Z;
-                    
-                    // 🌟 修正 1：放弃 TF 直接相减，改回全局参数补偿
-                    // 这里我们暴露了符号。具体是 + 还是 -，需要看实际物理表现。
-                    hover_pose.position.x += CAM_OFFSET_X; 
-                    hover_pose.position.y += CAM_OFFSET_Y;
+    bool moveToPose(const geometry_msgs::Pose &pose, const std::string &label)
+    {
+        move_group_.setPoseTarget(pose);
+        moveit::planning_interface::MoveGroupInterface::Plan plan;
+        auto plan_result = move_group_.plan(plan);
 
-                    move_group_.setPoseTarget(hover_pose);
-                    move_group_.move(); // 阻塞式移动到悬停点
-                    
-                    ros::Duration(5).sleep(); // 稳定一下画面
-                    current_state_ = RobotState::REQUEST_VISION;
-                }
-                break;
+        if (plan_result != moveit::planning_interface::MoveItErrorCode::SUCCESS)
+        {
+            ROS_ERROR("[CTRL] Plan failed for %s at (%.6f, %.6f, %.6f).",
+                      label.c_str(), pose.position.x, pose.position.y, pose.position.z);
+            return false;
+        }
 
-            case RobotState::REQUEST_VISION:
-                {
-                    tly::GetPrecisePose srv;
-                    srv.request.target_shape_type = current_task_.shape_type;
-                    
-                    if (vision_client_.call(srv) && srv.response.success) {
-                        
-                        double z_dist = HOVER_Z - PICK_Z; 
-                        
-                        // 暴露像素到物理的映射极性
-                        double dX_physical = (srv.response.dy * z_dist) / CAM_FY;
-                        double dY_physical = (srv.response.dx * z_dist) / CAM_FX;
-                        
-                        ROS_INFO("Vision offset: dx_pix=%d, dy_pix=%d | Physical: dX=%.4f, dY=%.4f", 
-                                  srv.response.dx, srv.response.dy, dX_physical, dY_physical);
+        auto exec_result = move_group_.execute(plan);
+        if (exec_result != moveit::planning_interface::MoveItErrorCode::SUCCESS)
+        {
+            ROS_ERROR("[CTRL] Execute failed for %s.", label.c_str());
+            return false;
+        }
 
-                        precise_pick_pose_ = current_task_.coarse_pick_pose;
+        return true;
+    }
 
-                        // ==========================================
-                        // 🌟 核心修正 2：最终机械微调 (Fine-Tuning)
-                        // 用于补偿相机光心与吸盘物理中心的那一两毫米安装误差
-                        // ==========================================
-                        double FINE_TUNE_X = 0.002; // 如果每次都往前偏，填负数，比如 -0.003
-                        double FINE_TUNE_Y = -0.002; // 如果每次都往左偏，填负数，比如 -0.002
+    geometry_msgs::Pose hoverFrom(const geometry_msgs::Pose &pose) const
+    {
+        geometry_msgs::Pose h = pose;
+        h.position.z = HOVER_Z_;
+        return h;
+    }
 
-                        // 将视觉物理偏差 + 机械微调 加回到目标上
-                        precise_pick_pose_.position.x += (dX_physical + FINE_TUNE_X); 
-                        precise_pick_pose_.position.y += (dY_physical + FINE_TUNE_Y);
-                        
-                        double precise_yaw = srv.response.angle * (3.14159 / 180.0);
-                        tf2::Quaternion q_pick;
-                        q_pick.setRPY(3.14159, 0, precise_yaw);
-                        precise_pick_pose_.orientation = tf2::toMsg(q_pick);
+    bool applyOptionalPreciseCorrection()
+    {
+        if (!use_precise_service_)
+            return true;
 
-                        current_state_ = RobotState::EXECUTE_PICK;
-                    } else {
-                        ROS_WARN("Vision failed! Robot stopped to let you check the camera image.");
-                        current_state_ = RobotState::IDLE;
-                    }
-                }
-                break;
+        tly::GetPrecisePose srv;
+        srv.request.target_shape_type = current_task_.shape_type;
 
-            case RobotState::EXECUTE_PICK:
-                {
-                    // 执行精准下降抓取
-                    move_group_.setPoseTarget(precise_pick_pose_);
-                    move_group_.move();
-                    setSuctionCup(true);
-                    ros::Duration(0.5).sleep();
-                    
-                    // 提起到悬停高度
-                    geometry_msgs::Pose hover_pose = precise_pick_pose_;
-                    hover_pose.position.z = HOVER_Z;
-                    move_group_.setPoseTarget(hover_pose);
-                    move_group_.move();
-                    
-                    current_state_ = RobotState::EXECUTE_PLACE;
-                }
-                break;
+        if (!precise_client_.call(srv) || !srv.response.success)
+        {
+            ROS_WARN("[CTRL] Precise service failed; keeping original pick pose.");
+            return true;
+        }
 
-            case RobotState::EXECUTE_PLACE:
-                {
-                    // 飞到目标白板位置放置
-                    geometry_msgs::Pose hover_place = current_task_.place_pose;
-                    hover_place.position.z = HOVER_Z;
-                    
-                    move_group_.setPoseTarget(hover_place); move_group_.move();
-                    move_group_.setPoseTarget(current_task_.place_pose); move_group_.move();
-                    
-                    setSuctionCup(false);
-                    ros::Duration(0.5).sleep();
-                    
-                    move_group_.setPoseTarget(hover_place); move_group_.move();
-                    
-                    // 本方块完成，回到第一个状态抓下一个
-                    current_state_ = RobotState::FLY_TO_HOVER; 
-                }
-                break;
+        if (!camera_info_ready_)
+            return true;
+
+        // Compatibility mode with the old service:
+        // vision returns equivalent pixel dx/dy, controller converts them back to meters
+        // around the current hover height.
+        double fx = assume_image_rectified_ ? P_.at<double>(0, 0) : K_.at<double>(0, 0);
+        double fy = assume_image_rectified_ ? P_.at<double>(1, 1) : K_.at<double>(1, 1);
+        double z_dist = std::max(std::abs(HOVER_Z_ - PICK_Z_), 1e-4);
+
+        double dX = srv.response.dy * z_dist / fy;
+        double dY = srv.response.dx * z_dist / fx;
+
+        current_task_.pick_pose.position.x += dX;
+        current_task_.pick_pose.position.y += dY;
+
+        double yaw = srv.response.angle * M_PI / 180.0;
+        tf2::Quaternion q;
+        q.setRPY(M_PI, 0.0, yaw);
+        current_task_.pick_pose.orientation = tf2::toMsg(q);
+
+        ROS_INFO("[CTRL] Optional precise correction: dx_pix=%d dy_pix=%d => dX=%.5f dY=%.5f angle=%d",
+                 srv.response.dx, srv.response.dy, dX, dY, srv.response.angle);
+        return true;
+    }
+
+    void failOrFinish(const std::string &reason)
+    {
+        ROS_ERROR("[CTRL] %s", reason.c_str());
+        if (stop_on_motion_failure_)
+        {
+            while (!tasks_.empty())
+                tasks_.pop();
+            publishBusy(false);
+            state_ = State::IDLE;
+        }
+        else
+        {
+            state_ = State::TAKE_NEXT_TASK;
         }
     }
 
+    void controlLoop(const ros::TimerEvent &)
+    {
+        switch (state_)
+        {
+        case State::IDLE:
+            return;
+
+        case State::TAKE_NEXT_TASK:
+            if (tasks_.empty())
+            {
+                state_ = State::FINISH;
+                return;
+            }
+            current_task_ = tasks_.front();
+            tasks_.pop();
+            ROS_INFO("[CTRL] Next task: shape=%d way=%d pick_px=(%d,%d) pick_angle=%d remaining=%lu",
+                     current_task_.shape_type, current_task_.way,
+                     current_task_.pick_pixel.u, current_task_.pick_pixel.v,
+                     current_task_.pick_angle_deg, tasks_.size());
+            state_ = State::MOVE_TO_PICK_HOVER;
+            return;
+
+        case State::MOVE_TO_PICK_HOVER:
+        {
+            geometry_msgs::Pose hover = hoverFrom(current_task_.pick_pose);
+            if (!moveToPose(hover, "pick_hover"))
+            {
+                failOrFinish("Move to pick hover failed.");
+                return;
+            }
+            state_ = State::OPTIONAL_PRECISE_CORRECTION;
+            return;
+        }
+
+        case State::OPTIONAL_PRECISE_CORRECTION:
+            applyOptionalPreciseCorrection();
+            state_ = State::EXECUTE_PICK;
+            return;
+
+        case State::EXECUTE_PICK:
+        {
+            if (!moveToPose(current_task_.pick_pose, "pick"))
+            {
+                failOrFinish("Move to pick pose failed.");
+                return;
+            }
+            setSuction(true);
+
+            geometry_msgs::Pose hover = hoverFrom(current_task_.pick_pose);
+            if (!moveToPose(hover, "lift_after_pick"))
+            {
+                failOrFinish("Lift after pick failed.");
+                return;
+            }
+            state_ = State::MOVE_TO_PLACE_HOVER;
+            return;
+        }
+
+        case State::MOVE_TO_PLACE_HOVER:
+        {
+            geometry_msgs::Pose hover = hoverFrom(current_task_.place_pose);
+            if (!moveToPose(hover, "place_hover"))
+            {
+                failOrFinish("Move to place hover failed.");
+                return;
+            }
+            state_ = State::EXECUTE_PLACE;
+            return;
+        }
+
+        case State::EXECUTE_PLACE:
+        {
+            if (!moveToPose(current_task_.place_pose, "place"))
+            {
+                failOrFinish("Move to place pose failed.");
+                return;
+            }
+            setSuction(false);
+
+            geometry_msgs::Pose hover = hoverFrom(current_task_.place_pose);
+            if (!moveToPose(hover, "lift_after_place"))
+            {
+                failOrFinish("Lift after place failed.");
+                return;
+            }
+            state_ = State::TAKE_NEXT_TASK;
+            return;
+        }
+
+        case State::FINISH:
+            ROS_INFO("[CTRL] All tasks finished.");
+            publishBusy(false);
+            state_ = State::IDLE;
+            return;
+        }
+    }
 };
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv)
+{
     ros::init(argc, argv, "xarm_controller_node");
     ros::AsyncSpinner spinner(2);
     spinner.start();
-    TetrisRobotController controller;
+
+    XarmTetrisController controller;
     ros::waitForShutdown();
     return 0;
 }

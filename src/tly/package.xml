@@ -19,6 +19,7 @@
   <build_depend>sensor_msgs</build_depend>
   <build_depend>cv_bridge</build_depend>
   <build_depend>message_generation</build_depend>
+  <build_depend>image_transport</build_depend>
 
   
   <!-- MoveIt! 依赖 -->
@@ -44,6 +45,7 @@
   <build_export_depend>tf2_ros</build_export_depend>
   <build_export_depend>tf2_geometry_msgs</build_export_depend>
   <build_export_depend>xarm_msgs</build_export_depend>
+  <build_export_depend>image_transport</build_export_depend>
 
   <!-- Exec 依赖 -->
   <exec_depend>roscpp</exec_depend>
@@ -59,5 +61,6 @@
   <exec_depend>tf2_geometry_msgs</exec_depend>
   <exec_depend>xarm_msgs</exec_depend>
   <exec_depend>message_runtime</exec_depend>
+  <exec_depend>image_transport</exec_depend>
 
 </package>
