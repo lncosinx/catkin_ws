@@ -4,7 +4,7 @@
          ========================= -->
     <arg name="robot_ip" default="192.168.1.228" />
     <arg name="expected_blocks" default="35" />
-    <arg name="place_z_extra_margin" default="0.002" />
+    <arg name="place_z_extra_margin" default="0.003" />
 
     <!-- =========================
          1. xArm real MoveIt control
@@ -57,7 +57,8 @@
         <param name="table_frame" value="table_frame" />
 
         <!-- Pick point mode: centroid is safest for suction. -->
-        <param name="pick_point_mode" value="centroid" />
+        <param name="pick_point_mode" value="hybrid" />
+        <rosparam param="distance_pick_shapes">[3, 4]</rosparam>
 
         <!-- Wider ROI for current RealSense view. If debug foreground includes too much background, narrow this. -->
         <param name="roi_x_min" value="314" />
@@ -127,17 +128,28 @@
         <param name="place_z_extra_margin" value="$(arg place_z_extra_margin)" />
         <param name="use_precise_service" value="false" />
 
-        <param name="velocity_scale" value="0.1" />
-        <param name="acceleration_scale" value="0.1" />
+        <param name="velocity_scale" value="0.20" />
+        <param name="acceleration_scale" value="0.15" />
         <param name="planning_time" value="5.0" />
         <param name="planning_attempts" value="5" />
 
         <!-- Keep these mechanical offsets conservative. Tune only after vision and angle are stable. -->
-        <param name="tcp_pick_offset_x" value="0.0" />
+        <param name="tcp_pick_offset_x" value="-0.0028" />
         <param name="tcp_pick_offset_y" value="-0.002" />
-        <param name="tcp_pick_offset_z" value="-0.005" />
-        <param name="tcp_place_offset_x" value="0.002" />
-        <param name="tcp_place_offset_y" value="0.002" />
+        <param name="tcp_pick_offset_z" value="-0.006" />
+        <param name="tcp_place_offset_x" value="-0.0025" />
+        <param name="tcp_place_offset_y" value="-0.001" />
+
+        <!-- <param name="pick_yaw_corr_shape3_way3_deg" value="180" /> -->
+        <param name="pick_yaw_corr_shape4_way3_deg" value="180" />
+        <param name="pick_yaw_corr_shape3_way1_deg" value="180" />
+        <!-- <param name="pick_yaw_corr_shape4_way1_deg" value="180" /> -->
+
+        <param name="use_continuous_yaw" value="true" />
+        <param name="auto_unwind_wrist" value="true" />
+        <param name="wrist_unwind_threshold" value="5.20" />
+        <param name="wrist_unwind_target_abs" value="0.30" />
+
     </node>
 
     <!-- =========================

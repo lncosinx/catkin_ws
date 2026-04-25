@@ -26,7 +26,6 @@
 #include <string>
 #include <vector>
 #include <algorithm>
-#include <array>
 
 struct PixelPoint
 {
@@ -53,6 +52,15 @@ struct TaskGoal
     int pick_angle_deg = 0;
 
     PixelPoint pick_pixel;
+    PixelPoint geom_pixel;
+    bool has_geom_pixel = false;
+
+    // table-frame vector from suction pick point to piece geometric center at observation time.
+    // Used to compensate hybrid/distance pick points during placement.
+    bool has_pick_to_geom_offset = false;
+    double pick_to_geom_dx = 0.0;
+    double pick_to_geom_dy = 0.0;
+
     GridCenter place_grid_center;
 
     // Backward compatible: old plan has no explicit cells.
@@ -190,11 +198,17 @@ private:
     double tcp_place_offset_x_ = 0.0;
     double tcp_place_offset_y_ = 0.0;
 
-    // Per-shape/per-target-way pick yaw calibration.
-    // This fixes cases where the vision angle for an asymmetric piece is correct in
-    // position but 180 deg ambiguous for only some planned orientations.
-    // corr[shape][way] is added to the visual pick angle before building pick_pose.
-    std::array<std::array<int, 4>, 7> pick_yaw_corr_by_shape_way_{};
+    // Yaw continuity / wrist-unwind protection.
+    // Pose quaternions cannot distinguish 90deg from -270deg, so we keep
+    // target yaw continuous for logging and use joint6 auto-unwind to avoid
+    // accumulating toward the physical joint limit.
+    bool use_continuous_yaw_ = true;
+    bool has_last_commanded_yaw_ = false;
+    double last_commanded_yaw_ = 0.0;
+    bool auto_unwind_wrist_ = true;
+    double wrist_unwind_threshold_ = 5.20;  // rad, about 298 deg
+    double wrist_unwind_target_abs_ = 0.30; // rad, after modulo 2pi should be near zero
+    bool holding_block_ = false;
 
     bool use_precise_service_ = false;
     bool assume_image_rectified_ = false;
@@ -251,8 +265,10 @@ private:
         pnh_.param("tcp_pick_offset_z", tcp_pick_offset_z_, tcp_pick_offset_z_);
         pnh_.param("tcp_place_offset_x", tcp_place_offset_x_, tcp_place_offset_x_);
         pnh_.param("tcp_place_offset_y", tcp_place_offset_y_, tcp_place_offset_y_);
-
-        loadPickYawCalibrationParams();
+        pnh_.param("use_continuous_yaw", use_continuous_yaw_, use_continuous_yaw_);
+        pnh_.param("auto_unwind_wrist", auto_unwind_wrist_, auto_unwind_wrist_);
+        pnh_.param("wrist_unwind_threshold", wrist_unwind_threshold_, wrist_unwind_threshold_);
+        pnh_.param("wrist_unwind_target_abs", wrist_unwind_target_abs_, wrist_unwind_target_abs_);
 
         nh_.param("/tetris/GRID_SIZE", GRID_SIZE_, GRID_SIZE_);
         nh_.param("/tetris/BOARD_ORIGIN_X", BOARD_ORIGIN_X_, BOARD_ORIGIN_X_);
@@ -279,75 +295,10 @@ private:
         ROS_INFO("[CTRL] TCP offsets: pick=(%.4f, %.4f, %.4f), place=(%.4f, %.4f)",
                  tcp_pick_offset_x_, tcp_pick_offset_y_, tcp_pick_offset_z_,
                  tcp_place_offset_x_, tcp_place_offset_y_);
-    }
-
-    static int normalizeDeg360(int a)
-    {
-        a %= 360;
-        if (a < 0)
-            a += 360;
-        return a;
-    }
-
-    static int normalizeWay(int way)
-    {
-        way %= 4;
-        if (way < 0)
-            way += 4;
-        return way;
-    }
-
-    void loadPickYawCalibrationParams()
-    {
-        for (auto &row : pick_yaw_corr_by_shape_way_)
-            row.fill(0);
-
-        // Coarse per-shape correction, applied to all target ways of that shape.
-        // Shape IDs: 0=line, 1=square, 2=T, 3=L_left, 4=L_right, 5=Z_left, 6=Z_right.
-        for (int shape = 0; shape < 7; ++shape)
-        {
-            int corr = 0;
-            std::string key = "pick_yaw_corr_shape" + std::to_string(shape) + "_deg";
-            pnh_.param(key, corr, 0);
-            corr = normalizeDeg360(corr);
-            for (int way = 0; way < 4; ++way)
-                pick_yaw_corr_by_shape_way_[shape][way] = corr;
-        }
-
-        // Fine per-shape + per-target-way correction. This is what you should use
-        // when only SOME L pieces are 180 deg off. Example launch param:
-        //   <param name="pick_yaw_corr_shape3_way0_deg" value="180" />
-        // means: L_left planned with way=0 uses visual_pick_angle + 180 deg.
-        for (int shape = 0; shape < 7; ++shape)
-        {
-            for (int way = 0; way < 4; ++way)
-            {
-                int corr = pick_yaw_corr_by_shape_way_[shape][way];
-                std::string key = "pick_yaw_corr_shape" + std::to_string(shape) +
-                                  "_way" + std::to_string(way) + "_deg";
-                pnh_.param(key, corr, corr);
-                pick_yaw_corr_by_shape_way_[shape][way] = normalizeDeg360(corr);
-            }
-        }
-
-        ROS_INFO("[CTRL] pick yaw correction table deg: shape0=[%d,%d,%d,%d] shape1=[%d,%d,%d,%d] shape2=[%d,%d,%d,%d] shape3=[%d,%d,%d,%d] shape4=[%d,%d,%d,%d] shape5=[%d,%d,%d,%d] shape6=[%d,%d,%d,%d]",
-                 pick_yaw_corr_by_shape_way_[0][0], pick_yaw_corr_by_shape_way_[0][1], pick_yaw_corr_by_shape_way_[0][2], pick_yaw_corr_by_shape_way_[0][3],
-                 pick_yaw_corr_by_shape_way_[1][0], pick_yaw_corr_by_shape_way_[1][1], pick_yaw_corr_by_shape_way_[1][2], pick_yaw_corr_by_shape_way_[1][3],
-                 pick_yaw_corr_by_shape_way_[2][0], pick_yaw_corr_by_shape_way_[2][1], pick_yaw_corr_by_shape_way_[2][2], pick_yaw_corr_by_shape_way_[2][3],
-                 pick_yaw_corr_by_shape_way_[3][0], pick_yaw_corr_by_shape_way_[3][1], pick_yaw_corr_by_shape_way_[3][2], pick_yaw_corr_by_shape_way_[3][3],
-                 pick_yaw_corr_by_shape_way_[4][0], pick_yaw_corr_by_shape_way_[4][1], pick_yaw_corr_by_shape_way_[4][2], pick_yaw_corr_by_shape_way_[4][3],
-                 pick_yaw_corr_by_shape_way_[5][0], pick_yaw_corr_by_shape_way_[5][1], pick_yaw_corr_by_shape_way_[5][2], pick_yaw_corr_by_shape_way_[5][3],
-                 pick_yaw_corr_by_shape_way_[6][0], pick_yaw_corr_by_shape_way_[6][1], pick_yaw_corr_by_shape_way_[6][2], pick_yaw_corr_by_shape_way_[6][3]);
-    }
-
-    int correctedPickAngleDeg(int shape_type, int target_way, int raw_angle_deg) const
-    {
-        int a = normalizeDeg360(raw_angle_deg);
-        if (shape_type < 0 || shape_type >= 7)
-            return a;
-        int way = normalizeWay(target_way);
-        int corr = pick_yaw_corr_by_shape_way_[shape_type][way];
-        return normalizeDeg360(a + corr);
+        ROS_INFO("[CTRL] yaw protection: continuous_yaw=%s auto_unwind_wrist=%s threshold=%.3f target_abs=%.3f",
+                 use_continuous_yaw_ ? "true" : "false",
+                 auto_unwind_wrist_ ? "true" : "false",
+                 wrist_unwind_threshold_, wrist_unwind_target_abs_);
     }
 
     void cameraInfoCallback(const sensor_msgs::CameraInfo::ConstPtr &msg)
@@ -679,6 +630,49 @@ private:
         return z_max + place_z_extra_margin_;
     }
 
+    static double normalizeAngleRad(double a)
+    {
+        while (a > M_PI)
+            a -= 2.0 * M_PI;
+        while (a <= -M_PI)
+            a += 2.0 * M_PI;
+        return a;
+    }
+
+    double currentEefYawRad()
+    {
+        geometry_msgs::PoseStamped cur = move_group_.getCurrentPose();
+        tf2::Quaternion q;
+        tf2::fromMsg(cur.pose.orientation, q);
+        double roll, pitch, yaw;
+        tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
+        return yaw;
+    }
+
+    double continuousYaw(double raw_yaw, const std::string &label)
+    {
+        if (!use_continuous_yaw_)
+            return raw_yaw;
+
+        if (!has_last_commanded_yaw_)
+        {
+            last_commanded_yaw_ = currentEefYawRad();
+            has_last_commanded_yaw_ = true;
+            ROS_INFO("[CTRL] continuous yaw initialized from current EEF yaw %.1f deg.",
+                     last_commanded_yaw_ * 180.0 / M_PI);
+        }
+
+        double delta = normalizeAngleRad(raw_yaw - last_commanded_yaw_);
+        double out = last_commanded_yaw_ + delta;
+        ROS_INFO("[CTRL] continuous yaw %s: raw=%.1f deg last=%.1f deg delta=%.1f deg cmd=%.1f deg",
+                 label.c_str(), raw_yaw * 180.0 / M_PI,
+                 last_commanded_yaw_ * 180.0 / M_PI,
+                 delta * 180.0 / M_PI,
+                 out * 180.0 / M_PI);
+        last_commanded_yaw_ = out;
+        return out;
+    }
+
     geometry_msgs::Pose makeDownPose(double x, double y, double z, double yaw_rad) const
     {
         geometry_msgs::Pose pose;
@@ -892,7 +886,26 @@ private:
                  px.u, px.v, du, dv, dx * 1000.0, dy * 1000.0);
     }
 
-    geometry_msgs::Pose buildPickPose(const PixelPoint &px, int angle_deg) const
+    bool computePickToGeomOffset(const PixelPoint &pick_px, const PixelPoint &geom_px,
+                                 double &dx_table, double &dy_table) const
+    {
+        geometry_msgs::Point pick_p, geom_p;
+        if (!pixelToPickPointTable(pick_px, pick_p))
+            return false;
+        if (!pixelToPickPointTable(geom_px, geom_p))
+            return false;
+
+        // Use the same pixel-dependent affine correction as pick pose, so the offset is in the
+        // same corrected table coordinate system.
+        applyPickAffineCorrection(pick_px, pick_p);
+        applyPickAffineCorrection(geom_px, geom_p);
+
+        dx_table = geom_p.x - pick_p.x;
+        dy_table = geom_p.y - pick_p.y;
+        return true;
+    }
+
+    geometry_msgs::Pose buildPickPose(const PixelPoint &px, int angle_deg)
     {
         geometry_msgs::Point p;
         if (!pixelToPickPointTable(px, p))
@@ -902,14 +915,16 @@ private:
 
         applyPickAffineCorrection(px, p);
 
-        double yaw = angle_deg * M_PI / 180.0;
+        double raw_yaw = angle_deg * M_PI / 180.0;
+        double yaw = continuousYaw(raw_yaw, "pick");
         geometry_msgs::Pose pose = makeDownPose(p.x + tcp_pick_offset_x_, p.y + tcp_pick_offset_y_, p.z + tcp_pick_offset_z_, yaw);
-        ROS_INFO("[CTRL] pick pixel=(%d,%d), angle=%d => table pick=(%.6f, %.6f, %.6f), yaw=%.1f deg",
-                 px.u, px.v, angle_deg, pose.position.x, pose.position.y, pose.position.z, angle_deg * 1.0);
+        ROS_INFO("[CTRL] pick pixel=(%d,%d), angle=%d => table pick=(%.6f, %.6f, %.6f), raw_yaw=%.1f deg cmd_yaw=%.1f deg",
+                 px.u, px.v, angle_deg, pose.position.x, pose.position.y, pose.position.z,
+                 raw_yaw * 180.0 / M_PI, yaw * 180.0 / M_PI);
         return pose;
     }
 
-    geometry_msgs::Pose buildPlacePose(const TaskGoal &goal) const
+    geometry_msgs::Pose buildPlacePose(const TaskGoal &goal)
     {
         double center_row = goal.place_grid_center.row;
         double center_col = goal.place_grid_center.col;
@@ -917,17 +932,40 @@ private:
 
         geometry_msgs::Point center = bilinearBoardCenter(center_row, center_col);
         double z = placeZFromTargetCells(goal);
-        double yaw = way * M_PI / 2.0;
+        double raw_yaw = way * M_PI / 2.0;
+        double yaw = continuousYaw(raw_yaw, "place");
 
-        geometry_msgs::Pose pose = makeDownPose(
-            center.x + tcp_place_offset_x_,
-            center.y + tcp_place_offset_y_,
-            z,
-            yaw);
+        double place_x = center.x + tcp_place_offset_x_;
+        double place_y = center.y + tcp_place_offset_y_;
 
-        ROS_INFO("[CTRL] place grid center=(%.3f, %.3f), way=%d => table place=(%.6f, %.6f, %.6f), yaw=%.1f deg, has_cells=%s",
+        if (goal.has_pick_to_geom_offset)
+        {
+            // The robot grips the piece at pick point, not necessarily at its geometric center.
+            // At observation time, vector pick->geom is known in table frame. Rotate that vector
+            // from pick yaw to place yaw, then put TCP at target_center - rotated_vector.
+            double pick_yaw = goal.pick_angle_deg * M_PI / 180.0;
+            // Compensation is geometric: use raw target yaw, not the continuous equivalent yaw.
+            double delta = raw_yaw - pick_yaw;
+            double c = std::cos(delta);
+            double s = std::sin(delta);
+            double rot_dx = c * goal.pick_to_geom_dx - s * goal.pick_to_geom_dy;
+            double rot_dy = s * goal.pick_to_geom_dx + c * goal.pick_to_geom_dy;
+
+            place_x -= rot_dx;
+            place_y -= rot_dy;
+
+            ROS_INFO("[CTRL] hybrid place compensation: pick_to_geom=(%.3f, %.3f) mm, delta_yaw=%.1f deg => TCP shift=(%.3f, %.3f) mm",
+                     goal.pick_to_geom_dx * 1000.0, goal.pick_to_geom_dy * 1000.0,
+                     delta * 180.0 / M_PI, -rot_dx * 1000.0, -rot_dy * 1000.0);
+        }
+
+        geometry_msgs::Pose pose = makeDownPose(place_x, place_y, z, yaw);
+
+        ROS_INFO("[CTRL] place grid center=(%.3f, %.3f), way=%d => table place=(%.6f, %.6f, %.6f), raw_yaw=%.1f deg cmd_yaw=%.1f deg, has_cells=%s geom_comp=%s",
                  center_row, center_col, way, pose.position.x, pose.position.y, pose.position.z,
-                 way * 90.0, goal.has_target_cells ? "true" : "false");
+                 raw_yaw * 180.0 / M_PI, yaw * 180.0 / M_PI,
+                 goal.has_target_cells ? "true" : "false",
+                 goal.has_pick_to_geom_offset ? "true" : "false");
 
         if (goal.has_target_cells)
         {
@@ -974,26 +1012,35 @@ private:
 
         int total = msg->data[0];
         int expected_old = 1 + total * 7;
-        int expected_ext = 1 + total * 15;
+        int expected_ext15 = 1 + total * 15;
+        int expected_ext17 = 1 + total * 17;
         bool extended_plan = false;
+        bool plan_has_geom_pixel = false;
 
-        if (static_cast<int>(msg->data.size()) >= expected_ext)
+        if (static_cast<int>(msg->data.size()) >= expected_ext17)
         {
             extended_plan = true;
+            plan_has_geom_pixel = true;
+        }
+        else if (static_cast<int>(msg->data.size()) >= expected_ext15)
+        {
+            extended_plan = true;
+            plan_has_geom_pixel = false;
         }
         else if (static_cast<int>(msg->data.size()) >= expected_old)
         {
             extended_plan = false;
+            plan_has_geom_pixel = false;
         }
         else
         {
-            ROS_ERROR("[CTRL] Invalid plan length: got %lu, expected at least %d old-format or %d extended-format.",
-                      msg->data.size(), expected_old, expected_ext);
+            ROS_ERROR("[CTRL] Invalid plan length: got %lu, expected at least %d old-format, %d ext15, or %d ext17.",
+                      msg->data.size(), expected_old, expected_ext15, expected_ext17);
             return;
         }
 
         ROS_INFO("[CTRL] Received plan with %d steps. format=%s. Captured observation camera TF.",
-                 total, extended_plan ? "extended-15" : "old-7");
+                 total, plan_has_geom_pixel ? "extended-17-pick+geom" : (extended_plan ? "extended-15" : "old-7"));
 
         int idx = 1;
         for (int i = 0; i < total; ++i)
@@ -1011,6 +1058,18 @@ private:
             goal.pick_pixel.v = msg->data[idx++];
             goal.pick_angle_deg = msg->data[idx++];
 
+            if (plan_has_geom_pixel)
+            {
+                goal.geom_pixel.u = msg->data[idx++];
+                goal.geom_pixel.v = msg->data[idx++];
+                goal.has_geom_pixel = true;
+            }
+            else
+            {
+                goal.geom_pixel = goal.pick_pixel;
+                goal.has_geom_pixel = false;
+            }
+
             if (extended_plan)
             {
                 goal.has_target_cells = true;
@@ -1026,13 +1085,27 @@ private:
 
             try
             {
-                int corrected_pick_angle = correctedPickAngleDeg(goal.shape_type, goal.way, goal.pick_angle_deg);
-                if (corrected_pick_angle != normalizeDeg360(goal.pick_angle_deg))
+                goal.pick_pose = buildPickPose(goal.pick_pixel, goal.pick_angle_deg);
+
+                if (goal.has_geom_pixel)
                 {
-                    ROS_WARN("[CTRL] pick yaw corrected: shape=%d way=%d raw=%d corrected=%d",
-                             goal.shape_type, goal.way, goal.pick_angle_deg, corrected_pick_angle);
+                    double dx = 0.0, dy = 0.0;
+                    if (computePickToGeomOffset(goal.pick_pixel, goal.geom_pixel, dx, dy))
+                    {
+                        goal.pick_to_geom_dx = dx;
+                        goal.pick_to_geom_dy = dy;
+                        goal.has_pick_to_geom_offset = true;
+                        ROS_INFO("[CTRL] pick/geom pixels: pick=(%d,%d) geom=(%d,%d) => pick_to_geom=(%.3f, %.3f) mm",
+                                 goal.pick_pixel.u, goal.pick_pixel.v,
+                                 goal.geom_pixel.u, goal.geom_pixel.v,
+                                 dx * 1000.0, dy * 1000.0);
+                    }
+                    else
+                    {
+                        ROS_WARN("[CTRL] Failed to compute pick-to-geom offset; placement compensation disabled for this task.");
+                    }
                 }
-                goal.pick_pose = buildPickPose(goal.pick_pixel, corrected_pick_angle);
+
                 goal.place_pose = buildPlacePose(goal);
             }
             catch (const std::exception &e)
@@ -1073,8 +1146,60 @@ private:
         return true;
     }
 
+    bool maybeUnwindWrist(const std::string &label)
+    {
+        if (!auto_unwind_wrist_ || holding_block_)
+            return true;
+
+        std::vector<double> joints = move_group_.getCurrentJointValues();
+        if (joints.size() < 6)
+        {
+            ROS_WARN_THROTTLE(2.0, "[CTRL] Cannot auto-unwind wrist: expected at least 6 joints, got %lu.", joints.size());
+            return true;
+        }
+
+        double q6 = joints[5];
+        if (std::abs(q6) < wrist_unwind_threshold_)
+            return true;
+
+        double target_q6 = normalizeAngleRad(q6);
+        if (std::abs(target_q6) > wrist_unwind_target_abs_)
+            target_q6 = (target_q6 > 0.0) ? wrist_unwind_target_abs_ : -wrist_unwind_target_abs_;
+
+        std::vector<double> target = joints;
+        target[5] = target_q6;
+
+        ROS_WARN("[CTRL] Auto-unwind wrist before %s: joint6 %.1f deg -> %.1f deg",
+                 label.c_str(), q6 * 180.0 / M_PI, target_q6 * 180.0 / M_PI);
+
+        move_group_.clearPoseTargets();
+        move_group_.setStartStateToCurrentState();
+        move_group_.setJointValueTarget(target);
+        moveit::planning_interface::MoveGroupInterface::Plan plan;
+        auto plan_result = move_group_.plan(plan);
+        if (plan_result != moveit::planning_interface::MoveItErrorCode::SUCCESS)
+        {
+            ROS_ERROR("[CTRL] Auto-unwind wrist planning failed before %s.", label.c_str());
+            return false;
+        }
+        auto exec_result = move_group_.execute(plan);
+        if (exec_result != moveit::planning_interface::MoveItErrorCode::SUCCESS)
+        {
+            ROS_ERROR("[CTRL] Auto-unwind wrist execution failed before %s.", label.c_str());
+            return false;
+        }
+        move_group_.clearPoseTargets();
+
+        has_last_commanded_yaw_ = false;
+        return true;
+    }
+
     bool moveToPose(const geometry_msgs::Pose &pose, const std::string &label)
     {
+        if (!maybeUnwindWrist(label))
+            return false;
+
+        move_group_.setStartStateToCurrentState();
         move_group_.setPoseTarget(pose);
         moveit::planning_interface::MoveGroupInterface::Plan plan;
         auto plan_result = move_group_.plan(plan);
@@ -1150,6 +1275,7 @@ private:
         {
             while (!tasks_.empty())
                 tasks_.pop();
+            holding_block_ = false;
             publishBusy(false);
             state_ = State::IDLE;
         }
@@ -1205,7 +1331,8 @@ private:
                 failOrFinish("Move to pick pose failed.");
                 return;
             }
-            setSuction(true);
+            if (setSuction(true))
+                holding_block_ = true;
 
             geometry_msgs::Pose hover = hoverFrom(current_task_.pick_pose);
             if (!moveToPose(hover, "lift_after_pick"))
@@ -1236,7 +1363,8 @@ private:
                 failOrFinish("Move to place pose failed.");
                 return;
             }
-            setSuction(false);
+            if (setSuction(false))
+                holding_block_ = false;
 
             geometry_msgs::Pose hover = hoverFrom(current_task_.place_pose);
             if (!moveToPose(hover, "lift_after_place"))
@@ -1250,6 +1378,7 @@ private:
 
         case State::FINISH:
             ROS_INFO("[CTRL] All tasks finished.");
+            holding_block_ = false;
             publishBusy(false);
             state_ = State::IDLE;
             return;

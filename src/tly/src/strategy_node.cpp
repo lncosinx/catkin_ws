@@ -499,7 +499,9 @@ void statusCallback(const std_msgs::Bool::ConstPtr &msg)
 
 struct BlockInfo
 {
-    int u, v, ang;
+    int u = 0, v = 0, ang = 0;  // pick point + 当前视觉角度
+    int geom_u = 0, geom_v = 0; // 几何中心，用于控制节点补偿 hybrid 吸点偏移
+    bool has_geom = false;
 }; // 统一存放每个积木的物理属性
 
 void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
@@ -582,20 +584,43 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
         }
     }
 
-    // 【核心修复1】：按照 4 个元素 (shape, u, v, angle) 去解析视觉数据，防止数组错位！
+    // 解析视觉散落块。兼容两种格式：
+    // 旧格式每块 4 个整数：[shape, pick_u, pick_v, angle]
+    // 新格式每块 6 个整数：[shape, pick_u, pick_v, angle, geom_u, geom_v]
+    // hybrid 吸取时需要 geom_u/geom_v 给控制节点补偿“吸点不在几何中心”的放置偏差。
     vector<BlockInfo> available_blocks[7];
     if (msg->data.size() > 147)
     {
         int num_blocks = msg->data[idx++];
-        for (int i = 0; i < num_blocks && idx + 3 < msg->data.size(); ++i)
+        int remaining = (int)msg->data.size() - idx;
+        bool vision_has_geom = (num_blocks > 0 && remaining >= num_blocks * 6);
+        int stride = vision_has_geom ? 6 : 4;
+
+        for (int i = 0; i < num_blocks && idx + stride - 1 < (int)msg->data.size(); ++i)
         {
+            BlockInfo b;
             int shape = msg->data[idx++];
-            int u = msg->data[idx++];
-            int v = msg->data[idx++];
-            int ang = msg->data[idx++]; // 读出绝对角度
-            available_blocks[shape].push_back({u, v, ang});
+            b.u = msg->data[idx++];
+            b.v = msg->data[idx++];
+            b.ang = msg->data[idx++];
+            if (vision_has_geom)
+            {
+                b.geom_u = msg->data[idx++];
+                b.geom_v = msg->data[idx++];
+                b.has_geom = true;
+            }
+            else
+            {
+                b.geom_u = b.u;
+                b.geom_v = b.v;
+                b.has_geom = false;
+            }
+
+            if (shape >= 0 && shape < 7)
+                available_blocks[shape].push_back(b);
         }
-        ROS_INFO("Parsed true pixel coordinates AND angle for %d scattered blocks.", num_blocks);
+        ROS_INFO("Parsed %d scattered blocks. vision_payload_stride=%d (%s geom center).",
+                 num_blocks, stride, vision_has_geom ? "with" : "without");
     }
 
     if (total_blocks == 0)
@@ -796,7 +821,7 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
         }
 
         std_msgs::Int32MultiArray plan_msg;
-        plan_msg.data.push_back(seq.size()); // 每个动作使用扩展 15-int 格式
+        plan_msg.data.push_back(seq.size()); // 每个动作使用扩展 17-int 格式
 
         const char *SHAPE_NAMES[] = {
             "linear_red", "grid_orange", "T_shape_brown",
@@ -809,12 +834,17 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
             {
                 if (act.piece_id == seq[i])
                 {
-                    int pu = 0, pv = 0, p_ang = 0;
+                    int pu = 0, pv = 0, p_ang = 0, geom_u = 0, geom_v = 0;
+                    bool has_geom = false;
                     if (!available_blocks[act.shape_type].empty())
                     {
-                        pu = available_blocks[act.shape_type].back().u;
-                        pv = available_blocks[act.shape_type].back().v;
-                        p_ang = available_blocks[act.shape_type].back().ang;
+                        BlockInfo b = available_blocks[act.shape_type].back();
+                        pu = b.u;
+                        pv = b.v;
+                        p_ang = b.ang;
+                        geom_u = b.geom_u;
+                        geom_v = b.geom_v;
+                        has_geom = b.has_geom;
                         available_blocks[act.shape_type].pop_back();
                     }
                     else
@@ -830,11 +860,10 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
                         sum_c += pt.y;
                     }
 
-                    // 扩展版发送格式：每个动作 15 个整数
-                    // [shape, way, sum_r, sum_c, u, v, pick_angle,
+                    // 扩展版发送格式：每个动作 17 个整数
+                    // [shape, way, sum_r, sum_c, pick_u, pick_v, pick_angle, geom_u, geom_v,
                     //  cell0_r, cell0_c, cell1_r, cell1_c, cell2_r, cell2_c, cell3_r, cell3_c]
-                    // 控制节点可以用 4 个目标凸起坐标查询 PLACE_Z_MAP_14x10，
-                    // 对翘曲白板取 max(z0,z1,z2,z3) 作为放置高度。
+                    // pick_u/v 用于吸取；geom_u/v 用于控制节点补偿 hybrid 吸点偏离几何中心造成的放置平移误差。
                     plan_msg.data.push_back(act.shape_type);
                     plan_msg.data.push_back(act.real_way);
                     plan_msg.data.push_back(sum_r);
@@ -842,6 +871,8 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
                     plan_msg.data.push_back(pu);
                     plan_msg.data.push_back(pv);
                     plan_msg.data.push_back(p_ang);
+                    plan_msg.data.push_back(geom_u);
+                    plan_msg.data.push_back(geom_v);
 
                     std::string cell_str;
                     for (auto &pt : act.absolute_coords)
@@ -854,9 +885,10 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
                         cell_str += buf;
                     }
 
-                    ROS_INFO("action [%2d/%lu]: select block => %-18s | cells => %s| center=(%.2f, %.2f) | rotation => %3d degree | pick=(%d,%d,%d)",
+                    ROS_INFO("action [%2d/%lu]: select block => %-18s | cells => %s| center=(%.2f, %.2f) | rotation => %3d degree | pick=(%d,%d,%d) geom=(%d,%d) has_geom=%s",
                              i + 1, seq.size(), SHAPE_NAMES[act.shape_type], cell_str.c_str(),
-                             sum_r / 4.0, sum_c / 4.0, act.real_way * 90, pu, pv, p_ang);
+                             sum_r / 4.0, sum_c / 4.0, act.real_way * 90, pu, pv, p_ang,
+                             geom_u, geom_v, has_geom ? "true" : "false");
                     break;
                 }
             }

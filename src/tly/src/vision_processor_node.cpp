@@ -674,6 +674,15 @@ public:
 
         ROS_INFO("C++ Vision node ready (Topology + lightboard mask optimized). use_lightboard_mask=%s stable_publish_max_missed=%d",
                  use_lightboard_mask ? "true" : "false", stable_publish_max_missed);
+        std::string dist_shapes_str;
+        for (size_t i = 0; i < distance_pick_shapes.size(); ++i)
+        {
+            char buf[16];
+            std::snprintf(buf, sizeof(buf), "%s%d", i == 0 ? "" : ",", distance_pick_shapes[i]);
+            dist_shapes_str += buf;
+        }
+        ROS_INFO("C++ Vision pick_point_mode=%s distance_pick_shapes=[%s]. board_state payload=[shape,pick_u,pick_v,angle,geom_u,geom_v]",
+                 pick_point_mode.c_str(), dist_shapes_str.c_str());
     }
 
     ~VisionProcessorNode() { delete templates; }
@@ -1038,15 +1047,25 @@ public:
             if (tr.shape_id < 0 || tr.shape_id >= 7)
                 continue;
             inventory[tr.shape_id]++;
-            Point2f p = tr.stable_px_geom();
+
+            // 同时发布吸取点 pick_px 和几何中心 geom_px。
+            // hybrid 模式下 L 型会用 distance-transform 作为 pick_px，吸得更稳；
+            // 但放置时控制节点必须知道 geom_px，才能补偿“吸点不在几何中心”导致的放置平移误差。
+            Point2f pick = tr.stable_px_pick();
+            Point2f geom = tr.stable_px_geom();
+
+            // 新视觉 payload 每个块 6 个整数：
+            // [shape, pick_u, pick_v, angle, geom_u, geom_v]
             payload.push_back(tr.shape_id);
-            payload.push_back(round(p.x));
-            payload.push_back(round(p.y));
-            payload.push_back(round(tr.stable_angle()));
+            payload.push_back((int)round(pick.x));
+            payload.push_back((int)round(pick.y));
+            payload.push_back((int)round(tr.stable_angle()));
+            payload.push_back((int)round(geom.x));
+            payload.push_back((int)round(geom.y));
         }
         msg.data.insert(msg.data.end(), inventory.begin(), inventory.end());
         msg.data.insert(msg.data.end(), board_state.begin(), board_state.end());
-        msg.data.push_back(payload.size() / 4);
+        msg.data.push_back(payload.size() / 6);
         msg.data.insert(msg.data.end(), payload.begin(), payload.end());
         state_pub.publish(msg);
     }
