@@ -1,82 +1,130 @@
 <launch>
+    <!-- =========================
+         Basic arguments
+         ========================= -->
     <arg name="robot_ip" default="192.168.1.228" />
+    <arg name="expected_blocks" default="35" />
+    <arg name="place_z_extra_margin" default="0.01" />
 
-    <!-- 1. 启动官方的真机 MoveIt 控制环境 -->
+    <!-- =========================
+         1. xArm real MoveIt control
+         ========================= -->
     <include file="$(find xarm6_moveit_config)/launch/realMove_exec.launch">
         <arg name="robot_ip" value="$(arg robot_ip)" />
     </include>
-    
-    <!-- 2. 启动 Realsense 相机 -->
+
+    <!-- =========================
+         2. RealSense camera
+         ========================= -->
     <include file="$(find realsense2_camera)/launch/rs_camera.launch">
         <arg name="align_depth" value="true" />
     </include>
 
-    <!-- 3. 启动手眼标定发布器 -->
+    <!-- =========================
+         3. Hand-eye calibration TF publisher
+         camera_color_optical_frame -> robot TF tree
+         ========================= -->
     <include file="$(find easy_handeye)/launch/publish.launch">
         <arg name="eye_on_hand" value="true" />
         <arg name="namespace_prefix" value="xarm6_realsense_calibration" />
     </include>
 
-    <!-- 4. 加载我们在标定工具里生成的 yaml 配置文件到 ROS 参数服务器 -->
+    <!-- =========================
+         4. Tetris calibration/config YAML
+         Includes PICK_SURFACE_PLANE_BASE, BOARD_CENTERS, PLACE_Z_MAP, etc.
+         ========================= -->
     <rosparam file="$(find tly)/config/tetris_config.yaml" command="load" />
 
-    <!-- 5. 启动动态 TF 广播节点，在后台静默修正物理倾角 -->
+    <!-- =========================
+         5. table_frame publisher
+         ========================= -->
     <node pkg="tly" type="table_tf_broadcaster.py" name="table_tf_broadcaster" output="screen" />
 
-    <node pkg="image_proc" type="image_proc" name="image_proc" ns="/camera/color" output="screen"/>
+    <!-- =========================
+         6. Generate /camera/color/image_rect_color
+         ========================= -->
+    <node pkg="image_proc" type="image_proc" name="image_proc" ns="/camera/color" output="screen" />
 
-    <!-- 7. 视觉节点：只负责识别方块、质心吸取点、姿态角 -->
+    
+    <!-- 7. 视觉节点 -->
     <node pkg="tly" type="vision_processor_node_cpp" name="vision_processor_node" output="screen">
-    <param name="image_topic" value="/camera/color/image_rect_color"/>
-    <param name="camera_info_topic" value="/camera/color/camera_info"/>
-    <param name="assume_image_rectified" value="true"/>
+        <param name="image_topic" value="/camera/color/image_rect_color" />
+        <param name="camera_info_topic" value="/camera/color/camera_info" />
+        <param name="assume_image_rectified" value="true" />
+        <param name="table_frame" value="table_frame" />
+        
+        <!-- 角度与姿态偏置 -->
+        <param name="publish_angle_in_table_frame" value="true" />
+        <param name="angle_axis_probe_px" value="40.0" />
+        <param name="contour_axis_probe_px" value="50.0" />
+        <!-- 核心修改 1：关闭轮廓轴线推断，彻底消除 T/L 块的角度横跳，信任 1° 精度的模板角度 -->
+        <param name="use_contour_axis_yaw" value="false" />
 
-    <param name="table_frame" value="table_frame"/>
-    <!-- 吸取点设置 -->
-    <!-- centroid  ：默认，吸取点=物理重心近似点，推荐你现在用
-         distance  ：最大内切圆中心，可能偏边缘
-         hybrid    ：部分形状用 distance，其余用 centroid -->
-    <param name="pick_point_mode" value="centroid"/>
+        <!-- Pick point mode: hybrid 模式对 L 型使用形心，更稳固 -->
+        <param name="pick_point_mode" value="hybrid" />
+        <rosparam param="distance_pick_shapes">[3, 4, 5, 6]</rosparam>
 
-    <!-- 只识别左侧散落方块区域 -->
-    <param name="roi_x_min" value="314" />
-    <param name="roi_y_min" value="44" />
-    <param name="roi_x_max" value="895" />
-    <param name="roi_y_max" value="695" />
+        <!-- Wider ROI for current RealSense view. -->
+        <param name="roi_x_min" value="314" />
+        <param name="roi_y_min" value="44" />
+        <param name="roi_x_max" value="895" />
+        <param name="roi_y_max" value="695" />
 
-    <!-- 暗色方块前景分割 -->
-    <param name="threshold_mode" value="otsu"/>
-    <param name="manual_dark_threshold" value="105"/>
-    <param name="blur_kernel" value="5"/>
-    <param name="close_kernel" value="3"/>
-    <param name="open_kernel" value="3"/>
+        <!-- Black block segmentation on white lightboard. -->
+        <param name="threshold_mode" value="otsu" />
+        <param name="manual_dark_threshold" value="105" />
+        <param name="blur_kernel" value="5" />
+        <param name="close_kernel" value="3" />
+        <param name="open_kernel" value="3" />
 
-    <!-- 面积阈值，1280x720 下先用这组 -->
-    <param name="min_area" value="900"/>
-    <param name="max_area" value="50000"/>
+        <!-- Lightboard mask: 仅在发光板亮区内寻找黑色积木 -->
+        <param name="use_saturation_foreground" value="false" />
+        <param name="use_lightboard_mask" value="true" />
+        <param name="lightboard_min_area_ratio" value="0.08" />
+        <param name="lightboard_close_kernel" value="15" />
 
-    <!-- 模板匹配 -->
-    <param name="min_template_iou" value="0.45"/>
-    <param name="template_size" value="96"/>
-    <param name="template_angle_step" value="5"/>
-    <param name="template_refine_step" value="1"/>
+        <!-- Area filtering at 1280x720. -->
+        <param name="min_area" value="900" />
+        <param name="max_area" value="50000" />
+        <param name="min_contour_fill_ratio" value="0.18" />
+        <param name="max_contour_fill_ratio" value="0.98" />
 
-    <!-- 稳定性 -->
-    <param name="track_history_len" value="9"/>
-    <param name="stable_min_frames" value="3"/>
-    <param name="stable_max_px_std" value="6.0"/>
-    <param name="stable_max_angle_std_deg" value="10.0"/>
-    <param name="publish_only_stable" value="true"/>
-    <param name="stable_publish_max_missed" value="6" />
-    <param name="max_missed_frames" value="12" />
+        <!-- Topology-enhanced template matching (由于 C++ 中做了全量预计算，refine_step 设为 1 获取最高 1° 精度) -->
+        <param name="min_template_iou" value="0.40" />
+        <param name="template_size" value="72" />
+        <param name="template_angle_step" value="10" />
+        <param name="template_refine_step" value="1" />
 
-    <param name="publish_debug_foreground" value="true"/>
-    <param name="publish_debug_edges" value="true"/>
-    <param name="publish_debug_pose_array" value="true"/>
+        <!-- Tracking/stability: faster startup, tolerant to short missed detections. -->
+        <param name="track_history_len" value="9" />
+        <param name="stable_min_frames" value="2" />
+        <!-- 核心修改 2：放宽位置抖动容忍度，防止边缘积木和 L 型距离变换点在几像素内滑动导致误判 -->
+        <param name="stable_max_px_std" value="15.0" />
+        <param name="stable_max_angle_std_deg" value="25.0" />
+        <param name="publish_only_stable" value="true" />
+        <param name="stable_publish_max_missed" value="3" />
+        <param name="max_missed_frames" value="10" />
 
-    <param name="use_lightboard_mask" value="true" />
-    <param name="lightboard_min_area_ratio" value="0.08" />
-    <param name="lightboard_close_kernel" value="15" />
-</node>
+        <!-- Track matching gates. -->
+        <param name="track_match_gate_px" value="85.0" />
+        <param name="track_match_gate_m" value="0.055" />
 
+        <!-- Precise Pose 服务参数 (显式暴露方便后续机械臂微调时修改) -->
+        <param name="precise_timeout" value="0.8" />
+        <param name="precise_require_stable" value="true" />
+        <param name="precise_center_gate_px" value="280.0" />
+
+    </node>
+
+    <!-- =========================
+         9. Strategy node
+         Waits for 35 stable blocks; fallback allows 34 stable blocks after a shorter wait.
+         ========================= -->
+    <node pkg="tly" type="strategy_node" name="strategy_node" output="screen"
+          launch-prefix="bash -c 'sleep 2; exec $0 $@'">
+        <param name="expected_total_blocks" value="$(arg expected_blocks)" />
+        <param name="inventory_stable_required_frames" value="5" />
+        <param name="min_usable_total_blocks" value="35" />
+        <param name="min_usable_stable_required_frames" value="3" />
+    </node>
 </launch>

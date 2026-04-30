@@ -5,7 +5,7 @@
     <arg name="pick_surface_samples" default="16" />
 
     <!-- 白板标定模式：A=9点，B=25点，C=140点。白板翘曲明显建议 C -->
-    <arg name="board_mode" default="C" />
+    <arg name="board_mode" default="B" />
 
     <!-- 白板高度插值：C 模式建议 idw；A/B 可用 quadratic 或 idw -->
     <arg name="height_interpolation" default="idw" />

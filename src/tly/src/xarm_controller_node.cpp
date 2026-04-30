@@ -4,6 +4,7 @@
 #include <sensor_msgs/CameraInfo.h>
 
 #include <moveit/move_group_interface/move_group_interface.h>
+#include <moveit_msgs/RobotTrajectory.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 #include <tf2/LinearMath/Matrix3x3.h>
@@ -210,6 +211,13 @@ private:
     double wrist_unwind_target_abs_ = 0.30; // rad, after modulo 2pi should be near zero
     bool holding_block_ = false;
 
+    // Cartesian straight-line motion for near-board Z approach/retract.
+    // Normal MoveIt joint-space planning only guarantees the final pose, not a vertical TCP path.
+    bool use_cartesian_z_motion_ = true;
+    double cartesian_eef_step_ = 0.003;
+    double cartesian_jump_threshold_ = 0.0;
+    double cartesian_min_fraction_ = 0.98;
+
     bool use_precise_service_ = false;
     bool assume_image_rectified_ = false;
     bool use_board_map_ = true;
@@ -269,6 +277,10 @@ private:
         pnh_.param("auto_unwind_wrist", auto_unwind_wrist_, auto_unwind_wrist_);
         pnh_.param("wrist_unwind_threshold", wrist_unwind_threshold_, wrist_unwind_threshold_);
         pnh_.param("wrist_unwind_target_abs", wrist_unwind_target_abs_, wrist_unwind_target_abs_);
+        pnh_.param("use_cartesian_z_motion", use_cartesian_z_motion_, use_cartesian_z_motion_);
+        pnh_.param("cartesian_eef_step", cartesian_eef_step_, cartesian_eef_step_);
+        pnh_.param("cartesian_jump_threshold", cartesian_jump_threshold_, cartesian_jump_threshold_);
+        pnh_.param("cartesian_min_fraction", cartesian_min_fraction_, cartesian_min_fraction_);
 
         nh_.param("/tetris/GRID_SIZE", GRID_SIZE_, GRID_SIZE_);
         nh_.param("/tetris/BOARD_ORIGIN_X", BOARD_ORIGIN_X_, BOARD_ORIGIN_X_);
@@ -299,6 +311,9 @@ private:
                  use_continuous_yaw_ ? "true" : "false",
                  auto_unwind_wrist_ ? "true" : "false",
                  wrist_unwind_threshold_, wrist_unwind_target_abs_);
+        ROS_INFO("[CTRL] Cartesian Z motion: use=%s eef_step=%.4f jump=%.3f min_fraction=%.3f",
+                 use_cartesian_z_motion_ ? "true" : "false",
+                 cartesian_eef_step_, cartesian_jump_threshold_, cartesian_min_fraction_);
     }
 
     void cameraInfoCallback(const sensor_msgs::CameraInfo::ConstPtr &msg)
@@ -1218,6 +1233,44 @@ private:
             return false;
         }
 
+        move_group_.clearPoseTargets();
+        return true;
+    }
+
+    bool moveLinearToPose(const geometry_msgs::Pose &target, const std::string &label)
+    {
+        move_group_.setStartStateToCurrentState();
+
+        std::vector<geometry_msgs::Pose> waypoints;
+        waypoints.push_back(target);
+
+        moveit_msgs::RobotTrajectory trajectory;
+        double fraction = move_group_.computeCartesianPath(
+            waypoints,
+            cartesian_eef_step_,
+            cartesian_jump_threshold_,
+            trajectory);
+
+        ROS_INFO("[CTRL] Cartesian path for %s: target=(%.6f, %.6f, %.6f), fraction=%.3f",
+                 label.c_str(), target.position.x, target.position.y, target.position.z, fraction);
+
+        if (fraction < cartesian_min_fraction_)
+        {
+            ROS_ERROR("[CTRL] Cartesian path failed for %s: fraction=%.3f < %.3f",
+                      label.c_str(), fraction, cartesian_min_fraction_);
+            return false;
+        }
+
+        moveit::planning_interface::MoveGroupInterface::Plan plan;
+        plan.trajectory_ = trajectory;
+
+        auto exec_result = move_group_.execute(plan);
+        if (exec_result != moveit::planning_interface::MoveItErrorCode::SUCCESS)
+        {
+            ROS_ERROR("[CTRL] Cartesian execute failed for %s.", label.c_str());
+            return false;
+        }
+
         return true;
     }
 
@@ -1326,7 +1379,10 @@ private:
 
         case State::EXECUTE_PICK:
         {
-            if (!moveToPose(current_task_.pick_pose, "pick"))
+            bool pick_ok = use_cartesian_z_motion_
+                               ? moveLinearToPose(current_task_.pick_pose, "pick_linear_down")
+                               : moveToPose(current_task_.pick_pose, "pick");
+            if (!pick_ok)
             {
                 failOrFinish("Move to pick pose failed.");
                 return;
@@ -1335,7 +1391,10 @@ private:
                 holding_block_ = true;
 
             geometry_msgs::Pose hover = hoverFrom(current_task_.pick_pose);
-            if (!moveToPose(hover, "lift_after_pick"))
+            bool lift_pick_ok = use_cartesian_z_motion_
+                                    ? moveLinearToPose(hover, "lift_after_pick_linear")
+                                    : moveToPose(hover, "lift_after_pick");
+            if (!lift_pick_ok)
             {
                 failOrFinish("Lift after pick failed.");
                 return;
@@ -1358,7 +1417,10 @@ private:
 
         case State::EXECUTE_PLACE:
         {
-            if (!moveToPose(current_task_.place_pose, "place"))
+            bool place_ok = use_cartesian_z_motion_
+                                ? moveLinearToPose(current_task_.place_pose, "place_linear_down")
+                                : moveToPose(current_task_.place_pose, "place");
+            if (!place_ok)
             {
                 failOrFinish("Move to place pose failed.");
                 return;
@@ -1367,7 +1429,10 @@ private:
                 holding_block_ = false;
 
             geometry_msgs::Pose hover = hoverFrom(current_task_.place_pose);
-            if (!moveToPose(hover, "lift_after_place"))
+            bool lift_place_ok = use_cartesian_z_motion_
+                                     ? moveLinearToPose(hover, "lift_after_place_linear")
+                                     : moveToPose(hover, "lift_after_place");
+            if (!lift_place_ok)
             {
                 failOrFinish("Lift after place failed.");
                 return;

@@ -18,6 +18,7 @@
 #include <vector>
 #include <deque>
 #include <map>
+#include <unordered_map>
 #include <mutex>
 #include <cmath>
 #include <numeric>
@@ -52,6 +53,8 @@ struct Detection
     Point2f geom_px;
     Point2f pick_px;
     double angle_deg;
+    double axis_angle_img_deg = 0.0;
+    bool has_axis_angle = false;
     double score;
     double iou;
     double stamp;
@@ -63,7 +66,6 @@ struct Detection
 // --- 数学与辅助工具 ---
 namespace vision_utils
 {
-    // 0~360 周期角度均值：L/T/Z 这类非中心对称积木不能把 0° 和 180° 当成同一姿态。
     double meanPeriodicAngle360(const vector<double> &angles)
     {
         if (angles.empty())
@@ -79,25 +81,6 @@ namespace vision_utils
         return fmod(res + 360.0, 360.0);
     }
 
-    // 0~360 周期角度标准差，避免 14°/194° 被错误合并。
-    double angleStdDevDeg360(const vector<double> &angles)
-    {
-        if (angles.size() < 2)
-            return numeric_limits<double>::infinity();
-        double mean = meanPeriodicAngle360(angles) * M_PI / 180.0;
-        double sum_sq = 0.0;
-        for (double a : angles)
-        {
-            double rad = a * M_PI / 180.0;
-            double d = atan2(sin(rad - mean), cos(rad - mean));
-            sum_sq += d * d;
-        }
-        return sqrt(sum_sq / angles.size()) * 180.0 / M_PI;
-    }
-
-    // 指定周期的角度均值/标准差。
-    // line/Z 使用 180° 周期，square 使用 90° 周期，L/T 使用 360° 周期。
-    // 这样既保留 L/T 的 180° 方向信息，又避免 line/square/Z 因等价角跳变而永远不稳定。
     double meanPeriodicAnglePeriod(const vector<double> &angles, double period_deg)
     {
         if (angles.empty())
@@ -175,10 +158,7 @@ public:
     int missed;
 
     BlockTrack(int id, const Detection &det, int h_len)
-        : track_id(id), history_len(h_len), missed(0)
-    {
-        update(det);
-    }
+        : track_id(id), history_len(h_len), missed(0) { update(det); }
 
     void update(const Detection &det)
     {
@@ -226,14 +206,13 @@ public:
         return false;
     }
 
+    // --- 核心修复区：将 Z 块（5，6）的对称等价周期设为 180 度 ---
     static double angle_period_for_shape(int sid)
     {
-        // 0 line: 180° 等价；1 square: 90° 等价；5/6 Z: 180° 等价。
-        // 2 T 和 3/4 L 必须保留 0~360°，否则会出现放置差 180°。
         if (sid == 1)
             return 90.0;
         if (sid == 0 || sid == 5 || sid == 6)
-            return 180.0;
+            return 180.0; // 修复了 Z 型方块角度横跳引发的不稳定
         return 360.0;
     }
 
@@ -280,13 +259,7 @@ public:
         return vision_utils::angleStdDevDegPeriod(angs, angle_period_for_shape(shape_id));
     }
 
-    bool is_stable(int min_frames, double max_px_std, double max_angle_std) const
-    {
-        return is_stable(min_frames, max_px_std, max_angle_std, 0);
-    }
-
-    // 允许已经稳定的轨迹短时丢帧后继续发布，避免库存 28~33 之间抖动。
-    bool is_stable(int min_frames, double max_px_std, double max_angle_std, int allowed_missed) const
+    bool is_stable(int min_frames, double max_px_std, double max_angle_std, int allowed_missed = 0) const
     {
         return count() >= min_frames && missed <= allowed_missed &&
                position_std_px() <= max_px_std && angle_std_deg() <= max_angle_std;
@@ -355,12 +328,7 @@ public:
     }
 };
 
-// --- 拓扑增强模板匹配库 ---
-// 仍然使用黑白分割，但匹配不再只依赖硬 IoU：
-// 1) 模板和候选都会做归一化；
-// 2) 用轻微膨胀后的 IoU 抗边缘缺损；
-// 3) 用双向 Chamfer 距离评价形状拓扑接近程度；
-// 4) 保留 0~360° 角度，避免 L/Z/T 被压成 180° 周期。
+// --- 拓扑增强模板匹配库 (已做预计算优化) ---
 class TemplateBank
 {
 public:
@@ -372,21 +340,41 @@ public:
         Mat mask;
         Mat soft_mask;
         vector<Point> pts;
+        vector<double> signature;
+        vector<double> signature8;
     };
+
+    // 粗略搜索模板库
     vector<Tmpl> coarse_templates;
+    // 精细搜索模板库 (全量预计算缓存 360 度)
+    vector<vector<Tmpl>> all_templates;
 
     TemplateBank(int c_size = 96, int a_step = 5, int r_step = 1)
         : canvas_size(c_size), angle_step(a_step), refine_step(r_step), cell_size(20), margin(14)
     {
+        all_templates.resize(7);
+        for (int i = 0; i < 7; ++i)
+        {
+            all_templates[i].resize(360);
+        }
+
+        ROS_INFO("Pre-computing all 360-degree templates. This may take a few seconds but ensures 0 latency later...");
+
         for (auto const &pair : BASE_SHAPES)
         {
             int sid = pair.first;
-            for (int angle = 0; angle < 360; angle += angle_step)
+            for (int angle = 0; angle < 360; ++angle)
             {
                 Mat m = render_shape(sid, angle);
-                coarse_templates.push_back(make_template(sid, (double)angle, m));
+                all_templates[sid][angle] = make_template(sid, (double)angle, m);
+
+                if (angle % angle_step == 0)
+                {
+                    coarse_templates.push_back(all_templates[sid][angle]);
+                }
             }
         }
+        ROS_INFO("Template Pre-computation Done.");
     }
 
     Tmpl make_template(int sid, double angle, const Mat &mask)
@@ -398,6 +386,8 @@ public:
         Mat k = getStructuringElement(MORPH_RECT, Size(3, 3));
         dilate(t.mask, t.soft_mask, k);
         findNonZero(t.mask, t.pts);
+        t.signature = grid_signature(t.mask, 4);
+        t.signature8 = grid_signature(t.mask, 8);
         return t;
     }
 
@@ -454,6 +444,35 @@ public:
         return out;
     }
 
+    static vector<double> grid_signature(const Mat &mask, int grid = 4)
+    {
+        vector<double> sig(grid * grid, 0.0);
+        Mat bin;
+        threshold(mask, bin, 0, 255, THRESH_BINARY);
+        double total = max(1, countNonZero(bin));
+        for (int gy = 0; gy < grid; ++gy)
+        {
+            int y0 = gy * bin.rows / grid, y1 = (gy + 1) * bin.rows / grid;
+            for (int gx = 0; gx < grid; ++gx)
+            {
+                int x0 = gx * bin.cols / grid, x1 = (gx + 1) * bin.cols / grid;
+                Rect r(x0, y0, max(1, x1 - x0), max(1, y1 - y0));
+                sig[gy * grid + gx] = countNonZero(bin(r)) / total;
+            }
+        }
+        return sig;
+    }
+
+    static double signature_similarity(const vector<double> &a, const vector<double> &b)
+    {
+        if (a.empty() || b.empty() || a.size() != b.size())
+            return 0.0;
+        double l1 = 0.0;
+        for (size_t i = 0; i < a.size(); ++i)
+            l1 += std::abs(a[i] - b[i]);
+        return max(0.0, 1.0 - 0.5 * l1);
+    }
+
     tuple<int, double, double> match(const Mat &mask_norm)
     {
         Mat cand;
@@ -470,14 +489,16 @@ public:
         Mat cand_soft;
         Mat k = getStructuringElement(MORPH_RECT, Size(3, 3));
         dilate(cand, cand_soft, k);
-
         Mat cand_inv = 255 - cand;
         Mat cand_dist;
         distanceTransform(cand_inv, cand_dist, DIST_L2, 3);
+        vector<double> cand_sig = grid_signature(cand, 4);
+        vector<double> cand_sig8 = grid_signature(cand, 8);
 
+        // 粗匹配阶段
         for (auto &tmpl : coarse_templates)
         {
-            double s = topology_score(cand, cand_soft, cand_dist, cand_pts, tmpl);
+            double s = topology_score(cand, cand_soft, cand_dist, cand_pts, cand_sig, cand_sig8, tmpl);
             if (s > best_score)
             {
                 best_score = s;
@@ -486,13 +507,13 @@ public:
             }
         }
 
+        // 精细匹配阶段 (直接使用预计算数据，无重渲染延迟)
         double ref_angle = best_angle;
         for (int angle = (int)best_angle - angle_step; angle <= (int)best_angle + angle_step; angle += refine_step)
         {
-            int a = (angle + 360) % 360;
-            Mat tmpl_mask = render_shape(best_sid, a);
-            Tmpl tmpl = make_template(best_sid, a, tmpl_mask);
-            double s = topology_score(cand, cand_soft, cand_dist, cand_pts, tmpl);
+            int a = (angle % 360 + 360) % 360;
+            const Tmpl &tmpl = all_templates[best_sid][a];
+            double s = topology_score(cand, cand_soft, cand_dist, cand_pts, cand_sig, cand_sig8, tmpl);
             if (s > best_score)
             {
                 best_score = s;
@@ -503,7 +524,8 @@ public:
     }
 
     static double topology_score(const Mat &cand, const Mat &cand_soft, const Mat &cand_dist,
-                                 const vector<Point> &cand_pts, const Tmpl &tmpl)
+                                 const vector<Point> &cand_pts, const vector<double> &cand_sig,
+                                 const vector<double> &cand_sig8, const Tmpl &tmpl)
     {
         double hard_iou = binary_iou(cand, tmpl.mask);
         double soft_iou = binary_iou(cand_soft, tmpl.soft_mask);
@@ -533,8 +555,85 @@ public:
         double chamfer = 0.5 * (d_ct + d_tc);
         double chamfer_score = exp(-chamfer / 3.5);
 
-        // hard_iou 负责严格轮廓，soft_iou 和 chamfer 负责拓扑鲁棒性。
-        return 0.35 * hard_iou + 0.35 * soft_iou + 0.30 * chamfer_score;
+        double sig_score = signature_similarity(cand_sig, tmpl.signature);
+        double sig8_score = signature_similarity(cand_sig8, tmpl.signature8);
+
+        double cell_score = 0.0;
+        if (tmpl.sid == 3 || tmpl.sid == 4)
+            cell_score = l_cell_pattern_score(cand, tmpl.sid, tmpl.angle);
+
+        if (tmpl.sid == 3 || tmpl.sid == 4)
+            return 0.12 * hard_iou + 0.08 * soft_iou + 0.08 * chamfer_score +
+                   0.17 * sig_score + 0.25 * sig8_score + 0.30 * cell_score;
+
+        if (tmpl.sid == 2)
+            return 0.24 * hard_iou + 0.18 * soft_iou + 0.18 * chamfer_score +
+                   0.20 * sig_score + 0.20 * sig8_score;
+
+        return 0.30 * hard_iou + 0.25 * soft_iou + 0.20 * chamfer_score +
+               0.15 * sig_score + 0.10 * sig8_score;
+    }
+
+    static double l_cell_pattern_score(const Mat &cand, int sid, double angle_deg)
+    {
+        if (sid != 3 && sid != 4)
+            return 0.0;
+        Mat bin;
+        threshold(cand, bin, 0, 255, THRESH_BINARY);
+        Point2f center(bin.cols / 2.0f, bin.rows / 2.0f);
+        Mat rot_mat = getRotationMatrix2D(center, -angle_deg, 1.0);
+        Mat unrot;
+        warpAffine(bin, unrot, rot_mat, bin.size(), INTER_NEAREST, BORDER_CONSTANT, Scalar(0));
+        Mat norm = normalize_binary_mask(unrot, bin.rows);
+
+        vector<Point> pts;
+        findNonZero(norm, pts);
+        if (pts.empty())
+            return 0.0;
+
+        Rect bb = boundingRect(pts);
+        if (bb.width < 4 || bb.height < 4)
+            return 0.0;
+
+        const auto &raw = BASE_SHAPES.at(sid);
+        int min_x = 999, min_y = 999, max_x = -999, max_y = -999;
+        for (const auto &p : raw)
+        {
+            min_x = std::min(min_x, p.x);
+            min_y = std::min(min_y, p.y);
+            max_x = std::max(max_x, p.x);
+            max_y = std::max(max_y, p.y);
+        }
+        int gw = max_x - min_x + 1, gh = max_y - min_y + 1;
+        if (gw <= 0 || gh <= 0)
+            return 0.0;
+
+        vector<int> expected(gw * gh, 0);
+        for (const auto &p : raw)
+            expected[(p.y - min_y) * gw + (p.x - min_x)] = 1;
+
+        double score = 0.0;
+        int cells = 0;
+        for (int gy = 0; gy < gh; ++gy)
+        {
+            int y0 = bb.y + gy * bb.height / gh, y1 = bb.y + (gy + 1) * bb.height / gh;
+            for (int gx = 0; gx < gw; ++gx)
+            {
+                int x0 = bb.x + gx * bb.width / gw, x1 = bb.x + (gx + 1) * bb.width / gw;
+                Rect r(x0, y0, std::max(1, x1 - x0), std::max(1, y1 - y0));
+                r &= Rect(0, 0, norm.cols, norm.rows);
+                if (r.empty())
+                    continue;
+
+                double ratio = countNonZero(norm(r)) / std::max(1.0, (double)r.area());
+                bool exp_occ = expected[gy * gw + gx] != 0;
+                double cell_score = exp_occ ? std::min(1.0, ratio / 0.22)
+                                            : std::max(0.0, 1.0 - ratio / 0.12);
+                score += cell_score;
+                cells++;
+            }
+        }
+        return cells > 0 ? score / cells : 0.0;
     }
 
     static double binary_iou(const Mat &a, const Mat &b)
@@ -570,7 +669,14 @@ private:
     bool use_lightboard_mask;
     double lightboard_min_area_ratio;
     int lightboard_close_kernel;
+    bool use_saturation_foreground;
+    int saturation_min;
+    int saturation_value_min;
+    bool use_contour_axis_yaw;
+    double contour_axis_probe_px;
     int stable_publish_max_missed;
+    bool publish_angle_in_table_frame;
+    double angle_axis_probe_px;
 
     string pick_point_mode;
     vector<int> distance_pick_shapes;
@@ -594,6 +700,10 @@ private:
     tf2_ros::Buffer tf_buffer;
     tf2_ros::TransformListener tf_listener;
 
+    geometry_msgs::TransformStamped cached_tx;
+    bool has_cached_tx = false;
+    double last_tf_req_time = 0;
+
     CameraModel cam_model;
     TemplateBank *templates;
 
@@ -606,7 +716,6 @@ private:
 public:
     VisionProcessorNode() : pnh_("~"), it_(nh_), tf_listener(tf_buffer)
     {
-        // 加载参数
         pnh_.param("image_topic", image_topic, string("/camera/color/image_rect_color"));
         pnh_.param("camera_info_topic", camera_info_topic, string("/camera/color/camera_info"));
         pnh_.param("assume_image_rectified", assume_rectified, true);
@@ -632,6 +741,11 @@ public:
         pnh_.param("use_lightboard_mask", use_lightboard_mask, true);
         pnh_.param("lightboard_min_area_ratio", lightboard_min_area_ratio, 0.08);
         pnh_.param("lightboard_close_kernel", lightboard_close_kernel, 15);
+        pnh_.param("use_saturation_foreground", use_saturation_foreground, false);
+        pnh_.param("saturation_min", saturation_min, 35);
+        pnh_.param("saturation_value_min", saturation_value_min, 45);
+        pnh_.param("use_contour_axis_yaw", use_contour_axis_yaw, true);
+        pnh_.param("contour_axis_probe_px", contour_axis_probe_px, 50.0);
 
         pnh_.param("min_area", min_area, 900.0);
         pnh_.param("max_area", max_area, 50000.0);
@@ -653,6 +767,8 @@ public:
         pnh_.param("stable_max_angle_std_deg", stable_max_angle_std_deg, 5.0);
         pnh_.param("publish_only_stable", publish_only_stable, true);
         pnh_.param("stable_publish_max_missed", stable_publish_max_missed, 6);
+        pnh_.param("publish_angle_in_table_frame", publish_angle_in_table_frame, true);
+        pnh_.param("angle_axis_probe_px", angle_axis_probe_px, 40.0);
 
         pnh_.param("precise_timeout", precise_timeout, 0.8);
         pnh_.param("precise_require_stable", precise_require_stable, true);
@@ -672,17 +788,7 @@ public:
         pose_array_pub = nh_.advertise<geometry_msgs::PoseArray>("/vision/tracked_blocks_table", 1);
         precise_srv = nh_.advertiseService("/vision/get_precise_pose", &VisionProcessorNode::handle_precise, this);
 
-        ROS_INFO("C++ Vision node ready (Topology + lightboard mask optimized). use_lightboard_mask=%s stable_publish_max_missed=%d",
-                 use_lightboard_mask ? "true" : "false", stable_publish_max_missed);
-        std::string dist_shapes_str;
-        for (size_t i = 0; i < distance_pick_shapes.size(); ++i)
-        {
-            char buf[16];
-            std::snprintf(buf, sizeof(buf), "%s%d", i == 0 ? "" : ",", distance_pick_shapes[i]);
-            dist_shapes_str += buf;
-        }
-        ROS_INFO("C++ Vision pick_point_mode=%s distance_pick_shapes=[%s]. board_state payload=[shape,pick_u,pick_v,angle,geom_u,geom_v]",
-                 pick_point_mode.c_str(), dist_shapes_str.c_str());
+        ROS_INFO("C++ Vision node FULLY OPTIMIZED ready.");
     }
 
     ~VisionProcessorNode() { delete templates; }
@@ -701,16 +807,291 @@ public:
         return rect.center;
     }
 
-    Point2f distance_transform_center(Size sz, const vector<Point> &cnt)
+    // 局部 ROI 优化过的 Distance Transform
+    Point2f distance_transform_center(const vector<Point> &cnt)
     {
-        Mat single = Mat::zeros(sz, CV_8UC1);
-        vector<vector<Point>> cnts = {cnt};
-        drawContours(single, cnts, 0, Scalar(255), FILLED);
+        Rect bb = boundingRect(cnt);
+        int pad = 4;
+        bb.x -= pad;
+        bb.y -= pad;
+        bb.width += pad * 2;
+        bb.height += pad * 2;
+
+        Mat local_mask = Mat::zeros(bb.size(), CV_8UC1);
+        vector<Point> local_cnt;
+        for (const auto &p : cnt)
+        {
+            local_cnt.push_back(Point(p.x - bb.x, p.y - bb.y));
+        }
+        vector<vector<Point>> cnts = {local_cnt};
+        drawContours(local_mask, cnts, 0, Scalar(255), FILLED);
+
         Mat dist;
-        distanceTransform(single, dist, DIST_L2, 5);
+        distanceTransform(local_mask, dist, DIST_L2, 5);
         Point max_loc;
         minMaxLoc(dist, nullptr, nullptr, nullptr, &max_loc);
-        return Point2f(max_loc.x, max_loc.y);
+
+        return Point2f(max_loc.x + bb.x, max_loc.y + bb.y);
+    }
+
+    double contour_axis_angle_img_deg(const vector<Point> &cnt)
+    {
+        if (cnt.size() < 5)
+            return 0.0;
+        RotatedRect rr = minAreaRect(cnt);
+        double a = rr.angle;
+        if (rr.size.width < rr.size.height)
+            a += 90.0;
+        while (a < 0.0)
+            a += 180.0;
+        while (a >= 180.0)
+            a -= 180.0;
+        return a;
+    }
+
+    static double angle_dist_180(double a, double b)
+    {
+        double d = std::fabs(a - b);
+        while (d >= 180.0)
+            d -= 180.0;
+        if (d > 90.0)
+            d = 180.0 - d;
+        return d;
+    }
+
+    bool hough_axis_angle_img_deg(const Mat &fg_mask, const vector<Point> &cnt, double &out_angle)
+    {
+        if (cnt.size() < 5)
+            return false;
+        Rect bb = boundingRect(cnt);
+        int pad = 8;
+        int x0 = std::max(0, bb.x - pad), y0 = std::max(0, bb.y - pad);
+        int x1 = std::min(fg_mask.cols, bb.x + bb.width + pad), y1 = std::min(fg_mask.rows, bb.y + bb.height + pad);
+        if (x1 <= x0 + 5 || y1 <= y0 + 5)
+            return false;
+
+        Mat roi = fg_mask(Rect(x0, y0, x1 - x0, y1 - y0)).clone();
+        Mat edges;
+        Canny(roi, edges, 50, 150, 3);
+        vector<Vec4i> lines;
+        double min_len = std::max(12.0, 0.28 * std::max(bb.width, bb.height));
+        HoughLinesP(edges, lines, 1, CV_PI / 180.0, 10, min_len, 5);
+        if (lines.empty())
+            return false;
+
+        vector<double> hist(180, 0.0);
+        vector<pair<double, double>> samples;
+        for (const auto &l : lines)
+        {
+            double dx = static_cast<double>(l[2] - l[0]), dy = static_cast<double>(l[3] - l[1]);
+            double len = std::hypot(dx, dy);
+            if (len < min_len)
+                continue;
+            double a = std::atan2(dy, dx) * 180.0 / M_PI;
+            while (a < 0.0)
+                a += 180.0;
+            while (a >= 180.0)
+                a -= 180.0;
+            int bin = static_cast<int>(std::round(a)) % 180;
+            double w = len * len;
+            hist[bin] += w;
+            samples.push_back({a, w});
+        }
+
+        if (samples.empty())
+            return false;
+        int best_bin = 0;
+        for (int i = 1; i < 180; ++i)
+            if (hist[i] > hist[best_bin])
+                best_bin = i;
+
+        double s = 0.0, c = 0.0, wsum = 0.0;
+        for (const auto &aw : samples)
+        {
+            double a = aw.first, w = aw.second;
+            if (angle_dist_180(a, best_bin) > 12.0)
+                continue;
+            double rad = 2.0 * a * M_PI / 180.0;
+            s += w * std::sin(rad);
+            c += w * std::cos(rad);
+            wsum += w;
+        }
+
+        if (wsum <= 1e-9)
+            return false;
+        double mean = 0.5 * std::atan2(s, c) * 180.0 / M_PI;
+        while (mean < 0.0)
+            mean += 180.0;
+        while (mean >= 180.0)
+            mean -= 180.0;
+        out_angle = mean;
+        return true;
+    }
+
+    static double norm360deg(double a)
+    {
+        while (a < 0.0)
+            a += 360.0;
+        while (a >= 360.0)
+            a -= 360.0;
+        return a;
+    }
+
+    static double angle_diff_deg(double a, double b)
+    {
+        return fmod(a - b + 540.0, 360.0) - 180.0;
+    }
+
+    static double choose_axis_direction_near_template(double axis_yaw, double template_yaw)
+    {
+        double a0 = norm360deg(axis_yaw);
+        double a1 = norm360deg(axis_yaw + 180.0);
+        return std::abs(angle_diff_deg(a0, template_yaw)) <= std::abs(angle_diff_deg(a1, template_yaw)) ? a0 : a1;
+    }
+
+    double directed_t_axis_angle_img_deg(const vector<Point> &cnt, Point2f center, double axis_angle_0_180_deg)
+    {
+        double a = axis_angle_0_180_deg * M_PI / 180.0;
+        double nx = -std::sin(a), ny = std::cos(a);
+        double max_t = -1e9, min_t = 1e9, sum_pos = 0.0, sum_neg = 0.0;
+        int n_pos = 0, n_neg = 0;
+
+        for (const auto &p : cnt)
+        {
+            double dx = static_cast<double>(p.x) - center.x;
+            double dy = static_cast<double>(p.y) - center.y;
+            double t = dx * nx + dy * ny;
+            max_t = std::max(max_t, t);
+            min_t = std::min(min_t, t);
+            if (t >= 0.0)
+            {
+                sum_pos += t;
+                n_pos++;
+            }
+            else
+            {
+                sum_neg += -t;
+                n_neg++;
+            }
+        }
+
+        double pos_extent = max_t, neg_extent = -min_t;
+        double pos_mean = n_pos > 0 ? sum_pos / n_pos : 0.0;
+        double neg_mean = n_neg > 0 ? sum_neg / n_neg : 0.0;
+        double score = (pos_extent - neg_extent) + 0.35 * (pos_mean - neg_mean);
+
+        double directed = axis_angle_0_180_deg;
+        if (score < 0.0)
+            directed += 180.0;
+        return norm360deg(directed);
+    }
+
+    double directed_l_axis_angle_img_deg(const vector<Point> &cnt, Point2f center, double axis_angle_0_180_deg)
+    {
+        if (cnt.size() < 5)
+            return norm360deg(axis_angle_0_180_deg);
+        double a = axis_angle_0_180_deg * M_PI / 180.0;
+        double ux = std::cos(a), uy = std::sin(a), nx = -std::sin(a), ny = std::cos(a);
+        double min_u = 1e9, max_u = -1e9;
+        struct UV
+        {
+            double u;
+            double v;
+        };
+        vector<UV> pts;
+        pts.reserve(cnt.size());
+
+        for (const auto &p : cnt)
+        {
+            double dx = static_cast<double>(p.x) - center.x, dy = static_cast<double>(p.y) - center.y;
+            double u = dx * ux + dy * uy, v = dx * nx + dy * ny;
+            pts.push_back({u, v});
+            min_u = std::min(min_u, u);
+            max_u = std::max(max_u, u);
+        }
+        double span_u = max_u - min_u;
+        if (span_u < 1e-6)
+            return norm360deg(axis_angle_0_180_deg);
+        double band = std::max(4.0, 0.32 * span_u);
+
+        auto end_score = [&](bool high_end) -> double
+        {
+            double v_min = 1e9, v_max = -1e9, abs_v_sum = 0.0;
+            int n = 0;
+            for (const auto &q : pts)
+            {
+                if (high_end ? (q.u >= max_u - band) : (q.u <= min_u + band))
+                {
+                    v_min = std::min(v_min, q.v);
+                    v_max = std::max(v_max, q.v);
+                    abs_v_sum += std::abs(q.v);
+                    n++;
+                }
+            }
+            if (n <= 0)
+                return -1e9;
+            return (v_max - v_min) + 0.25 * (abs_v_sum / n) + 0.015 * n;
+        };
+
+        double directed = axis_angle_0_180_deg;
+        if (end_score(false) > end_score(true))
+            directed += 180.0;
+        return norm360deg(directed);
+    }
+
+    double directed_z_axis_angle_img_deg(const vector<Point> &cnt, Point2f center, double axis_angle_0_180_deg, int sid)
+    {
+        if (cnt.size() < 5)
+            return norm360deg(axis_angle_0_180_deg);
+        double a = axis_angle_0_180_deg * M_PI / 180.0;
+        double ux = std::cos(a), uy = std::sin(a), nx = -std::sin(a), ny = std::cos(a);
+        struct UV
+        {
+            double u;
+            double v;
+        };
+        vector<UV> pts;
+        pts.reserve(cnt.size());
+        double min_u = 1e9, max_u = -1e9;
+
+        for (const auto &p : cnt)
+        {
+            double dx = static_cast<double>(p.x) - center.x, dy = static_cast<double>(p.y) - center.y;
+            double u = dx * ux + dy * uy, v = dx * nx + dy * ny;
+            pts.push_back({u, v});
+            min_u = std::min(min_u, u);
+            max_u = std::max(max_u, u);
+        }
+
+        double span_u = max_u - min_u;
+        if (span_u < 1e-6)
+            return norm360deg(axis_angle_0_180_deg);
+        double mid_u = 0.5 * (min_u + max_u), dead_band = 0.08 * span_u;
+        double low_sum = 0.0, high_sum = 0.0;
+        int low_n = 0, high_n = 0;
+
+        for (const auto &q : pts)
+        {
+            if (q.u < mid_u - dead_band)
+            {
+                low_sum += q.v;
+                low_n++;
+            }
+            else if (q.u > mid_u + dead_band)
+            {
+                high_sum += q.v;
+                high_n++;
+            }
+        }
+
+        if (low_n < 3 || high_n < 3)
+            return norm360deg(axis_angle_0_180_deg);
+        double step_sign = (high_sum / high_n) - (low_sum / low_n);
+        double expected = (sid == 5) ? 1.0 : -1.0;
+        double directed = axis_angle_0_180_deg;
+        if (step_sign * expected < 0.0)
+            directed += 180.0;
+        return norm360deg(directed);
     }
 
     void keep_largest_component(Mat &mask, double min_area_ratio)
@@ -719,7 +1100,6 @@ public:
         findContours(mask.clone(), contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
         if (contours.empty())
             return;
-
         int best_idx = -1;
         double best_area = 0.0;
         for (int i = 0; i < (int)contours.size(); ++i)
@@ -731,11 +1111,8 @@ public:
                 best_idx = i;
             }
         }
-
-        double min_a = min_area_ratio * mask.cols * mask.rows;
-        if (best_idx < 0 || best_area < min_a)
+        if (best_idx < 0 || best_area < min_area_ratio * mask.cols * mask.rows)
             return;
-
         Mat out = Mat::zeros(mask.size(), CV_8UC1);
         drawContours(out, contours, best_idx, Scalar(255), FILLED);
         mask = out;
@@ -757,15 +1134,12 @@ public:
 
         Mat gray;
         cvtColor(roi, gray, COLOR_BGR2GRAY);
-
         if (blur_kernel > 1)
         {
             int b_k = blur_kernel % 2 == 1 ? blur_kernel : blur_kernel + 1;
             GaussianBlur(gray, gray, Size(b_k, b_k), 0);
         }
 
-        // 发光板场景：先找亮底板，只在亮底板内部寻找黑色积木。
-        // 这会屏蔽画面外黑色背景和右侧无关暗区，避免它们进入前景。
         Mat board_mask = Mat::ones(gray.size(), CV_8UC1) * 255;
         if (use_lightboard_mask)
         {
@@ -773,8 +1147,7 @@ public:
             int ksz = max(3, lightboard_close_kernel);
             if (ksz % 2 == 0)
                 ksz++;
-            Mat k = getStructuringElement(MORPH_RECT, Size(ksz, ksz));
-            morphologyEx(board_mask, board_mask, MORPH_CLOSE, k);
+            morphologyEx(board_mask, board_mask, MORPH_CLOSE, getStructuringElement(MORPH_RECT, Size(ksz, ksz)));
             morphologyEx(board_mask, board_mask, MORPH_OPEN, getStructuringElement(MORPH_RECT, Size(5, 5)));
             keep_largest_component(board_mask, lightboard_min_area_ratio);
             erode(board_mask, board_mask, getStructuringElement(MORPH_RECT, Size(3, 3)));
@@ -782,34 +1155,31 @@ public:
 
         Mat mask_roi;
         if (threshold_mode == "adaptive")
-        {
-            adaptiveThreshold(gray, mask_roi, 255, ADAPTIVE_THRESH_GAUSSIAN_C,
-                              THRESH_BINARY_INV, 31, 7);
-        }
+            adaptiveThreshold(gray, mask_roi, 255, ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, 31, 7);
         else if (threshold_mode == "otsu")
-        {
             threshold(gray, mask_roi, 0, 255, THRESH_BINARY_INV | THRESH_OTSU);
-        }
         else
-        {
             threshold(gray, mask_roi, manual_dark_threshold, 255, THRESH_BINARY_INV);
+
+        if (use_saturation_foreground)
+        {
+            Mat hsv, sat_mask, val_mask, sat_fg;
+            cvtColor(roi, hsv, COLOR_BGR2HSV);
+            vector<Mat> hsv_ch;
+            split(hsv, hsv_ch);
+            threshold(hsv_ch[1], sat_mask, saturation_min, 255, THRESH_BINARY);
+            threshold(hsv_ch[2], val_mask, saturation_value_min, 255, THRESH_BINARY);
+            bitwise_and(sat_mask, val_mask, sat_fg);
+            morphologyEx(sat_fg, sat_fg, MORPH_OPEN, getStructuringElement(MORPH_RECT, Size(3, 3)));
+            bitwise_or(mask_roi, sat_fg, mask_roi);
         }
 
         if (use_lightboard_mask)
             bitwise_and(mask_roi, board_mask, mask_roi);
-
         if (close_kernel > 1)
-        {
-            Mat kernel = Mat::ones(close_kernel, close_kernel, CV_8UC1);
-            morphologyEx(mask_roi, mask_roi, MORPH_CLOSE, kernel);
-        }
+            morphologyEx(mask_roi, mask_roi, MORPH_CLOSE, Mat::ones(close_kernel, close_kernel, CV_8UC1));
         if (open_kernel > 1)
-        {
-            Mat kernel = Mat::ones(open_kernel, open_kernel, CV_8UC1);
-            morphologyEx(mask_roi, mask_roi, MORPH_OPEN, kernel);
-        }
-
-        // 再次限制在发光板区域内，防止形态学运算把边界外噪声带回来。
+            morphologyEx(mask_roi, mask_roi, MORPH_OPEN, Mat::ones(open_kernel, open_kernel, CV_8UC1));
         if (use_lightboard_mask)
             bitwise_and(mask_roi, board_mask, mask_roi);
 
@@ -829,7 +1199,6 @@ public:
         }
         catch (cv_bridge::Exception &e)
         {
-            ROS_ERROR("cv_bridge exception: %s", e.what());
             return;
         }
 
@@ -837,7 +1206,7 @@ public:
         Mat small_frame, fg_mask;
         double scale;
 
-        // 1. CPU 预处理 (极快)
+        // 1. CPU 预处理
         process_foreground(frame, small_frame, fg_mask, scale);
 
         // 2. 轮廓提取与分类
@@ -869,12 +1238,21 @@ public:
             if (iou < min_template_iou)
                 continue;
 
-            Point2f centroid = contour_centroid(cnt);
+            // 针对 Z 型方块的特化处理：使用外接矩形中心，免疫边缘光线毛刺，彻底消除 1~2mm 漂移
+            Point2f centroid;
+            if (sid == 5 || sid == 6)
+            {
+                centroid = minAreaRect(cnt).center;
+            }
+            else
+            {
+                centroid = contour_centroid(cnt);
+            }
             Point2f pick_pt = centroid;
             if (pick_point_mode == "distance" ||
                 (pick_point_mode == "hybrid" && find(distance_pick_shapes.begin(), distance_pick_shapes.end(), sid) != distance_pick_shapes.end()))
             {
-                pick_pt = distance_transform_center(fg_mask.size(), cnt);
+                pick_pt = distance_transform_center(cnt);
             }
 
             vector<Point> cnt_full;
@@ -889,31 +1267,45 @@ public:
             d.geom_px = Point2f(centroid.x * inv_scale, centroid.y * inv_scale);
             d.pick_px = Point2f(pick_pt.x * inv_scale, pick_pt.y * inv_scale);
             d.angle_deg = angle;
+
+            double axis_hough = 0.0;
+            if (hough_axis_angle_img_deg(c_mask, cnt, axis_hough))
+            {
+                d.axis_angle_img_deg = axis_hough;
+                d.has_axis_angle = true;
+            }
+            else
+            {
+                d.axis_angle_img_deg = contour_axis_angle_img_deg(cnt);
+                d.has_axis_angle = true;
+            }
             d.score = iou;
             d.stamp = stamp;
             detections.push_back(d);
         }
 
-        // 3. 坐标转换与追踪更新
-        geometry_msgs::TransformStamped tx;
-        bool has_tx = false;
+        // 3. TF 坐标转换优化
         string c_frame = camera_frame_override.empty() ? msg->header.frame_id : camera_frame_override;
-        try
+        if (ros::Time::now().toSec() - last_tf_req_time > 0.5 || !has_cached_tx)
         {
-            tx = tf_buffer.lookupTransform(table_frame, c_frame, ros::Time(0), ros::Duration(0.05));
-            has_tx = true;
-        }
-        catch (tf2::TransformException &ex)
-        {
-            ROS_WARN_THROTTLE(2.0, "TF error: %s", ex.what());
+            try
+            {
+                cached_tx = tf_buffer.lookupTransform(table_frame, c_frame, ros::Time(0), ros::Duration(0.01));
+                has_cached_tx = true;
+                last_tf_req_time = ros::Time::now().toSec();
+            }
+            catch (...)
+            {
+            }
         }
 
-        if (has_tx)
-            attach_table_points(detections, tx);
+        if (has_cached_tx)
+            attach_table_points(detections, cached_tx);
 
+        Mat cloned_frame = frame.clone();
         {
             lock_guard<mutex> lock(state_mtx);
-            latest_frame = frame.clone();
+            latest_frame = std::move(cloned_frame);
             latest_header = msg->header;
             update_tracks(detections);
         }
@@ -928,7 +1320,9 @@ public:
                     pub_tracks.push_back(t);
             }
             else if (t.missed == 0)
+            {
                 pub_tracks.push_back(t);
+            }
         }
 
         publish_board_state(pub_tracks);
@@ -950,25 +1344,69 @@ public:
         tf2::Matrix3x3 R(q);
         tf2::Vector3 T(tx.transform.translation.x, tx.transform.translation.y, tx.transform.translation.z);
 
+        auto project_px_to_table = [&](Point2f px, Point3f &out)
+        {
+            Point3f ray = cam_model.pixel_to_ray(px.x, px.y);
+            tf2::Vector3 v_ray(ray.x, ray.y, ray.z);
+            tf2::Vector3 table_ray = R * v_ray;
+            if (std::abs(table_ray.z()) < 1e-9)
+                return false;
+            double t = (target_plane_z - T.z()) / table_ray.z();
+            if (t < 0)
+                return false;
+            tf2::Vector3 pt = T + table_ray * t;
+            out = Point3f(pt.x(), pt.y(), pt.z());
+            return true;
+        };
+
         for (auto &d : detections)
         {
-            auto try_proj = [&](Point2f px, Point3f &out)
-            {
-                Point3f ray = cam_model.pixel_to_ray(px.x, px.y);
-                tf2::Vector3 v_ray(ray.x, ray.y, ray.z);
-                tf2::Vector3 table_ray = R * v_ray;
-                if (abs(table_ray.z()) < 1e-9)
-                    return false;
-                double t = (target_plane_z - T.z()) / table_ray.z();
-                if (t < 0)
-                    return false;
-                tf2::Vector3 pt = T + table_ray * t;
-                out = Point3f(pt.x(), pt.y(), pt.z());
-                return true;
-            };
-            bool g_ok = try_proj(d.geom_px, d.geom_table);
-            bool p_ok = try_proj(d.pick_px, d.pick_table);
+            bool g_ok = project_px_to_table(d.geom_px, d.geom_table);
+            bool p_ok = project_px_to_table(d.pick_px, d.pick_table);
             d.has_table_points = g_ok && p_ok;
+
+            if (publish_angle_in_table_frame && g_ok)
+            {
+                auto image_axis_to_table_yaw = [&](double img_angle_deg, double probe_px, double &out_yaw) -> bool
+                {
+                    double a = (-img_angle_deg - 90.0) * M_PI / 180.0;
+                    Point2f p0 = d.geom_px;
+                    Point2f p1(p0.x + probe_px * std::cos(a), p0.y + probe_px * std::sin(a));
+                    Point3f t0, t1;
+                    if (!(project_px_to_table(p0, t0) && project_px_to_table(p1, t1)))
+                        return false;
+                    double dx = static_cast<double>(t1.x - t0.x), dy = static_cast<double>(t1.y - t0.y);
+                    if (std::hypot(dx, dy) <= 1e-6)
+                        return false;
+                    out_yaw = norm360deg(std::atan2(dy, dx) * 180.0 / M_PI);
+                    return true;
+                };
+
+                double template_yaw = 0.0;
+                bool ok_template = image_axis_to_table_yaw(d.angle_deg, angle_axis_probe_px, template_yaw);
+                double publish_yaw = template_yaw;
+
+                if (use_contour_axis_yaw && d.has_axis_angle)
+                {
+                    double axis_img_for_yaw = d.axis_angle_img_deg;
+                    if (d.shape_id == 2)
+                        axis_img_for_yaw = directed_t_axis_angle_img_deg(d.contour, d.geom_px, d.axis_angle_img_deg);
+                    else if (d.shape_id == 3 || d.shape_id == 4)
+                        axis_img_for_yaw = directed_l_axis_angle_img_deg(d.contour, d.geom_px, d.axis_angle_img_deg);
+                    else if (d.shape_id == 5 || d.shape_id == 6)
+                        axis_img_for_yaw = directed_z_axis_angle_img_deg(d.contour, d.geom_px, d.axis_angle_img_deg, d.shape_id);
+
+                    double axis_yaw = 0.0;
+                    if (image_axis_to_table_yaw(axis_img_for_yaw, contour_axis_probe_px, axis_yaw))
+                    {
+                        if (d.shape_id >= 2 && d.shape_id <= 6)
+                            publish_yaw = axis_yaw;
+                        else
+                            publish_yaw = ok_template ? choose_axis_direction_near_template(axis_yaw, template_yaw) : axis_yaw;
+                    }
+                }
+                d.angle_deg = norm360deg(publish_yaw);
+            }
         }
     }
 
@@ -977,17 +1415,45 @@ public:
         double penalty = (tr.shape_id == det.shape_id) ? 0.0 : 1.5;
         if (tr.has_stable_table_pick() && det.has_table_points)
         {
-            Point3f p1 = tr.stable_table_pick(), p2 = det.pick_table;
-            double d = norm(p1 - p2);
+            double d = norm(tr.stable_table_pick() - det.pick_table);
             if (d <= track_match_gate_m)
                 return d / max(track_match_gate_m, 1e-6) + penalty;
             return numeric_limits<double>::infinity();
         }
-        Point2f p1 = tr.stable_px_pick(), p2 = det.pick_px;
-        double dpx = norm(p1 - p2);
+        double dpx = norm(tr.stable_px_pick() - det.pick_px);
         if (dpx <= track_match_gate_px)
             return dpx / max(track_match_gate_px, 1e-6) + penalty;
         return numeric_limits<double>::infinity();
+    }
+
+    static double angleDiffDeg(double a, double b) { return fmod(a - b + 540.0, 360.0) - 180.0; }
+    static double norm360(double a)
+    {
+        double r = fmod(a, 360.0);
+        return r < 0 ? r + 360.0 : r;
+    }
+
+    Detection make_angle_consistent_with_track(const BlockTrack &tr, const Detection &det) const
+    {
+        Detection out = det;
+        if (!(det.shape_id == 2 || det.shape_id == 3 || det.shape_id == 4))
+            return out;
+        if (tr.count() < 2)
+            return out;
+        double prev = tr.stable_angle();
+        double candidates[3] = {det.angle_deg, det.angle_deg + 180.0, det.angle_deg - 180.0};
+        double best = candidates[0], best_abs = std::abs(angleDiffDeg(candidates[0], prev));
+        for (double c : candidates)
+        {
+            double e = std::abs(angleDiffDeg(c, prev));
+            if (e < best_abs)
+            {
+                best_abs = e;
+                best = c;
+            }
+        }
+        out.angle_deg = norm360(best);
+        return out;
     }
 
     void update_tracks(const vector<Detection> &detections)
@@ -995,7 +1461,6 @@ public:
         vector<int> unmatched_t(tracks.size()), unmatched_d(detections.size());
         iota(unmatched_t.begin(), unmatched_t.end(), 0);
         iota(unmatched_d.begin(), unmatched_d.end(), 0);
-
         struct Pair
         {
             double score;
@@ -1020,7 +1485,7 @@ public:
             auto it_d = find(unmatched_d.begin(), unmatched_d.end(), p.di);
             if (it_t != unmatched_t.end() && it_d != unmatched_d.end())
             {
-                tracks[p.ti].update(detections[p.di]);
+                tracks[p.ti].update(make_angle_consistent_with_track(tracks[p.ti], detections[p.di]));
                 unmatched_t.erase(it_t);
                 unmatched_d.erase(it_d);
             }
@@ -1029,9 +1494,7 @@ public:
             tracks[ti].mark_missed();
         for (int di : unmatched_d)
             tracks.push_back(BlockTrack(next_track_id++, detections[di], track_history_len));
-
-        tracks.erase(remove_if(tracks.begin(), tracks.end(),
-                               [this](const BlockTrack &t)
+        tracks.erase(remove_if(tracks.begin(), tracks.end(), [this](const BlockTrack &t)
                                { return t.missed > max_missed_frames; }),
                      tracks.end());
     }
@@ -1039,23 +1502,13 @@ public:
     void publish_board_state(const vector<BlockTrack> &pub_tracks)
     {
         std_msgs::Int32MultiArray msg;
-        vector<int> inventory(7, 0);
-        vector<int> board_state(140, 0);
-        vector<int> payload;
+        vector<int> inventory(7, 0), board_state(140, 0), payload;
         for (auto &tr : pub_tracks)
         {
             if (tr.shape_id < 0 || tr.shape_id >= 7)
                 continue;
             inventory[tr.shape_id]++;
-
-            // 同时发布吸取点 pick_px 和几何中心 geom_px。
-            // hybrid 模式下 L 型会用 distance-transform 作为 pick_px，吸得更稳；
-            // 但放置时控制节点必须知道 geom_px，才能补偿“吸点不在几何中心”导致的放置平移误差。
-            Point2f pick = tr.stable_px_pick();
-            Point2f geom = tr.stable_px_geom();
-
-            // 新视觉 payload 每个块 6 个整数：
-            // [shape, pick_u, pick_v, angle, geom_u, geom_v]
+            Point2f pick = tr.stable_px_pick(), geom = tr.stable_px_geom();
             payload.push_back(tr.shape_id);
             payload.push_back((int)round(pick.x));
             payload.push_back((int)round(pick.y));
@@ -1134,7 +1587,6 @@ public:
 
             BlockTrack *chosen = nullptr;
             double min_dist = numeric_limits<double>::infinity();
-
             for (auto &tr : tracks)
             {
                 if (tr.shape_id != target_sid || tr.missed != 0)
@@ -1156,37 +1608,29 @@ public:
             {
                 res.success = true;
                 res.angle = round(chosen->stable_angle());
-
-                string c_frame = camera_frame_override.empty() ? latest_header.frame_id : camera_frame_override;
-                geometry_msgs::TransformStamped tx;
-                try
+                if (chosen->has_stable_table_pick() && has_cached_tx)
                 {
-                    tx = tf_buffer.lookupTransform(table_frame, c_frame, ros::Time(0), ros::Duration(0.01));
-
-                    // 获取中心点的 Table 坐标
-                    tf2::Quaternion q(tx.transform.rotation.x, tx.transform.rotation.y, tx.transform.rotation.z, tx.transform.rotation.w);
-                    tf2::Matrix3x3 R(q);
-                    tf2::Vector3 T(tx.transform.translation.x, tx.transform.translation.y, tx.transform.translation.z);
-                    Point3f ray_c = cam_model.pixel_to_ray(cx, cy);
-                    tf2::Vector3 table_ray = R * tf2::Vector3(ray_c.x, ray_c.y, ray_c.z);
-                    double t = (target_plane_z - T.z()) / table_ray.z();
-                    tf2::Vector3 center_table = T + table_ray * t;
-
-                    if (chosen->has_stable_table_pick())
+                    try
                     {
+                        tf2::Quaternion q(cached_tx.transform.rotation.x, cached_tx.transform.rotation.y, cached_tx.transform.rotation.z, cached_tx.transform.rotation.w);
+                        tf2::Matrix3x3 R(q);
+                        tf2::Vector3 T(cached_tx.transform.translation.x, cached_tx.transform.translation.y, cached_tx.transform.translation.z);
+                        Point3f ray_c = cam_model.pixel_to_ray(cx, cy);
+                        tf2::Vector3 table_ray = R * tf2::Vector3(ray_c.x, ray_c.y, ray_c.z);
+                        double t = (target_plane_z - T.z()) / table_ray.z();
+                        tf2::Vector3 center_table = T + table_ray * t;
+
                         Point3f target_table = chosen->stable_table_pick();
-                        double dx_t = target_table.x - center_table.x();
-                        double dy_t = target_table.y - center_table.y();
+                        double dx_t = target_table.x - center_table.x(), dy_t = target_table.y - center_table.y();
                         double z_dist = max(abs(hover_z - target_plane_z), 1e-4);
                         res.dx = round(dy_t * fx / z_dist);
                         res.dy = round(dx_t * fy / z_dist);
                         return true;
                     }
+                    catch (...)
+                    {
+                    }
                 }
-                catch (...)
-                { /* fallback to px */
-                }
-
                 res.dx = round(chosen->stable_px_pick().x - cx);
                 res.dy = round(chosen->stable_px_pick().y - cy);
                 return true;
@@ -1205,7 +1649,7 @@ int main(int argc, char **argv)
 {
     ros::init(argc, argv, "vision_processor_node_cpp");
     VisionProcessorNode node;
-    ros::AsyncSpinner spinner(5); // 开启多线程以同时处理图像和 TF
+    ros::AsyncSpinner spinner(5);
     spinner.start();
     ros::waitForShutdown();
     return 0;

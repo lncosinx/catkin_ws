@@ -43,10 +43,10 @@
         <param name="pick_point_mode" value="centroid" />
 
         <!-- 单块测试可适当扩大 ROI；这里保持你当前左侧区域设置 -->
-        <param name="roi_x_min" value="314" />
-        <param name="roi_y_min" value="44" />
-        <param name="roi_x_max" value="895" />
-        <param name="roi_y_max" value="695" />
+        <param name="roi_x_min" value="270" />
+        <param name="roi_y_min" value="30" />
+        <param name="roi_x_max" value="910" />
+        <param name="roi_y_max" value="705" />
 
         <param name="threshold_mode" value="otsu" />
         <param name="manual_dark_threshold" value="105" />
