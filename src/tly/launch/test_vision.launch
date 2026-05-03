@@ -65,10 +65,10 @@
         <rosparam param="distance_pick_shapes">[3, 4, 5, 6]</rosparam>
 
         <!-- Wider ROI for current RealSense view. -->
-        <param name="roi_x_min" value="314" />
-        <param name="roi_y_min" value="44" />
-        <param name="roi_x_max" value="895" />
-        <param name="roi_y_max" value="695" />
+        <param name="roi_x_min" value="323" />
+        <param name="roi_y_min" value="45" />
+        <param name="roi_x_max" value="900" />
+        <param name="roi_y_max" value="680" />
 
         <!-- Black block segmentation on white lightboard. -->
         <param name="threshold_mode" value="otsu" />

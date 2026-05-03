@@ -33,6 +33,9 @@ This version supports:
 The controller can use:
   - PICK_SURFACE_PLANE_BASE for accurate pick ray-plane intersection
   - BOARD_CENTERS_14x10_TABLE and PLACE_Z_MAP_14x10 for placement
+
+New Feature:
+  - Undo support for point collection (type 'u' or 'undo' to revert the last point).
 """
 
 import os
@@ -59,10 +62,6 @@ BOARD_MODE_B_COLS = [0, 2, 5, 7, 9]
 BOARD_MODE_B_ROWS = [0, 3, 7, 10, 13]
 
 
-def prompt(msg):
-    input(msg)
-
-
 def get_eef_pose(tf_buffer, parent="link_base", child="link_eef"):
     try:
         trans = tf_buffer.lookup_transform(parent, child, rospy.Time(0), rospy.Duration(3.0))
@@ -76,9 +75,22 @@ def get_eef_pose(tf_buffer, parent="link_base", child="link_eef"):
         return None
 
 
-def require_pose(tf_buffer, message, parent="link_base", child="link_eef"):
+def require_pose(tf_buffer, message, parent="link_base", child="link_eef", allow_undo=False):
+    """
+    提示用户按回车记录当前位姿。
+    如果 allow_undo 为 True，用户可以输入 'u' 返回 'UNDO' 以撤销上一步操作。
+    """
     while not rospy.is_shutdown():
-        prompt(message)
+        prompt_str = message
+        if allow_undo:
+            prompt_str += " [按回车记录 | 输入 'u' 撤销上一步]: "
+        else:
+            prompt_str += " [按回车记录]: "
+            
+        ans = input(prompt_str).strip().lower()
+        if allow_undo and ans in ('u', 'undo', '撤销'):
+            return "UNDO"
+            
         pose = get_eef_pose(tf_buffer, parent, child)
         if pose is not None and np.all(np.isfinite(pose)):
             print("  记录 {}<-{}: x={:.6f}, y={:.6f}, z={:.6f}".format(parent, child, *pose))
@@ -337,24 +349,35 @@ def main():
     print(f"= 白板模式: {board_mode}，采样 {len(board_sample_col_row)} 个凸起中心")
     print(f"= 白板高度插值: {height_interpolation}")
     print("= 所有点都用吸盘中心轻触目标点，不要压弯发光板/白板。")
+    print("= (新增) 如果标定失误，可以输入 'u' 撤销并重新记录上一个点。")
     print("=" * 94 + "\n")
 
     # Step 1.
-    start_pose = require_pose(tf_buffer, "[步骤 1] 请将机械臂移动到【视觉拍照起点高度】，然后按回车键...", base_frame, eef_frame)
+    start_pose = require_pose(tf_buffer, "[步骤 1] 请将机械臂移动到【视觉拍照起点高度】", base_frame, eef_frame)
     cam_fx, cam_fy, cam_cx, cam_cy = get_camera_info()
 
     # Step 2: fit scatter/pick surface.
     print("\n--- 步骤 2：多点拟合散落方块所在发光板/桌面平面 ---")
     print("请在【散落方块会出现的整个视野区域】均匀采点。不要采白色底盘，也不要采方块顶面。")
     scatter_surface_points = []
-    for i, label in enumerate(surface_prompt_positions(pick_surface_samples), start=1):
+    labels = surface_prompt_positions(pick_surface_samples)
+    i = 0
+    while i < len(labels):
+        label = labels[i]
         p = require_pose(
             tf_buffer,
-            f"[步骤 2.{i}] 吸盘轻触散落区裸发光板/桌面平面【{label}】点，按回车键...",
+            f"[步骤 2.{i+1}/{len(labels)}] 吸盘轻触散落区裸发光板/桌面平面【{label}】点",
             base_frame,
             eef_frame,
+            allow_undo=(i > 0)
         )
+        if isinstance(p, str) and p == "UNDO":
+            i -= 1
+            scatter_surface_points.pop()
+            print(f"  ↩️ 已撤销，重新回到上一个点:【{labels[i]}】。")
+            continue
         scatter_surface_points.append(p)
+        i += 1
     scatter_surface_points = np.asarray(scatter_surface_points, dtype=float)
 
     surface_centroid_base, surface_normal_base, signed_resid, surf_rms, surf_max = fit_plane_pca(scatter_surface_points)
@@ -365,8 +388,13 @@ def main():
 
     # Step 3: table_frame.
     print("\n--- 步骤 3：定义 table_frame 原点和 X 方向 ---")
-    P_user = require_pose(tf_buffer, "[步骤 3.1] 选择散落区桌面上的 table_frame 原点 P，吸盘轻触后按回车键...", base_frame, eef_frame)
-    X_user = require_pose(tf_buffer, "[步骤 3.2] 沿你希望的 table_frame +X 方向选择一点 X，吸盘轻触后按回车键...", base_frame, eef_frame)
+    while True:
+        P_user = require_pose(tf_buffer, "[步骤 3.1] 选择散落区桌面上的 table_frame 原点 P", base_frame, eef_frame, allow_undo=False)
+        X_user = require_pose(tf_buffer, "[步骤 3.2] 沿你希望的 table_frame +X 方向选择一点 X", base_frame, eef_frame, allow_undo=True)
+        if isinstance(X_user, str) and X_user == "UNDO":
+            print("  ↩️ 已撤销，重新标定原点 P。")
+            continue
+        break
 
     P = project_point_to_plane(P_user, surface_centroid_base, surface_normal_base)
     X_proj = project_point_to_plane(X_user, surface_centroid_base, surface_normal_base)
@@ -393,10 +421,20 @@ def main():
     print("建议换不同颜色/不同位置采样，最终取中位数。")
     block_top_points_base = []
     block_top_points_table = []
-    for i in range(max(1, block_samples)):
-        pt = require_pose(tf_buffer, f"[步骤 4.{i+1}] 方块平放在散落区，吸盘轻触【方块顶面】，按回车键...", base_frame, eef_frame)
+    num_blocks = max(1, block_samples)
+    i = 0
+    while i < num_blocks:
+        pt = require_pose(tf_buffer, f"[步骤 4.{i+1}/{num_blocks}] 方块平放在散落区，吸盘轻触【方块顶面】", base_frame, eef_frame, allow_undo=(i > 0))
+        if isinstance(pt, str) and pt == "UNDO":
+            i -= 1
+            block_top_points_base.pop()
+            block_top_points_table.pop()
+            print(f"  ↩️ 已撤销，重新标定第 {i+1} 个方块高度。")
+            continue
         block_top_points_base.append(pt)
         block_top_points_table.append(to_table(R_mat, P, pt))
+        i += 1
+        
     block_top_points_base = np.asarray(block_top_points_base)
     block_top_points_table = np.asarray(block_top_points_table)
     block_thickness = float(np.median(block_top_points_table[:, 2]))
@@ -421,20 +459,33 @@ def main():
     print("坐标显示为 (col,row)，因为底盘是 10 列 x 14 行。")
     print(f"当前模式 {board_mode}: 需要采 {len(board_sample_col_row)} 个凸起中心。")
     if board_mode == "C":
-        print("模式 C 会采完整 140 点，耗时较长，但能最好反映白板局部翘曲。")
+        print("模式 C 会采完整 140 点，耗时较长，但能最好反映白板局部翘曲。如果误按，输入 'u' 撤销！")
 
     sample_rows = []
     sample_cols = []
     sample_points = []
     sample_records = []
 
-    for idx, (col, row) in enumerate(board_sample_col_row, start=1):
+    i = 0
+    while i < len(board_sample_col_row):
+        col, row = board_sample_col_row[i]
         p_base = require_pose(
             tf_buffer,
-            f"[步骤 5.{idx}/{len(board_sample_col_row)}] 吸盘对准【白色底盘凸起中心】 (col={col}, row={row})，按回车键...",
+            f"[步骤 5.{i+1}/{len(board_sample_col_row)}] 吸盘对准【白色底盘凸起中心】 (col={col}, row={row})",
             base_frame,
             eef_frame,
+            allow_undo=(i > 0)
         )
+        if isinstance(p_base, str) and p_base == "UNDO":
+            i -= 1
+            sample_cols.pop()
+            sample_rows.pop()
+            sample_points.pop()
+            sample_records.pop()
+            prev_col, prev_row = board_sample_col_row[i]
+            print(f"  ↩️ 已撤销！退回上一个点 (col={prev_col}, row={prev_row}) 重新记录。")
+            continue
+            
         p_tab = to_table(R_mat, P, p_base)
         sample_cols.append(col)
         sample_rows.append(row)
@@ -444,6 +495,7 @@ def main():
             "table": [float(p_tab[0]), float(p_tab[1]), float(p_tab[2])],
             "link_base": [float(p_base[0]), float(p_base[1]), float(p_base[2])],
         })
+        i += 1
 
     sample_points = np.asarray(sample_points, dtype=float)
     sample_rows = np.asarray(sample_rows, dtype=float)
@@ -480,9 +532,18 @@ def main():
     # Step 6: board flat surface.
     print("\n--- 步骤 6：标定白色底盘无凸起平面高度 ---")
     surface_points = []
-    for i in range(max(1, board_surface_samples)):
-        pt = require_pose(tf_buffer, f"[步骤 6.{i+1}] 吸盘轻触【底盘无凸起的平坦表面】第 {i+1} 个点，按回车键...", base_frame, eef_frame)
+    num_surf = max(1, board_surface_samples)
+    i = 0
+    while i < num_surf:
+        pt = require_pose(tf_buffer, f"[步骤 6.{i+1}/{num_surf}] 吸盘轻触【底盘无凸起的平坦表面】", base_frame, eef_frame, allow_undo=(i > 0))
+        if isinstance(pt, str) and pt == "UNDO":
+            i -= 1
+            surface_points.pop()
+            print(f"  ↩️ 已撤销，重新记录平坦表面的第 {i+1} 个点。")
+            continue
         surface_points.append(to_table(R_mat, P, pt))
+        i += 1
+        
     surface_points = np.asarray(surface_points, dtype=float)
     board_surface_z = float(np.median(surface_points[:, 2]))
     surf_a, surf_b, surf_c, board_surf_std = fit_plane_xyz(surface_points)

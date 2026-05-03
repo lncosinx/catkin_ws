@@ -12,6 +12,10 @@
         <arg name="robot_ip" value="$(arg robot_ip)" />
     </include>
 
+    <!-- 【核心新增】：发布吸盘 TCP！因为新的手眼标定依赖这个 frame，不发会导致相机 TF 断裂 -->
+    <node pkg="tf2_ros" type="static_transform_publisher" name="suction_tcp_broadcaster" 
+          args="0.00046 -0.00026 0.06962 0 0 0 link6 link_tcp" />
+
     <!-- 2. 启动 RealSense -->
     <include file="$(find realsense2_camera)/launch/rs_camera.launch">
         <arg name="align_depth" value="true" />

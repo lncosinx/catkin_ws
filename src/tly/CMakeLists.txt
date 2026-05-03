@@ -75,6 +75,7 @@ target_link_libraries(strategy_node
 # 编译执行控制节点 (Controller Node)
 # =========================================================
 add_executable(xarm_controller_node src/xarm_controller_node.cpp)
+add_dependencies(xarm_controller_node ${catkin_EXPORTED_TARGETS} xarm_msgs_gencpp)
 add_dependencies(xarm_controller_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 target_link_libraries(xarm_controller_node
   ${catkin_LIBRARIES}

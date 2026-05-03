@@ -14,10 +14,16 @@
 
     <include file="$(find xarm_description)/launch/xarm6_upload.launch" />
 
+    <!-- 【核心改进 1】：发布吸盘末端 TCP 的静态 TF。数据来自 xArm Studio (单位转为米) -->
+    <!-- args 参数顺序: x y z yaw pitch roll parent_frame child_frame -->
+    <node pkg="tf2_ros" type="static_transform_publisher" name="suction_tcp_broadcaster" 
+          args="0.00046 -0.00026 0.06962 0 0 0 link6 link_tcp" />
+
     <node pkg="aruco_ros" type="single" name="aruco_single">
         <remap from="/image" to="/camera/color/image_raw" />
         <remap from="/camera_info" to="/camera/color/camera_info" />
 
+        <!-- 保持 False 让 aruco_ros 利用 camera_info 自己算去畸变，这最稳妥 -->
         <param name="image_is_rectified" value="False"/>
         <param name="marker_id"          value="$(arg marker_id)"/>
         <param name="marker_size"        value="$(arg marker_size)"/>

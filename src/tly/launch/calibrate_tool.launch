@@ -20,6 +20,10 @@
         <arg name="robot_ip" value="$(arg robot_ip)" />
     </include>
 
+    <!-- 【核心新增】：在空间点标定阶段，也必须发布精确的吸盘 TCP 坐标系！ -->
+    <node pkg="tf2_ros" type="static_transform_publisher" name="suction_tcp_broadcaster" 
+          args="0.00046 -0.00026 0.06962 0 0 0 link6 link_tcp" />
+
     <!-- 2. 启动 RealSense，相机内参来自 /camera/color/camera_info -->
     <include file="$(find realsense2_camera)/launch/rs_camera.launch">
         <arg name="align_depth" value="true" />
@@ -29,7 +33,10 @@
     <node pkg="tly" type="calibration_tool.py" name="calibration_tool" output="screen"
           launch-prefix="bash -c 'sleep 5; exec $0 $@'">
         <param name="base_frame" value="link_base" />
-        <param name="eef_frame" value="link_eef" />
+        
+        <!-- 【核心修改】：让 Python 工具读取真实的吸盘尖端，而不是法兰盘 -->
+        <param name="eef_frame" value="link_tcp" />
+        
         <param name="config_path" value="$(arg config_path)" />
 
         <param name="pick_surface_samples" value="$(arg pick_surface_samples)" />
