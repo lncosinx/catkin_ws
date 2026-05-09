@@ -63,6 +63,18 @@ struct Detection
     bool has_table_points = false;
 };
 
+// --- 预处理阶段调试图 ---
+// 所有图都使用同一帧的 header 发布，方便用 rqt_image_view 对比。
+struct PreprocessDebugImages
+{
+    bool valid = false;
+    Mat rgb;         // 原始 RGB 图，encoding=rgb8
+    Mat gray;        // 灰度图，encoding=mono8
+    Mat gaussian;    // 高斯模糊后灰度图，encoding=mono8
+    Mat otsu_binary; // OTSU 反二值图，黑色方块为白色前景，encoding=mono8
+    Mat morphology;  // 形态学修正后的最终前景 mask，encoding=mono8
+};
+
 // --- 数学与辅助工具 ---
 namespace vision_utils
 {
@@ -677,6 +689,7 @@ private:
     int stable_publish_max_missed;
     bool publish_angle_in_table_frame;
     double angle_axis_probe_px;
+    bool publish_preprocess_debug;
 
     string pick_point_mode;
     vector<int> distance_pick_shapes;
@@ -694,6 +707,7 @@ private:
     image_transport::Subscriber img_sub;
     ros::Publisher state_pub;
     image_transport::Publisher debug_pub, fg_pub, edges_pub;
+    image_transport::Publisher preprocess_rgb_pub, preprocess_gray_pub, preprocess_gaussian_pub, preprocess_otsu_pub, preprocess_morph_pub;
     ros::Publisher pose_array_pub;
     ros::ServiceServer precise_srv;
 
@@ -769,6 +783,7 @@ public:
         pnh_.param("stable_publish_max_missed", stable_publish_max_missed, 6);
         pnh_.param("publish_angle_in_table_frame", publish_angle_in_table_frame, true);
         pnh_.param("angle_axis_probe_px", angle_axis_probe_px, 40.0);
+        pnh_.param("publish_preprocess_debug", publish_preprocess_debug, true);
 
         pnh_.param("precise_timeout", precise_timeout, 0.8);
         pnh_.param("precise_require_stable", precise_require_stable, true);
@@ -785,6 +800,14 @@ public:
         debug_pub = it_.advertise("/vision/debug_image", 1);
         fg_pub = it_.advertise("/vision/debug_foreground", 1);
         edges_pub = it_.advertise("/vision/debug_edges", 1);
+
+        // 预处理各阶段图像：rqt_image_view 里直接订阅这些 topic。
+        preprocess_rgb_pub = it_.advertise("/vision/preprocess/rgb", 1);
+        preprocess_gray_pub = it_.advertise("/vision/preprocess/gray", 1);
+        preprocess_gaussian_pub = it_.advertise("/vision/preprocess/gaussian_blur", 1);
+        preprocess_otsu_pub = it_.advertise("/vision/preprocess/otsu_binary", 1);
+        preprocess_morph_pub = it_.advertise("/vision/preprocess/morphology", 1);
+
         pose_array_pub = nh_.advertise<geometry_msgs::PoseArray>("/vision/tracked_blocks_table", 1);
         precise_srv = nh_.advertiseService("/vision/get_precise_pose", &VisionProcessorNode::handle_precise, this);
 
@@ -1118,7 +1141,8 @@ public:
         mask = out;
     }
 
-    void process_foreground(const Mat &frame, Mat &small_out, Mat &mask_out, double &scale)
+    void process_foreground(const Mat &frame, Mat &small_out, Mat &mask_out, double &scale,
+                            PreprocessDebugImages *dbg = nullptr)
     {
         Mat small_frame;
         scale = scale_percent / 100.0;
@@ -1132,13 +1156,23 @@ public:
         int y2 = (roi_y_max <= 0) ? small_frame.rows : min(small_frame.rows, roi_y_max);
         Mat roi = small_frame(Rect(x1, y1, x2 - x1, y2 - y1));
 
-        Mat gray;
-        cvtColor(roi, gray, COLOR_BGR2GRAY);
+        // 1) 原始 RGB / 2) 灰度 / 3) 高斯模糊
+        Mat gray_raw;
+        cvtColor(roi, gray_raw, COLOR_BGR2GRAY);
+
+        Mat gray_blur = gray_raw.clone();
         if (blur_kernel > 1)
         {
             int b_k = blur_kernel % 2 == 1 ? blur_kernel : blur_kernel + 1;
-            GaussianBlur(gray, gray, Size(b_k, b_k), 0);
+            GaussianBlur(gray_raw, gray_blur, Size(b_k, b_k), 0);
         }
+
+        // 后续分割统一使用高斯后的 gray_blur
+        Mat gray = gray_blur;
+
+        // 4) OTSU 二值图：黑色方块反二值为白色前景
+        Mat otsu_roi;
+        threshold(gray, otsu_roi, 0, 255, THRESH_BINARY_INV | THRESH_OTSU);
 
         Mat board_mask = Mat::ones(gray.size(), CV_8UC1) * 255;
         if (use_lightboard_mask)
@@ -1157,7 +1191,7 @@ public:
         if (threshold_mode == "adaptive")
             adaptiveThreshold(gray, mask_roi, 255, ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, 31, 7);
         else if (threshold_mode == "otsu")
-            threshold(gray, mask_roi, 0, 255, THRESH_BINARY_INV | THRESH_OTSU);
+            mask_roi = otsu_roi.clone();
         else
             threshold(gray, mask_roi, manual_dark_threshold, 255, THRESH_BINARY_INV);
 
@@ -1186,6 +1220,41 @@ public:
         mask_out = Mat::zeros(small_frame.size(), CV_8UC1);
         mask_roi.copyTo(mask_out(Rect(x1, y1, x2 - x1, y2 - y1)));
         small_out = small_frame;
+
+        // 调试图统一铺回 small_frame 尺寸；ROI 外置黑，方便和最终 mask 对齐。
+        if (dbg)
+        {
+            dbg->valid = true;
+            cvtColor(small_frame, dbg->rgb, COLOR_BGR2RGB);
+
+            dbg->gray = Mat::zeros(small_frame.size(), CV_8UC1);
+            gray_raw.copyTo(dbg->gray(Rect(x1, y1, x2 - x1, y2 - y1)));
+
+            dbg->gaussian = Mat::zeros(small_frame.size(), CV_8UC1);
+            gray_blur.copyTo(dbg->gaussian(Rect(x1, y1, x2 - x1, y2 - y1)));
+
+            dbg->otsu_binary = Mat::zeros(small_frame.size(), CV_8UC1);
+            otsu_roi.copyTo(dbg->otsu_binary(Rect(x1, y1, x2 - x1, y2 - y1)));
+
+            dbg->morphology = mask_out.clone();
+        }
+    }
+
+    void publish_preprocess_debug_images(const std_msgs::Header &header, const PreprocessDebugImages &dbg)
+    {
+        if (!publish_preprocess_debug || !dbg.valid)
+            return;
+
+        if (preprocess_rgb_pub.getNumSubscribers() > 0)
+            preprocess_rgb_pub.publish(cv_bridge::CvImage(header, "rgb8", dbg.rgb).toImageMsg());
+        if (preprocess_gray_pub.getNumSubscribers() > 0)
+            preprocess_gray_pub.publish(cv_bridge::CvImage(header, "mono8", dbg.gray).toImageMsg());
+        if (preprocess_gaussian_pub.getNumSubscribers() > 0)
+            preprocess_gaussian_pub.publish(cv_bridge::CvImage(header, "mono8", dbg.gaussian).toImageMsg());
+        if (preprocess_otsu_pub.getNumSubscribers() > 0)
+            preprocess_otsu_pub.publish(cv_bridge::CvImage(header, "mono8", dbg.otsu_binary).toImageMsg());
+        if (preprocess_morph_pub.getNumSubscribers() > 0)
+            preprocess_morph_pub.publish(cv_bridge::CvImage(header, "mono8", dbg.morphology).toImageMsg());
     }
 
     void image_cb(const sensor_msgs::ImageConstPtr &msg)
@@ -1205,9 +1274,10 @@ public:
         double stamp = msg->header.stamp.toSec();
         Mat small_frame, fg_mask;
         double scale;
+        PreprocessDebugImages preprocess_dbg;
 
         // 1. CPU 预处理
-        process_foreground(frame, small_frame, fg_mask, scale);
+        process_foreground(frame, small_frame, fg_mask, scale, publish_preprocess_debug ? &preprocess_dbg : nullptr);
 
         // 2. 轮廓提取与分类
         double inv_scale = 1.0 / scale;
@@ -1336,6 +1406,8 @@ public:
         }
         if (fg_pub.getNumSubscribers() > 0)
             fg_pub.publish(cv_bridge::CvImage(msg->header, "mono8", fg_mask).toImageMsg());
+
+        publish_preprocess_debug_images(msg->header, preprocess_dbg);
     }
 
     void attach_table_points(vector<Detection> &detections, const geometry_msgs::TransformStamped &tx)

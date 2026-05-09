@@ -93,7 +93,7 @@ def require_pose(tf_buffer, message, parent="link_base", child="link_eef", allow
             
         pose = get_eef_pose(tf_buffer, parent, child)
         if pose is not None and np.all(np.isfinite(pose)):
-            print("  记录 {}<-{}: x={:.6f}, y={:.6f}, z={:.6f}".format(parent, child, *pose))
+            print("  记录 {}<-{}: x={:.6f}, y={:.6f}, z={:.16f}".format(parent, child, *pose))
             return pose
         print("  ❌ 读取失败，请重新移动并再试。")
     sys.exit(1)
