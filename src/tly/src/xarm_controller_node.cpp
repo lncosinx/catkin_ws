@@ -741,14 +741,59 @@ private:
     bool pixelToPickPointTable(const PixelPoint &px, geometry_msgs::Point &out) const
     {
         bool ok = false;
+        // 1. 先用真实的 3D 射线求交，拿到带有高度信息的物理坐标 (重点是获取正确的 out.z)
         if (use_true_pick_plane_ && pick_plane_loaded_)
             ok = pixelToTruePickPlaneTablePoint(px, out);
         else
             ok = pixelToFlatPickZTablePoint(px, out);
+
         if (!ok)
             return false;
-        applyPickHomography(px, out);
-        return true;
+
+        // 如果不使用单应性矩阵，直接返回 3D 射线的结果
+        if (!use_pick_homography_ || !pick_homography_loaded_)
+            return true;
+
+        // ==========================================================
+        // 2. 核心修复：消除 2.5D 视觉的“高度视差 (Parallax Error)”
+        // ==========================================================
+        double u_flat = px.u;
+        double v_flat = px.v;
+
+        if (camera_info_ready_ && !P_.empty())
+        {
+            // 获取镜头光心
+            double cx = P_.at<double>(0, 2);
+            double cy = P_.at<double>(1, 2);
+
+            // 获取镜头到桌面的绝对高度，以及积木吸取面的绝对高度
+            double cam_z = std::abs(observation_cam_to_table_.transform.translation.z);
+            double block_z = std::abs(out.z);
+
+            // 只有当相机在积木上方时才进行压缩补偿
+            if (cam_z > block_z + 0.05)
+            {
+                // 计算视差收缩比例： (相机高度 - 积木高度) / 相机高度
+                double ratio = (cam_z - block_z) / cam_z;
+
+                // 将像素强行向光心 (cx, cy) 拉回，模拟把积木顶面“拍扁”到标定纸的平面上！
+                u_flat = cx + (px.u - cx) * ratio;
+                v_flat = cy + (px.v - cy) * ratio;
+            }
+        }
+
+        // ==========================================================
+        // 3. 把“拍扁去畸变”后的像素喂给 2D 单应性矩阵
+        // ==========================================================
+        geometry_msgs::Point hom_p;
+        if (applyPickHomographyXY(u_flat, v_flat, hom_p))
+        {
+            out.x = hom_p.x;
+            out.y = hom_p.y;
+            // 【注意】：这里绝不覆盖 out.z，完美保留 3D 射线算出的下压高度！
+            return true;
+        }
+        return false;
     }
 
     geometry_msgs::Point bilinearBoardCenter(double row, double col) const
