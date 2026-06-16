@@ -1,5 +1,5 @@
-// 视觉处理节点（经典版）：轮廓提取 + 模板匹配。
-// 神经网络边缘检测版见 vision_processor_node_dexined.cpp，两者话题/消息契约一致。
+// 视觉处理节点（DexiNed 版）：用 DexiNed ONNX (CUDA) 做边缘检测，再模板匹配。
+// 经典轮廓版见 vision_processor_node.cpp，两者话题/消息契约一致。
 #include <ros/ros.h>
 #include <image_transport/image_transport.h>
 #include <cv_bridge/cv_bridge.h>
@@ -13,6 +13,8 @@
 #include <tf2/LinearMath/Matrix3x3.h>
 
 #include <opencv2/opencv.hpp>
+#include <opencv2/dnn.hpp> // 引入 DNN 模块以支持 DexiNed
+
 #include <vector>
 #include <deque>
 #include <map>
@@ -69,7 +71,7 @@ struct PreprocessDebugImages
     Mat gray;        // 灰度图
     Mat gaussian;    // 高斯模糊后灰度图
     Mat otsu_binary; // OTSU 反二值图参考
-    Mat morphology;  // 经典流程生成的最终掩码
+    Mat morphology;  // DexiNed/传统流程生成的最终掩码
 };
 
 // --- 数学与辅助工具 ---
@@ -683,6 +685,12 @@ private:
     double angle_axis_probe_px;
     bool publish_preprocess_debug;
 
+    // DexiNed 参数
+    bool use_dexined_;
+    string dexined_model_path_;
+    double dexined_thresh_;
+    cv::dnn::Net dexined_net_;
+
     string pick_point_mode;
     vector<int> distance_pick_shapes;
     int template_size, template_angle_step, template_refine_step;
@@ -749,6 +757,11 @@ public:
         pnh_.param("use_contour_axis_yaw", use_contour_axis_yaw, true);
         pnh_.param("contour_axis_probe_px", contour_axis_probe_px, 50.0);
 
+        // DexiNed 模块参数配置
+        pnh_.param("use_dexined", use_dexined_, true);
+        pnh_.param("dexined_model_path", dexined_model_path_, string("/root/catkin_ws/src/tly/module/dexined.onnx"));
+        pnh_.param("dexined_thresh", dexined_thresh_, 100.0);
+
         pnh_.param("min_area", min_area, 900.0);
         pnh_.param("max_area", max_area, 50000.0);
         pnh_.param("min_template_iou", min_template_iou, 0.42);
@@ -776,6 +789,26 @@ public:
         vector<int> def_dist = {3, 4};
         pnh_.param("distance_pick_shapes", distance_pick_shapes, def_dist);
 
+        // 初始化强制加载 CUDA 版的 DexiNed 模型
+        if (use_dexined_)
+        {
+            try
+            {
+                dexined_net_ = cv::dnn::readNet(dexined_model_path_);
+                // 强制只允许使用 CUDA 执行网络推理！
+                dexined_net_.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
+                dexined_net_.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA);
+                ROS_INFO("DexiNed model loaded successfully from %s. STRICTLY bounded to CUDA GPU processing.", dexined_model_path_.c_str());
+            }
+            catch (const cv::Exception &e)
+            {
+                ROS_ERROR("CRITICAL ERROR: Failed to configure DexiNed to use CUDA. Error: %s", e.what());
+                ROS_ERROR("Ensure your OpenCV build explicitly enabled WITH_CUDA=ON and WITH_CUDNN=ON.");
+                ROS_WARN("Falling back to classical CPU CV pipeline.");
+                use_dexined_ = false;
+            }
+        }
+
         templates = new TemplateBank(template_size, template_angle_step, template_refine_step);
 
         info_sub = nh_.subscribe(camera_info_topic, 1, &VisionProcessorNode::info_cb, this);
@@ -793,7 +826,7 @@ public:
 
         pose_array_pub = nh_.advertise<geometry_msgs::PoseArray>("/vision/tracked_blocks_table", 1);
 
-        ROS_INFO("C++ Vision node (classical contour + template matching) ready.");
+        ROS_INFO("C++ Vision node (DexiNed edge detection, CUDA) ready.");
     }
 
     ~VisionProcessorNode() { delete templates; }
@@ -1163,9 +1196,69 @@ public:
 
         Mat mask_roi, edges_roi;
 
-        // 经典轮廓 + 模板匹配流程：阈值分割（OTSU/自适应/手动）+ 可选饱和度前景
-        // + 发光板掩码 + 形态学，再 Canny 出边缘。
+        if (use_dexined_ && !dexined_net_.empty())
         {
+            try
+            {
+                // DexiNed 要求输入长宽最好是 16 的倍数，进行 Padding 规避 shape 问题
+                int pad_w = (16 - (roi.cols % 16)) % 16;
+                int pad_h = (16 - (roi.rows % 16)) % 16;
+                Mat roi_padded;
+                copyMakeBorder(roi, roi_padded, 0, pad_h, 0, pad_w, BORDER_REFLECT);
+
+                // BGR 均值扣除 (ImageNet 标准) - blobFromImage 在执行 forward 时，底层 CUDA 引擎会负责 host->device
+                Mat blob = cv::dnn::blobFromImage(roi_padded, 1.0, Size(), Scalar(103.939, 116.779, 123.68), false, false);
+                dexined_net_.setInput(blob);
+
+                vector<String> outNames = dexined_net_.getUnconnectedOutLayersNames();
+                // 这一步彻底在 GPU 上执行，依赖我们在初始化声明的 backend/target!
+                Mat out = dexined_net_.forward(outNames[0]);
+
+                // 提取第一通道的边缘热力图 (大小为 1x1xHxW)
+                Mat edge_map(out.size[2], out.size[3], CV_32F, out.ptr<float>());
+
+                // 裁剪回原 ROI 大小
+                edge_map = edge_map(Rect(0, 0, roi.cols, roi.rows));
+
+                // 归一化并转成 0-255 灰度图 (在 CPU 层面进行极简操作，速度足够快)
+                normalize(edge_map, edge_map, 0, 255, NORM_MINMAX);
+                edge_map.convertTo(edges_roi, CV_8UC1);
+
+                // 二值化与闭运算连接断点
+                Mat bin_edges;
+                threshold(edges_roi, bin_edges, dexined_thresh_, 255, THRESH_BINARY);
+                morphologyEx(bin_edges, bin_edges, MORPH_CLOSE, getStructuringElement(MORPH_RECT, Size(5, 5)));
+
+                // 寻找外部轮廓并填充为实心前景
+                vector<vector<Point>> edge_cnts;
+                findContours(bin_edges, edge_cnts, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+                mask_roi = Mat::zeros(roi.size(), CV_8UC1);
+
+                for (const auto &c : edge_cnts)
+                {
+                    if (contourArea(c) > min_area / (scale * scale))
+                    {
+                        vector<vector<Point>> c_wrap = {c};
+                        drawContours(mask_roi, c_wrap, 0, Scalar(255), FILLED);
+                    }
+                }
+
+                if (close_kernel > 1)
+                    morphologyEx(mask_roi, mask_roi, MORPH_CLOSE, Mat::ones(close_kernel, close_kernel, CV_8UC1));
+                if (open_kernel > 1)
+                    morphologyEx(mask_roi, mask_roi, MORPH_OPEN, Mat::ones(open_kernel, open_kernel, CV_8UC1));
+            }
+            catch (const cv::Exception &e)
+            {
+                ROS_ERROR_THROTTLE(2.0, "DexiNed inference failed on CUDA GPU! Msg: %s", e.what());
+                // 防御性生成空掩码防止段错误，保持节点活在状态
+                mask_roi = Mat::zeros(roi.size(), CV_8UC1);
+                edges_roi = Mat::zeros(roi.size(), CV_8UC1);
+            }
+        }
+        else
+        {
+            // 作为安全退路代码保留：仅当 use_dexined 在 launch 里设为 false 时才会进来
             Mat otsu_roi;
             threshold(gray, otsu_roi, 0, 255, THRESH_BINARY_INV | THRESH_OTSU);
 
@@ -1267,7 +1360,7 @@ public:
         double scale;
         PreprocessDebugImages preprocess_dbg;
 
-        // 1. 预处理：经典阈值分割 + 发光板掩码 + 形态学，生成前景掩码
+        // 1. CPU/GPU 预处理 (强制启用 CUDA 的 DexiNed 边缘提取 & 掩码生成)
         process_foreground(frame, small_frame, fg_mask, edges_mask, scale, publish_preprocess_debug ? &preprocess_dbg : nullptr);
 
         // 2. 轮廓提取与分类
@@ -1638,7 +1731,7 @@ public:
 
 int main(int argc, char **argv)
 {
-    ros::init(argc, argv, "vision_processor_node_cpp");
+    ros::init(argc, argv, "vision_processor_node_dexined");
     VisionProcessorNode node;
     ros::AsyncSpinner spinner(5);
     spinner.start();

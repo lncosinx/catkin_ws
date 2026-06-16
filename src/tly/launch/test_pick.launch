@@ -1,6 +1,8 @@
 <launch>
     <arg name="robot_ip" default="192.168.1.228" />
     <arg name="place_z_extra_margin" default="0.001" />
+    <!-- 视觉实现: vision_processor_node_cpp (经典) 或 vision_processor_node_dexined -->
+    <arg name="vision_node" default="vision_processor_node_cpp" />
 
     <!-- 1. 启动官方真机 MoveIt 控制环境 -->
     <include file="$(find xarm6_moveit_config)/launch/realMove_exec.launch">
@@ -28,7 +30,7 @@
     <node pkg="image_proc" type="image_proc" name="image_proc" ns="/camera/color" output="screen" />
 
     <!-- 8. 视觉节点 -->
-    <node pkg="tly" type="vision_processor_node_cpp" name="vision_processor_node" output="screen">
+    <node pkg="tly" type="$(arg vision_node)" name="vision_processor_node" output="screen">
         <param name="image_topic" value="/camera/color/image_rect_color" />
         <param name="camera_info_topic" value="/camera/color/camera_info" />
         <param name="assume_image_rectified" value="true" />

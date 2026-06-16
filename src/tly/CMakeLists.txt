@@ -67,11 +67,22 @@ target_link_libraries(xarm_controller_node
 )
 
 # =========================================================
-# 编译视觉处理节点 (Vision Processor Node - C++ CUDA)
+# 编译视觉处理节点 (经典版：轮廓提取 + 模板匹配)
 # =========================================================
 add_executable(vision_processor_node_cpp src/vision_processor_node.cpp)
 add_dependencies(vision_processor_node_cpp ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 target_link_libraries(vision_processor_node_cpp
+  ${catkin_LIBRARIES}
+  ${OpenCV_LIBRARIES}
+)
+
+# =========================================================
+# 编译视觉处理节点 (DexiNed 版：神经网络边缘检测 + 模板匹配)
+# 与经典版话题/消息契约一致，靠 launch 的 type:= 切换。
+# =========================================================
+add_executable(vision_processor_node_dexined src/vision_processor_node_dexined.cpp)
+add_dependencies(vision_processor_node_dexined ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(vision_processor_node_dexined
   ${catkin_LIBRARIES}
   ${OpenCV_LIBRARIES}
 )
