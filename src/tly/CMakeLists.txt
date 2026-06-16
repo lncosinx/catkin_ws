@@ -26,7 +26,8 @@ find_package(catkin REQUIRED COMPONENTS
 )
 
 # 寻找 OpenCV (确保包含 CUDA 模块)
-find_package(OpenCV REQUIRED)
+# 建议修改为显式查找 dnn 模块
+find_package(OpenCV REQUIRED COMPONENTS core imgproc dnn)
 
 # 🌟 2. 声明要编译的 Service 文件
 # 确保在 tly 包的根目录下创建了 srv 文件夹，并把 GetPrecisePose.srv 放进去！

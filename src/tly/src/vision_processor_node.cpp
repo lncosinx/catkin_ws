@@ -11,6 +11,7 @@
 #include <tf2/LinearMath/Matrix3x3.h>
 
 #include <opencv2/opencv.hpp>
+#include <opencv2/dnn.hpp> // 引入 DNN 模块以支持 DexiNed
 
 // 替换为你的服务头文件
 #include <tly/GetPrecisePose.h>
@@ -64,15 +65,14 @@ struct Detection
 };
 
 // --- 预处理阶段调试图 ---
-// 所有图都使用同一帧的 header 发布，方便用 rqt_image_view 对比。
 struct PreprocessDebugImages
 {
     bool valid = false;
-    Mat rgb;         // 原始 RGB 图，encoding=rgb8
-    Mat gray;        // 灰度图，encoding=mono8
-    Mat gaussian;    // 高斯模糊后灰度图，encoding=mono8
-    Mat otsu_binary; // OTSU 反二值图，黑色方块为白色前景，encoding=mono8
-    Mat morphology;  // 形态学修正后的最终前景 mask，encoding=mono8
+    Mat rgb;         // 原始 RGB 图
+    Mat gray;        // 灰度图
+    Mat gaussian;    // 高斯模糊后灰度图
+    Mat otsu_binary; // OTSU 反二值图参考
+    Mat morphology;  // DexiNed/传统流程生成的最终掩码
 };
 
 // --- 数学与辅助工具 ---
@@ -218,13 +218,12 @@ public:
         return false;
     }
 
-    // --- 核心修复区：将 Z 块（5，6）的对称等价周期设为 180 度 ---
     static double angle_period_for_shape(int sid)
     {
         if (sid == 1)
             return 90.0;
         if (sid == 0 || sid == 5 || sid == 6)
-            return 180.0; // 修复了 Z 型方块角度横跳引发的不稳定
+            return 180.0;
         return 360.0;
     }
 
@@ -340,7 +339,7 @@ public:
     }
 };
 
-// --- 拓扑增强模板匹配库 (已做预计算优化) ---
+// --- 拓扑增强模板匹配库 ---
 class TemplateBank
 {
 public:
@@ -356,9 +355,7 @@ public:
         vector<double> signature8;
     };
 
-    // 粗略搜索模板库
     vector<Tmpl> coarse_templates;
-    // 精细搜索模板库 (全量预计算缓存 360 度)
     vector<vector<Tmpl>> all_templates;
 
     TemplateBank(int c_size = 96, int a_step = 5, int r_step = 1)
@@ -370,7 +367,7 @@ public:
             all_templates[i].resize(360);
         }
 
-        ROS_INFO("Pre-computing all 360-degree templates. This may take a few seconds but ensures 0 latency later...");
+        ROS_INFO("Pre-computing all 360-degree templates. This may take a few seconds...");
 
         for (auto const &pair : BASE_SHAPES)
         {
@@ -507,7 +504,6 @@ public:
         vector<double> cand_sig = grid_signature(cand, 4);
         vector<double> cand_sig8 = grid_signature(cand, 8);
 
-        // 粗匹配阶段
         for (auto &tmpl : coarse_templates)
         {
             double s = topology_score(cand, cand_soft, cand_dist, cand_pts, cand_sig, cand_sig8, tmpl);
@@ -519,7 +515,6 @@ public:
             }
         }
 
-        // 精细匹配阶段 (直接使用预计算数据，无重渲染延迟)
         double ref_angle = best_angle;
         for (int angle = (int)best_angle - angle_step; angle <= (int)best_angle + angle_step; angle += refine_step)
         {
@@ -691,6 +686,12 @@ private:
     double angle_axis_probe_px;
     bool publish_preprocess_debug;
 
+    // DexiNed 参数
+    bool use_dexined_;
+    string dexined_model_path_;
+    double dexined_thresh_;
+    cv::dnn::Net dexined_net_;
+
     string pick_point_mode;
     vector<int> distance_pick_shapes;
     int template_size, template_angle_step, template_refine_step;
@@ -761,6 +762,11 @@ public:
         pnh_.param("use_contour_axis_yaw", use_contour_axis_yaw, true);
         pnh_.param("contour_axis_probe_px", contour_axis_probe_px, 50.0);
 
+        // DexiNed 模块参数配置
+        pnh_.param("use_dexined", use_dexined_, true);
+        pnh_.param("dexined_model_path", dexined_model_path_, string("/root/catkin_ws/src/tly/module/dexined.onnx"));
+        pnh_.param("dexined_thresh", dexined_thresh_, 100.0);
+
         pnh_.param("min_area", min_area, 900.0);
         pnh_.param("max_area", max_area, 50000.0);
         pnh_.param("min_template_iou", min_template_iou, 0.42);
@@ -792,6 +798,26 @@ public:
         vector<int> def_dist = {3, 4};
         pnh_.param("distance_pick_shapes", distance_pick_shapes, def_dist);
 
+        // 初始化强制加载 CUDA 版的 DexiNed 模型
+        if (use_dexined_)
+        {
+            try
+            {
+                dexined_net_ = cv::dnn::readNet(dexined_model_path_);
+                // 强制只允许使用 CUDA 执行网络推理！
+                dexined_net_.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
+                dexined_net_.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA);
+                ROS_INFO("DexiNed model loaded successfully from %s. STRICTLY bounded to CUDA GPU processing.", dexined_model_path_.c_str());
+            }
+            catch (const cv::Exception &e)
+            {
+                ROS_ERROR("CRITICAL ERROR: Failed to configure DexiNed to use CUDA. Error: %s", e.what());
+                ROS_ERROR("Ensure your OpenCV build explicitly enabled WITH_CUDA=ON and WITH_CUDNN=ON.");
+                ROS_WARN("Falling back to classical CPU CV pipeline.");
+                use_dexined_ = false;
+            }
+        }
+
         templates = new TemplateBank(template_size, template_angle_step, template_refine_step);
 
         info_sub = nh_.subscribe(camera_info_topic, 1, &VisionProcessorNode::info_cb, this);
@@ -801,7 +827,6 @@ public:
         fg_pub = it_.advertise("/vision/debug_foreground", 1);
         edges_pub = it_.advertise("/vision/debug_edges", 1);
 
-        // 预处理各阶段图像：rqt_image_view 里直接订阅这些 topic。
         preprocess_rgb_pub = it_.advertise("/vision/preprocess/rgb", 1);
         preprocess_gray_pub = it_.advertise("/vision/preprocess/gray", 1);
         preprocess_gaussian_pub = it_.advertise("/vision/preprocess/gaussian_blur", 1);
@@ -830,7 +855,6 @@ public:
         return rect.center;
     }
 
-    // 局部 ROI 优化过的 Distance Transform
     Point2f distance_transform_center(const vector<Point> &cnt)
     {
         Rect bb = boundingRect(cnt);
@@ -1141,7 +1165,7 @@ public:
         mask = out;
     }
 
-    void process_foreground(const Mat &frame, Mat &small_out, Mat &mask_out, double &scale,
+    void process_foreground(const Mat &frame, Mat &small_out, Mat &mask_out, Mat &edges_out, double &scale,
                             PreprocessDebugImages *dbg = nullptr)
     {
         Mat small_frame;
@@ -1156,7 +1180,6 @@ public:
         int y2 = (roi_y_max <= 0) ? small_frame.rows : min(small_frame.rows, roi_y_max);
         Mat roi = small_frame(Rect(x1, y1, x2 - x1, y2 - y1));
 
-        // 1) 原始 RGB / 2) 灰度 / 3) 高斯模糊
         Mat gray_raw;
         cvtColor(roi, gray_raw, COLOR_BGR2GRAY);
 
@@ -1167,13 +1190,7 @@ public:
             GaussianBlur(gray_raw, gray_blur, Size(b_k, b_k), 0);
         }
 
-        // 后续分割统一使用高斯后的 gray_blur
         Mat gray = gray_blur;
-
-        // 4) OTSU 二值图：黑色方块反二值为白色前景
-        Mat otsu_roi;
-        threshold(gray, otsu_roi, 0, 255, THRESH_BINARY_INV | THRESH_OTSU);
-
         Mat board_mask = Mat::ones(gray.size(), CV_8UC1) * 255;
         if (use_lightboard_mask)
         {
@@ -1187,41 +1204,115 @@ public:
             erode(board_mask, board_mask, getStructuringElement(MORPH_RECT, Size(3, 3)));
         }
 
-        Mat mask_roi;
-        if (threshold_mode == "adaptive")
-            adaptiveThreshold(gray, mask_roi, 255, ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, 31, 7);
-        else if (threshold_mode == "otsu")
-            mask_roi = otsu_roi.clone();
-        else
-            threshold(gray, mask_roi, manual_dark_threshold, 255, THRESH_BINARY_INV);
+        Mat mask_roi, edges_roi;
 
-        if (use_saturation_foreground)
+        if (use_dexined_ && !dexined_net_.empty())
         {
-            Mat hsv, sat_mask, val_mask, sat_fg;
-            cvtColor(roi, hsv, COLOR_BGR2HSV);
-            vector<Mat> hsv_ch;
-            split(hsv, hsv_ch);
-            threshold(hsv_ch[1], sat_mask, saturation_min, 255, THRESH_BINARY);
-            threshold(hsv_ch[2], val_mask, saturation_value_min, 255, THRESH_BINARY);
-            bitwise_and(sat_mask, val_mask, sat_fg);
-            morphologyEx(sat_fg, sat_fg, MORPH_OPEN, getStructuringElement(MORPH_RECT, Size(3, 3)));
-            bitwise_or(mask_roi, sat_fg, mask_roi);
+            try
+            {
+                // DexiNed 要求输入长宽最好是 16 的倍数，进行 Padding 规避 shape 问题
+                int pad_w = (16 - (roi.cols % 16)) % 16;
+                int pad_h = (16 - (roi.rows % 16)) % 16;
+                Mat roi_padded;
+                copyMakeBorder(roi, roi_padded, 0, pad_h, 0, pad_w, BORDER_REFLECT);
+
+                // BGR 均值扣除 (ImageNet 标准) - blobFromImage 在执行 forward 时，底层 CUDA 引擎会负责 host->device
+                Mat blob = cv::dnn::blobFromImage(roi_padded, 1.0, Size(), Scalar(103.939, 116.779, 123.68), false, false);
+                dexined_net_.setInput(blob);
+
+                vector<String> outNames = dexined_net_.getUnconnectedOutLayersNames();
+                // 这一步彻底在 GPU 上执行，依赖我们在初始化声明的 backend/target!
+                Mat out = dexined_net_.forward(outNames[0]);
+
+                // 提取第一通道的边缘热力图 (大小为 1x1xHxW)
+                Mat edge_map(out.size[2], out.size[3], CV_32F, out.ptr<float>());
+
+                // 裁剪回原 ROI 大小
+                edge_map = edge_map(Rect(0, 0, roi.cols, roi.rows));
+
+                // 归一化并转成 0-255 灰度图 (在 CPU 层面进行极简操作，速度足够快)
+                normalize(edge_map, edge_map, 0, 255, NORM_MINMAX);
+                edge_map.convertTo(edges_roi, CV_8UC1);
+
+                // 二值化与闭运算连接断点
+                Mat bin_edges;
+                threshold(edges_roi, bin_edges, dexined_thresh_, 255, THRESH_BINARY);
+                morphologyEx(bin_edges, bin_edges, MORPH_CLOSE, getStructuringElement(MORPH_RECT, Size(5, 5)));
+
+                // 寻找外部轮廓并填充为实心前景
+                vector<vector<Point>> edge_cnts;
+                findContours(bin_edges, edge_cnts, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+                mask_roi = Mat::zeros(roi.size(), CV_8UC1);
+
+                for (const auto &c : edge_cnts)
+                {
+                    if (contourArea(c) > min_area / (scale * scale))
+                    {
+                        vector<vector<Point>> c_wrap = {c};
+                        drawContours(mask_roi, c_wrap, 0, Scalar(255), FILLED);
+                    }
+                }
+
+                if (close_kernel > 1)
+                    morphologyEx(mask_roi, mask_roi, MORPH_CLOSE, Mat::ones(close_kernel, close_kernel, CV_8UC1));
+                if (open_kernel > 1)
+                    morphologyEx(mask_roi, mask_roi, MORPH_OPEN, Mat::ones(open_kernel, open_kernel, CV_8UC1));
+            }
+            catch (const cv::Exception &e)
+            {
+                ROS_ERROR_THROTTLE(2.0, "DexiNed inference failed on CUDA GPU! Msg: %s", e.what());
+                // 防御性生成空掩码防止段错误，保持节点活在状态
+                mask_roi = Mat::zeros(roi.size(), CV_8UC1);
+                edges_roi = Mat::zeros(roi.size(), CV_8UC1);
+            }
+        }
+        else
+        {
+            // 作为安全退路代码保留：仅当 use_dexined 在 launch 里设为 false 时才会进来
+            Mat otsu_roi;
+            threshold(gray, otsu_roi, 0, 255, THRESH_BINARY_INV | THRESH_OTSU);
+
+            if (threshold_mode == "adaptive")
+                adaptiveThreshold(gray, mask_roi, 255, ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY_INV, 31, 7);
+            else if (threshold_mode == "otsu")
+                mask_roi = otsu_roi.clone();
+            else
+                threshold(gray, mask_roi, manual_dark_threshold, 255, THRESH_BINARY_INV);
+
+            if (use_saturation_foreground)
+            {
+                Mat hsv, sat_mask, val_mask, sat_fg;
+                cvtColor(roi, hsv, COLOR_BGR2HSV);
+                vector<Mat> hsv_ch;
+                split(hsv, hsv_ch);
+                threshold(hsv_ch[1], sat_mask, saturation_min, 255, THRESH_BINARY);
+                threshold(hsv_ch[2], val_mask, saturation_value_min, 255, THRESH_BINARY);
+                bitwise_and(sat_mask, val_mask, sat_fg);
+                morphologyEx(sat_fg, sat_fg, MORPH_OPEN, getStructuringElement(MORPH_RECT, Size(3, 3)));
+                bitwise_or(mask_roi, sat_fg, mask_roi);
+            }
+
+            if (use_lightboard_mask)
+                bitwise_and(mask_roi, board_mask, mask_roi);
+            if (close_kernel > 1)
+                morphologyEx(mask_roi, mask_roi, MORPH_CLOSE, Mat::ones(close_kernel, close_kernel, CV_8UC1));
+            if (open_kernel > 1)
+                morphologyEx(mask_roi, mask_roi, MORPH_OPEN, Mat::ones(open_kernel, open_kernel, CV_8UC1));
+
+            Canny(mask_roi, edges_roi, 50, 150);
         }
 
-        if (use_lightboard_mask)
-            bitwise_and(mask_roi, board_mask, mask_roi);
-        if (close_kernel > 1)
-            morphologyEx(mask_roi, mask_roi, MORPH_CLOSE, Mat::ones(close_kernel, close_kernel, CV_8UC1));
-        if (open_kernel > 1)
-            morphologyEx(mask_roi, mask_roi, MORPH_OPEN, Mat::ones(open_kernel, open_kernel, CV_8UC1));
         if (use_lightboard_mask)
             bitwise_and(mask_roi, board_mask, mask_roi);
 
         mask_out = Mat::zeros(small_frame.size(), CV_8UC1);
         mask_roi.copyTo(mask_out(Rect(x1, y1, x2 - x1, y2 - y1)));
+
+        edges_out = Mat::zeros(small_frame.size(), CV_8UC1);
+        edges_roi.copyTo(edges_out(Rect(x1, y1, x2 - x1, y2 - y1)));
+
         small_out = small_frame;
 
-        // 调试图统一铺回 small_frame 尺寸；ROI 外置黑，方便和最终 mask 对齐。
         if (dbg)
         {
             dbg->valid = true;
@@ -1233,8 +1324,11 @@ public:
             dbg->gaussian = Mat::zeros(small_frame.size(), CV_8UC1);
             gray_blur.copyTo(dbg->gaussian(Rect(x1, y1, x2 - x1, y2 - y1)));
 
+            // 生成传统 OTSU 便于对照
+            Mat debug_otsu;
+            threshold(gray, debug_otsu, 0, 255, THRESH_BINARY_INV | THRESH_OTSU);
             dbg->otsu_binary = Mat::zeros(small_frame.size(), CV_8UC1);
-            otsu_roi.copyTo(dbg->otsu_binary(Rect(x1, y1, x2 - x1, y2 - y1)));
+            debug_otsu.copyTo(dbg->otsu_binary(Rect(x1, y1, x2 - x1, y2 - y1)));
 
             dbg->morphology = mask_out.clone();
         }
@@ -1272,12 +1366,12 @@ public:
         }
 
         double stamp = msg->header.stamp.toSec();
-        Mat small_frame, fg_mask;
+        Mat small_frame, fg_mask, edges_mask;
         double scale;
         PreprocessDebugImages preprocess_dbg;
 
-        // 1. CPU 预处理
-        process_foreground(frame, small_frame, fg_mask, scale, publish_preprocess_debug ? &preprocess_dbg : nullptr);
+        // 1. CPU/GPU 预处理 (强制启用 CUDA 的 DexiNed 边缘提取 & 掩码生成)
+        process_foreground(frame, small_frame, fg_mask, edges_mask, scale, publish_preprocess_debug ? &preprocess_dbg : nullptr);
 
         // 2. 轮廓提取与分类
         double inv_scale = 1.0 / scale;
@@ -1308,7 +1402,6 @@ public:
             if (iou < min_template_iou)
                 continue;
 
-            // 针对 Z 型方块的特化处理：使用外接矩形中心，免疫边缘光线毛刺，彻底消除 1~2mm 漂移
             Point2f centroid;
             if (sid == 5 || sid == 6)
             {
@@ -1406,6 +1499,9 @@ public:
         }
         if (fg_pub.getNumSubscribers() > 0)
             fg_pub.publish(cv_bridge::CvImage(msg->header, "mono8", fg_mask).toImageMsg());
+
+        if (edges_pub.getNumSubscribers() > 0)
+            edges_pub.publish(cv_bridge::CvImage(msg->header, "mono8", edges_mask).toImageMsg());
 
         publish_preprocess_debug_images(msg->header, preprocess_dbg);
     }
