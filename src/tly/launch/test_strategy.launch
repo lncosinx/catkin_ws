@@ -1,0 +1,17 @@
+<launch>
+    <!-- =========================================================
+         仅测试策略节点 strategy_node（纯算法，无任何硬件依赖）。
+         手动喂入 /vision/board_state 即可触发规划，观察 /tetris_plan：
+
+         布局：7 库存 + 140 占用栅格(14x10) + num_blocks
+               + [shape,u,v,angle,geom_u,geom_v] * num_blocks
+         例（全 0 栅格、库存随便给，像素任意）可用脚本/rostopic pub 构造。
+         观察输出： rostopic echo /tetris_plan
+         ========================================================= -->
+    <node pkg="tly" type="strategy_node" name="strategy_node" output="screen">
+        <param name="expected_total_blocks" value="35" />
+        <param name="inventory_stable_required_frames" value="5" />
+        <param name="min_usable_total_blocks" value="35" />
+        <param name="min_usable_stable_required_frames" value="3" />
+    </node>
+</launch>

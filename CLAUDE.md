@@ -35,16 +35,27 @@ Run the full pipeline against the real arm:
 roslaunch tly tly.launch robot_ip:=192.168.1.228
 ```
 
+Per-node `test_*.launch` files (bring up only what one node needs, so you don't
+have to run the whole `tly.launch` pipeline). All vision-bearing ones take
+`vision_node:=vision_processor_node_dexined` to switch the vision impl.
+- `test_vision.launch` — **vision only**: camera + `image_proc` + vision node.
+  No arm/TF/strategy. Inspect `/vision/board_state`, `/vision/debug_image`,
+  `/vision/pick_depth_debug`.
+- `test_strategy.launch` — **strategy only**, no hardware. Publish a fake
+  `/vision/board_state` to drive it; watch `/tetris_plan`.
+- `test_path.launch` — **perception→strategy→path** chain. Needs the arm for TF
+  (`robot_ip:=`) but never commands motion. Publishes `/motion_cmds`; compare
+  `[PATH][TASK]` `z_plane`/`z_depth` logs.
+- `test_controller.launch` — **controller only** + arm + camera. Feed a manual
+  `/tetris_plan`; **drives the real arm** (capped to 1 task). Native driver,
+  not MoveIt.
+- `test_pick.launch` — older MoveIt-based integration test: vision +
+  `xarm_controller_node` + `single_block_test.py`, one pick/place cycle.
+
 Other launch files in `src/tly/launch/`:
 - `tly.launch` — production run. Native xArm driver only (explicitly *not*
-  MoveIt/Pilz). Brings up camera, hand-eye TF, vision, controller, and
-  strategy nodes end to end.
-- `test_vision.launch` — MoveIt-based bring-up + vision + strategy node only
-  (no controller). Use to check the vision→plan pipeline without moving the
-  arm.
-- `test_pick.launch` — MoveIt bring-up + vision + `xarm_controller_node` +
-  `single_block_test.py`. Exercises one pick/place cycle for controller
-  debugging.
+  MoveIt/Pilz). Brings up camera, hand-eye TF, vision, controller, strategy,
+  and `path_planner_node` end to end.
 - `affine.launch` / `calibrate_tool.launch` / `calibrate_xarm.launch` /
   `xarm_calibration_setup.launch` — calibration utilities, see below.
 

@@ -1,0 +1,105 @@
+<launch>
+    <!-- =========================================================
+         测试控制节点 xarm_controller_node（会驱动真机！）。
+         只起：机械臂原生驱动 + 相机(camera_info) + 手眼TF + 标定 + table_frame + 控制节点。
+         不起 vision/strategy/path。手动喂 /tetris_plan 触发一次抓放：
+
+           rostopic pub -1 /tetris_plan std_msgs/Int32MultiArray "..."
+           （格式见 strategy_node 输出：count + 每任务 17 个 int）
+
+         安全：默认 max_tasks_per_plan=1，仅执行一个任务；速度沿用慢速档。
+         ⚠️ 确认工作区无人、急停可达后再运行。
+         ========================================================= -->
+    <arg name="robot_ip" default="192.168.1.228" />
+
+    <param name="robot_description" command="$(find xacro)/xacro --inorder '$(find xarm_description)/urdf/xarm_device.urdf.xacro' robot_type:=xarm dof:=6 add_gripper:=false" />
+
+    <!-- 1. xArm 原生驱动：/xarm/set_mode, set_state, move_line, set_controller_dout, xarm_states -->
+    <include file="$(find xarm_bringup)/launch/xarm6_server.launch">
+        <arg name="robot_ip" value="$(arg robot_ip)" />
+        <arg name="use_moveit" value="false" />
+        <arg name="ns" value="xarm" />
+        <arg name="velocity_control" value="false" />
+        <arg name="enforce_limits" value="true" />
+        <arg name="add_gripper" value="false" />
+    </include>
+    <node pkg="robot_state_publisher" type="robot_state_publisher" name="robot_state_publisher" output="screen">
+        <remap from="joint_states" to="/xarm/joint_states" />
+    </node>
+
+    <!-- 2. 相机（控制节点启动时等待 camera_info） -->
+    <include file="$(find realsense2_camera)/launch/rs_camera.launch">
+        <arg name="align_depth" value="true" />
+    </include>
+
+    <!-- 3. 手眼 TF + 标定 + table_frame -->
+    <include file="$(find easy_handeye)/launch/publish.launch">
+        <arg name="eye_on_hand" value="true" />
+        <arg name="namespace_prefix" value="xarm6_realsense_calibration" />
+    </include>
+    <rosparam file="$(find tly)/config/tetris_config.yaml" command="load" />
+    <node pkg="tly" type="table_tf_broadcaster.py" name="table_tf_broadcaster" output="screen" />
+
+    <!-- 4. 控制节点（被测对象），参数与 tly.launch 一致；max_tasks 降为 1 -->
+    <node pkg="tly" type="xarm_controller_node" name="xarm_controller_node" output="screen"
+          launch-prefix="bash -c 'sleep 4; exec $0 $@'">
+        <param name="eef_frame" value="link_tcp" />
+        <param name="table_frame" value="table_frame" />
+        <param name="base_frame" value="link_base" />
+        <param name="camera_frame" value="camera_color_optical_frame" />
+        <param name="camera_info_topic" value="/camera/color/camera_info" />
+        <param name="assume_image_rectified" value="true" />
+
+        <param name="use_true_pick_plane" value="true" />
+        <param name="use_pick_homography" value="true" />
+        <param name="use_pick_affine_correction" value="false" />
+        <param name="require_pick_plane" value="true" />
+        <param name="require_board_map" value="true" />
+        <param name="require_place_z_map" value="true" />
+        <param name="pick_yaw_offset_deg" value="90.0" />
+        <param name="yaw_homography_probe_px" value="30.0" />
+        <param name="yaw_homography_v_sign" value="-1.0" />
+
+        <param name="place_release_z_margin" value="0.006" />
+        <param name="tcp_pick_offset_z" value="0.004" />
+        <param name="tcp_pick_offset_x" value="0.0" />
+        <param name="tcp_pick_offset_y" value="0.0" />
+        <param name="tcp_place_offset_x" value="0.0" />
+        <param name="tcp_place_offset_y" value="-0.001" />
+        <param name="tcp_place_offset_z" value="0.004" />
+        <param name="verify_native_xyz_after_motion" value="false" />
+
+        <param name="transit_speed_mm_s" value="500.0" />
+        <param name="transit_acc_mm_s2" value="4500.0" />
+        <param name="loaded_transit_speed_mm_s" value="500.0" />
+        <param name="loaded_transit_acc_mm_s2" value="3500.0" />
+        <param name="pick_down_speed_mm_s" value="400" />
+        <param name="pick_down_acc_mm_s2" value="4000" />
+        <param name="place_down_speed_mm_s" value="400" />
+        <param name="place_down_acc_mm_s2" value="3500" />
+        <param name="lift_speed_mm_s" value="450" />
+        <param name="lift_acc_mm_s2" value="4500" />
+
+        <param name="enable_joint_jump_guard" value="false" />
+        <param name="enable_trajectory_guard" value="true" />
+        <param name="warn_ptp_joint_jump_rad" value="1.20" />
+        <param name="max_lin_branch_jump_rad" value="1.20" />
+        <param name="max_traj_segment_joint_delta_rad" value="0.35" />
+        <param name="lock_loaded_roll_pitch" value="true" />
+        <param name="use_loaded_lin_transport" value="true" />
+
+        <param name="enable_place_shake" value="true" />
+        <param name="place_shake_cycles" value="1" />
+        <param name="place_shake_dx_m" value="0.005" />
+        <param name="place_shake_dy_m" value="0.005" />
+        <param name="place_shake_speed_mm_s" value="250.0" />
+        <param name="place_shake_acc_mm_s2" value="6000.0" />
+
+        <param name="suction_on_wait" value="0.05" />
+        <param name="suction_off_wait" value="0.0" />
+
+        <!-- 测试安全：仅执行 1 个任务 -->
+        <param name="max_tasks_per_plan" value="1" />
+        <param name="suction_io_num" value="1" />
+    </node>
+</launch>
