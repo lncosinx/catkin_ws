@@ -7,6 +7,7 @@
 #include <geometry_msgs/PoseArray.h>
 #include <geometry_msgs/Pose.h>
 #include <std_msgs/Int32MultiArray.h>
+#include <std_msgs/Float32MultiArray.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 #include <tf2/LinearMath/Quaternion.h>
@@ -23,6 +24,8 @@
 #include <cmath>
 #include <numeric>
 #include <algorithm>
+
+#include <tly/depth_sampler.hpp>
 
 using namespace std;
 using namespace cv;
@@ -335,6 +338,29 @@ public:
             undistortPoints(pt, undistorted, K, D);
             return Point3f(undistorted.at<Vec2d>(0, 0)[0], undistorted.at<Vec2d>(0, 0)[1], 1.0);
         }
+    }
+
+    // 把“去畸变(rectified)”像素映射回“原始(distorted)彩色”像素。
+    // RealSense aligned_depth_to_color 与彩色原图对齐(带畸变)，而检测用 image_rect_color，
+    // 仅在 D≈0 时一致。采样对齐深度前需把 rect 像素映射回 raw 像素。单目彩色 R≈I，忽略 R。
+    // 非 rectified 模式或未就绪时原样返回（自然成为恒等映射）。
+    Point2f rectified_to_raw(double u, double v)
+    {
+        lock_guard<mutex> lock(mtx);
+        if (!ready || !use_rectified)
+            return Point2f((float)u, (float)v);
+        double fx = P.at<double>(0, 0), fy = P.at<double>(1, 1);
+        double cx = P.at<double>(0, 2), cy = P.at<double>(1, 2);
+        if (abs(fx) < 1e-9 || abs(fy) < 1e-9)
+            return Point2f((float)u, (float)v);
+        // 1. 用 P 反投影到归一化平面 (rect 帧)
+        double x = (u - cx) / fx, y = (v - cy) / fy;
+        // 2. 加畸变并用 K 投影回原始像素 (D≈0 且 K==P 时结果即 (u,v))
+        vector<Point3f> obj = {Point3f((float)x, (float)y, 1.0f)};
+        vector<Point2f> img;
+        Mat rvec = Mat::zeros(3, 1, CV_64F), tvec = Mat::zeros(3, 1, CV_64F);
+        projectPoints(obj, rvec, tvec, K, D, img);
+        return img[0];
     }
 };
 
@@ -667,6 +693,14 @@ private:
     bool assume_rectified;
     double target_plane_z, hover_z;
 
+    // 深度采样 (RealSense RGB-D)：用对齐深度给每个抓取点提供相机系 Z（米）
+    tly::DepthSampler depth_sampler_;
+    bool use_depth_pick_z_;
+    string depth_topic_;
+    int depth_sample_radius_px_;
+    bool depth_sample_in_raw_color_;
+    ros::Publisher pick_depth_pub_;
+
     int scale_percent;
     int roi_x_min, roi_y_min, roi_x_max, roi_y_max;
     string threshold_mode;
@@ -789,6 +823,12 @@ public:
         vector<int> def_dist = {3, 4};
         pnh_.param("distance_pick_shapes", distance_pick_shapes, def_dist);
 
+        pnh_.param("use_depth_pick_z", use_depth_pick_z_, true);
+        pnh_.param("depth_topic", depth_topic_, string("/camera/aligned_depth_to_color/image_raw"));
+        pnh_.param("depth_sample_radius_px", depth_sample_radius_px_, 4);
+        // 对齐深度在“彩色原图(带畸变)”坐标系；采样前把 rect 像素映射回 raw 像素。
+        pnh_.param("depth_sample_in_raw_color", depth_sample_in_raw_color_, true);
+
         // 初始化强制加载 CUDA 版的 DexiNed 模型
         if (use_dexined_)
         {
@@ -825,8 +865,12 @@ public:
         preprocess_morph_pub = it_.advertise("/vision/preprocess/morphology", 1);
 
         pose_array_pub = nh_.advertise<geometry_msgs::PoseArray>("/vision/tracked_blocks_table", 1);
+        pick_depth_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("/vision/pick_depth_debug", 1);
+        if (use_depth_pick_z_)
+            depth_sampler_.init(nh_, depth_topic_);
 
-        ROS_INFO("C++ Vision node (DexiNed edge detection, CUDA) ready.");
+        ROS_INFO("C++ Vision node (DexiNed edge detection, CUDA) ready. depth_pick_z=%s topic=%s",
+                 use_depth_pick_z_ ? "on" : "off", depth_topic_.c_str());
     }
 
     ~VisionProcessorNode() { delete templates; }
@@ -1661,6 +1705,8 @@ public:
     {
         std_msgs::Int32MultiArray msg;
         vector<int> inventory(7, 0), board_state(140, 0), payload;
+        std_msgs::Float32MultiArray depth_dbg; // 每块 [shape, u, v, z_m, valid]
+        string z_log;
         for (auto &tr : pub_tracks)
         {
             if (tr.shape_id < 0 || tr.shape_id >= 7)
@@ -1673,12 +1719,42 @@ public:
             payload.push_back((int)round(tr.stable_angle()));
             payload.push_back((int)round(geom.x));
             payload.push_back((int)round(geom.y));
+
+            // 步骤3：用对齐深度采样抓取点相机系 Z（米），先 log + 调试话题验证合理性。
+            // 暂不写入 board_state（该数据通路在引入“路径”模块时再接，见 plan.md §5）。
+            if (use_depth_pick_z_)
+            {
+                // 检测像素是 rect 坐标；对齐深度在 raw 彩色坐标，采样前映射回 raw。
+                Point2f dpx = depth_sample_in_raw_color_
+                                  ? cam_model.rectified_to_raw(pick.x, pick.y)
+                                  : Point2f(pick.x, pick.y);
+                int du = (int)round(dpx.x), dv = (int)round(dpx.y);
+                double z_m = -1.0;
+                bool z_ok = depth_sampler_.sampleZ(du, dv, depth_sample_radius_px_, z_m);
+                depth_dbg.data.push_back((float)tr.shape_id);
+                depth_dbg.data.push_back((float)du);
+                depth_dbg.data.push_back((float)dv);
+                depth_dbg.data.push_back((float)(z_ok ? z_m : -1.0));
+                depth_dbg.data.push_back(z_ok ? 1.0f : 0.0f);
+                z_log += "[s" + to_string(tr.shape_id) + " (" + to_string((int)round(pick.x)) + "," +
+                         to_string((int)round(pick.y)) + ")->raw(" + to_string(du) + "," + to_string(dv) +
+                         ") z=" + (z_ok ? to_string(z_m) : string("NA")) + "] ";
+            }
         }
         msg.data.insert(msg.data.end(), inventory.begin(), inventory.end());
         msg.data.insert(msg.data.end(), board_state.begin(), board_state.end());
         msg.data.push_back(payload.size() / 6);
         msg.data.insert(msg.data.end(), payload.begin(), payload.end());
         state_pub.publish(msg);
+
+        if (use_depth_pick_z_)
+        {
+            pick_depth_pub_.publish(depth_dbg);
+            if (!depth_sampler_.ready())
+                ROS_WARN_THROTTLE(2.0, "[DEPTH] no depth frame received yet on %s", depth_topic_.c_str());
+            else if (!z_log.empty())
+                ROS_INFO_THROTTLE(2.0, "[DEPTH] pick Z (m): %s", z_log.c_str());
+        }
     }
 
     void publish_pose_array(const vector<BlockTrack> &pub_tracks, const std_msgs::Header &header)
