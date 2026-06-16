@@ -90,11 +90,6 @@
         <param name="track_match_gate_px" value="85.0" />
         <param name="track_match_gate_m" value="0.055" />
 
-        <!-- Precise Pose 服务参数 (显式暴露方便后续机械臂微调时修改) -->
-        <param name="precise_timeout" value="0.8" />
-        <param name="precise_require_stable" value="true" />
-        <param name="precise_center_gate_px" value="280.0" />
-
     </node>
 
     <!-- 9. Pilz 控制节点 -->

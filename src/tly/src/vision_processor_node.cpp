@@ -13,9 +13,6 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/dnn.hpp> // 引入 DNN 模块以支持 DexiNed
 
-// 替换为你的服务头文件
-#include <tly/GetPrecisePose.h>
-
 #include <vector>
 #include <deque>
 #include <map>
@@ -700,9 +697,6 @@ private:
     double track_match_gate_px, track_match_gate_m, stable_max_px_std, stable_max_angle_std_deg;
     bool publish_only_stable;
 
-    double precise_timeout, precise_center_gate_px;
-    bool precise_require_stable;
-
     // 发布/订阅/服务
     ros::Subscriber info_sub;
     image_transport::Subscriber img_sub;
@@ -710,7 +704,6 @@ private:
     image_transport::Publisher debug_pub, fg_pub, edges_pub;
     image_transport::Publisher preprocess_rgb_pub, preprocess_gray_pub, preprocess_gaussian_pub, preprocess_otsu_pub, preprocess_morph_pub;
     ros::Publisher pose_array_pub;
-    ros::ServiceServer precise_srv;
 
     tf2_ros::Buffer tf_buffer;
     tf2_ros::TransformListener tf_listener;
@@ -791,10 +784,6 @@ public:
         pnh_.param("angle_axis_probe_px", angle_axis_probe_px, 40.0);
         pnh_.param("publish_preprocess_debug", publish_preprocess_debug, true);
 
-        pnh_.param("precise_timeout", precise_timeout, 0.8);
-        pnh_.param("precise_require_stable", precise_require_stable, true);
-        pnh_.param("precise_center_gate_px", precise_center_gate_px, 280.0);
-
         vector<int> def_dist = {3, 4};
         pnh_.param("distance_pick_shapes", distance_pick_shapes, def_dist);
 
@@ -834,7 +823,6 @@ public:
         preprocess_morph_pub = it_.advertise("/vision/preprocess/morphology", 1);
 
         pose_array_pub = nh_.advertise<geometry_msgs::PoseArray>("/vision/tracked_blocks_table", 1);
-        precise_srv = nh_.advertiseService("/vision/get_precise_pose", &VisionProcessorNode::handle_precise, this);
 
         ROS_INFO("C++ Vision node FULLY OPTIMIZED ready.");
     }
@@ -1737,80 +1725,6 @@ public:
         return out;
     }
 
-    bool handle_precise(tly::GetPrecisePose::Request &req, tly::GetPrecisePose::Response &res)
-    {
-        double deadline = ros::Time::now().toSec() + precise_timeout;
-        int target_sid = req.target_shape_type;
-
-        while (ros::Time::now().toSec() <= deadline)
-        {
-            lock_guard<mutex> lock(state_mtx);
-            if (latest_frame.empty())
-                continue;
-
-            double fx, fy, cx, cy;
-            if (!cam_model.get_intrinsics(fx, fy, cx, cy))
-                continue;
-            Point2f center_px(cx, cy);
-
-            BlockTrack *chosen = nullptr;
-            double min_dist = numeric_limits<double>::infinity();
-            for (auto &tr : tracks)
-            {
-                if (tr.shape_id != target_sid || tr.missed != 0)
-                    continue;
-                if (precise_require_stable && !tr.is_stable(stable_min_frames, stable_max_px_std, stable_max_angle_std_deg))
-                    continue;
-                Point2f px = tr.stable_px_pick();
-                double dpx = norm(px - center_px);
-                if (dpx > precise_center_gate_px)
-                    continue;
-                if (dpx < min_dist)
-                {
-                    min_dist = dpx;
-                    chosen = &tr;
-                }
-            }
-
-            if (chosen)
-            {
-                res.success = true;
-                res.angle = round(chosen->stable_angle());
-                if (chosen->has_stable_table_pick() && has_cached_tx)
-                {
-                    try
-                    {
-                        tf2::Quaternion q(cached_tx.transform.rotation.x, cached_tx.transform.rotation.y, cached_tx.transform.rotation.z, cached_tx.transform.rotation.w);
-                        tf2::Matrix3x3 R(q);
-                        tf2::Vector3 T(cached_tx.transform.translation.x, cached_tx.transform.translation.y, cached_tx.transform.translation.z);
-                        Point3f ray_c = cam_model.pixel_to_ray(cx, cy);
-                        tf2::Vector3 table_ray = R * tf2::Vector3(ray_c.x, ray_c.y, ray_c.z);
-                        double t = (target_plane_z - T.z()) / table_ray.z();
-                        tf2::Vector3 center_table = T + table_ray * t;
-
-                        Point3f target_table = chosen->stable_table_pick();
-                        double dx_t = target_table.x - center_table.x(), dy_t = target_table.y - center_table.y();
-                        double z_dist = max(abs(hover_z - target_plane_z), 1e-4);
-                        res.dx = round(dy_t * fx / z_dist);
-                        res.dy = round(dx_t * fy / z_dist);
-                        return true;
-                    }
-                    catch (...)
-                    {
-                    }
-                }
-                res.dx = round(chosen->stable_px_pick().x - cx);
-                res.dy = round(chosen->stable_px_pick().y - cy);
-                return true;
-            }
-            ros::Duration(0.03).sleep();
-        }
-        res.success = false;
-        res.dx = 0;
-        res.dy = 0;
-        res.angle = 0;
-        return true;
-    }
 };
 
 int main(int argc, char **argv)

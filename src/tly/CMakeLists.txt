@@ -7,7 +7,6 @@ add_compile_options(-std=c++14)
 # 开启 O3 最高级别优化！对于纯算力的 DLX 算法，这能让速度提升几十倍
 set(CMAKE_CXX_FLAGS "-O3 ${CMAKE_CXX_FLAGS}")
 
-# 🌟 1. 新增 message_generation 依赖
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
@@ -22,30 +21,14 @@ find_package(catkin REQUIRED COMPONENTS
   tf2_ros
   tf2_geometry_msgs
   xarm_msgs
-  message_generation 
 )
 
 # 寻找 OpenCV (确保包含 CUDA 模块)
 # 建议修改为显式查找 dnn 模块
 find_package(OpenCV REQUIRED COMPONENTS core imgproc dnn)
 
-# 🌟 2. 声明要编译的 Service 文件
-# 确保在 tly 包的根目录下创建了 srv 文件夹，并把 GetPrecisePose.srv 放进去！
-add_service_files(
-  FILES
-  GetPrecisePose.srv
-)
-
-# 🌟 3. 生成消息，依赖基础消息包
-generate_messages(
-  DEPENDENCIES
-  std_msgs
-  geometry_msgs
-)
-
-# 🌟 4. 在导出包时新增 message_runtime
 catkin_package(
-  CATKIN_DEPENDS roscpp rospy std_msgs geometry_msgs sensor_msgs cv_bridge image_transport moveit_ros_planning_interface tf2 xarm_msgs message_runtime
+  CATKIN_DEPENDS roscpp rospy std_msgs geometry_msgs sensor_msgs cv_bridge image_transport moveit_ros_planning_interface tf2 xarm_msgs
 )
 
 # 定义包含目录
