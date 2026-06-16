@@ -21,14 +21,28 @@ find_package(catkin REQUIRED COMPONENTS
   tf2_ros
   tf2_geometry_msgs
   xarm_msgs
+  message_generation
 )
 
 # 寻找 OpenCV (确保包含 CUDA 模块)
 # 建议修改为显式查找 dnn 模块
 find_package(OpenCV REQUIRED COMPONENTS core imgproc dnn)
 
+# /motion_cmds 消息：路径节点 -> 控制节点 (base 系抓放位姿队列)
+add_message_files(
+  FILES
+  MotionTask.msg
+  MotionPlan.msg
+)
+
+generate_messages(
+  DEPENDENCIES
+  std_msgs
+  geometry_msgs
+)
+
 catkin_package(
-  CATKIN_DEPENDS roscpp rospy std_msgs geometry_msgs sensor_msgs cv_bridge image_transport moveit_ros_planning_interface tf2 xarm_msgs
+  CATKIN_DEPENDS roscpp rospy std_msgs geometry_msgs sensor_msgs cv_bridge image_transport moveit_ros_planning_interface tf2 xarm_msgs message_runtime
 )
 
 # 定义包含目录
@@ -83,6 +97,18 @@ target_link_libraries(vision_processor_node_cpp
 add_executable(vision_processor_node_dexined src/vision_processor_node_dexined.cpp)
 add_dependencies(vision_processor_node_dexined ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 target_link_libraries(vision_processor_node_dexined
+  ${catkin_LIBRARIES}
+  ${OpenCV_LIBRARIES}
+)
+
+# =========================================================
+# 编译路径规划节点 (Path Planner Node)
+# 消费 /tetris_plan，做像素->base 抓取(含深度Z)+格子->base 放置解算，
+# 发布 /motion_cmds (base 系抓放位姿队列) 供控制节点执行。
+# =========================================================
+add_executable(path_planner_node src/path_planner_node.cpp)
+add_dependencies(path_planner_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(path_planner_node
   ${catkin_LIBRARIES}
   ${OpenCV_LIBRARIES}
 )

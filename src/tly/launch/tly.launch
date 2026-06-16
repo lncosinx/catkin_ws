@@ -205,6 +205,49 @@
     <param name="suction_io_num" value="1" />
 </node>
 
+    <!-- =========================
+         8b. Path planner node (步骤5a, 附加式)
+         消费 /tetris_plan, 解算 base 系抓放位姿(抓取Z用深度), 发布 /motion_cmds。
+         此步不接入控制节点, 仅供 rostopic echo /motion_cmds 与日志对照验证。
+         几何/标定参数与控制节点保持一致。
+         ========================= -->
+    <node pkg="tly" type="path_planner_node" name="path_planner_node" output="screen"
+          launch-prefix="bash -c 'sleep 4; exec $0 $@'">
+        <!-- Frames -->
+        <param name="table_frame" value="table_frame" />
+        <param name="base_frame" value="link_base" />
+        <param name="camera_frame" value="camera_color_optical_frame" />
+        <param name="camera_info_topic" value="/camera/color/camera_info" />
+
+        <!-- Calibration / geometry (与控制节点一致) -->
+        <param name="use_true_pick_plane" value="true" />
+        <param name="use_pick_homography" value="true" />
+        <param name="use_board_map" value="true" />
+        <param name="use_cell_max_place_z" value="true" />
+        <param name="require_board_map" value="true" />
+        <param name="require_place_z_map" value="true" />
+        <param name="pick_yaw_offset_deg" value="90.0" />
+        <param name="yaw_homography_probe_px" value="30.0" />
+        <param name="yaw_homography_v_sign" value="-1.0" />
+
+        <param name="place_release_z_margin" value="0.006" />
+        <param name="tcp_pick_offset_z" value="0.004" />
+        <param name="tcp_pick_offset_x" value="0.0" />
+        <param name="tcp_pick_offset_y" value="0.0" />
+        <param name="tcp_place_offset_x" value="0.0" />
+        <param name="tcp_place_offset_y" value="-0.001" />
+        <param name="tcp_place_offset_z" value="0.004" />
+
+        <!-- 深度抓取 Z (D2: 两种 XY 来源可切换) -->
+        <param name="use_depth_pick_z" value="true" />
+        <param name="pick_xy_source" value="homography" />
+        <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw" />
+        <param name="depth_sample_radius_px" value="4" />
+        <param name="depth_sample_in_raw_color" value="true" />
+
+        <!-- 附加式: 发布全部任务供对照 -->
+        <param name="max_tasks_per_plan" value="0" />
+    </node>
 
     <!-- =========================
          9. Strategy node
