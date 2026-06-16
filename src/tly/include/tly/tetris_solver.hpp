@@ -473,3 +473,258 @@ void generateSubInventories(int type, int current_sum, int target_sum, vector<in
         }
     }
 }
+
+// ==============================================================================
+// 进阶任务求解器（带形状序列硬约束）
+//   - 按给定形状序列(可循环)逐个放置；放不下即停，目标最大化得分。
+//   - 硬约束：第 1 个方块必须触底行；其后每块满足"跨行连接"或"重力支撑"(可调)。
+//   - 计分与普通模式一致：满行 +10，满行且 ≥4 色再 +10。
+//   - 采用 beam search（束搜索），在束宽内寻找高分放置序列；纯算法、可离线单测。
+// 坐标约定：BASE_SHAPES 内 Point{x=列偏移, y=行偏移}；输出 cells 用 Point{x=行, y=列}。
+// ==============================================================================
+struct SeqPlacement
+{
+    int shape_type;
+    int real_way;        // 0/1/2/3 -> 0/90/180/270 度
+    vector<Point> cells; // 绝对坐标 Point{x=row, y=col}
+};
+
+struct SeqConfig
+{
+    vector<int> sequence;         // 形状 id (0..6) 放置顺序
+    bool cyclic = false;          // 是否循环重复该序列
+    vector<int> inventory;        // size 7，各形状可用数量
+    bool require_support = false; // true=重力支撑(下方有支撑)；false=仅跨行连接
+    int board_rows = 14;
+    int board_cols = 10;
+    int beam_width = 120;         // 束宽
+    long max_total_placements = 0; // 0 = 取 inventory 之和
+};
+
+struct SeqResult
+{
+    vector<SeqPlacement> placements; // 按放置顺序
+    int score = 0;
+    int placed = 0;
+};
+
+// 计分：board 为 rows*cols 扁平数组，0=空，否则 shape_type+1（颜色）。
+inline int seqScore(const vector<int> &board, int rows, int cols)
+{
+    int s = 0;
+    for (int r = 0; r < rows; ++r)
+    {
+        bool full = true;
+        set<int> colors;
+        for (int c = 0; c < cols; ++c)
+        {
+            int v = board[r * cols + c];
+            if (v == 0)
+                full = false;
+            else
+                colors.insert(v);
+        }
+        if (full)
+        {
+            s += 10;
+            if ((int)colors.size() >= 4)
+                s += 10;
+        }
+    }
+    return s;
+}
+
+// 启发值：主项 score；次项偏好填满行(filled^2)、低行优先、颜色多样，引导束搜索。
+inline long seqHeuristic(const vector<int> &board, int rows, int cols, int score)
+{
+    long h = (long)score * 1000000L;
+    for (int r = 0; r < rows; ++r)
+    {
+        int filled = 0;
+        set<int> colors;
+        for (int c = 0; c < cols; ++c)
+        {
+            int v = board[r * cols + c];
+            if (v)
+            {
+                filled++;
+                colors.insert(v);
+            }
+        }
+        h += (long)filled * filled * (1 + r); // 低行(r 大)权重略高
+        if (filled > 0)
+            h += (long)colors.size();
+    }
+    return h;
+}
+
+struct SeqState
+{
+    vector<int> board; // rows*cols
+    vector<SeqPlacement> placements;
+    int score = 0;
+    int placed = 0;
+    long heuristic = 0;
+};
+
+// 枚举形状 shape 在 st 上的全部合法放置。
+inline vector<SeqPlacement> seqEnumPlacements(const SeqState &st, int shape, const SeqConfig &cfg)
+{
+    vector<SeqPlacement> out;
+    const int rows = cfg.board_rows, cols = cfg.board_cols;
+    const bool first = (st.placed == 0);
+    auto rots = getUniqueRotations(BASE_SHAPES[shape]);
+    for (auto &var : rots)
+    {
+        int max_x = 0, max_y = 0;
+        for (auto &p : var.coords)
+        {
+            max_x = max(max_x, p.x);
+            max_y = max(max_y, p.y);
+        }
+        for (int r0 = 0; r0 + max_y <= rows - 1; ++r0)
+        {
+            for (int c0 = 0; c0 + max_x <= cols - 1; ++c0)
+            {
+                vector<Point> cells;
+                bool ok = true, touch_bottom = false, connected = false, supported = false;
+                for (auto &p : var.coords)
+                {
+                    int nr = r0 + p.y; // 行
+                    int nc = c0 + p.x; // 列
+                    if (nr < 0 || nr >= rows || nc < 0 || nc >= cols || st.board[nr * cols + nc] != 0)
+                    {
+                        ok = false;
+                        break;
+                    }
+                    cells.push_back({nr, nc});
+                    if (nr == rows - 1)
+                        touch_bottom = true;
+                    if ((nr - 1 >= 0 && st.board[(nr - 1) * cols + nc]) ||
+                        (nr + 1 < rows && st.board[(nr + 1) * cols + nc]))
+                        connected = true;
+                    if ((nr + 1 >= rows) || (nr + 1 < rows && st.board[(nr + 1) * cols + nc]))
+                        supported = true;
+                }
+                if (!ok)
+                    continue;
+                if (first)
+                {
+                    if (!touch_bottom)
+                        continue; // 第一个方块必须触底
+                }
+                else if (cfg.require_support)
+                {
+                    if (!supported)
+                        continue;
+                }
+                else
+                {
+                    if (!connected)
+                        continue;
+                }
+                out.push_back({shape, var.real_way, cells});
+            }
+        }
+    }
+    return out;
+}
+
+// 构造有效放置序列：finite=原序列；cyclic=循环并按库存跳过已用尽的形状，长度上限=库存之和。
+inline vector<int> seqBuildEffective(const SeqConfig &cfg)
+{
+    vector<int> inv = cfg.inventory;
+    inv.resize(7, 0);
+    int total = 0;
+    for (int v : inv)
+        total += max(0, v);
+    if (cfg.max_total_placements > 0)
+        total = min(total, (int)cfg.max_total_placements);
+
+    vector<int> eff;
+    if (cfg.sequence.empty() || total <= 0)
+        return eff;
+
+    if (!cfg.cyclic)
+    {
+        eff = cfg.sequence; // finite：超出库存的项会在搜索中无处可放而自然终止
+        return eff;
+    }
+    vector<int> used(7, 0);
+    int idx = 0;
+    long guard = 0, guard_max = (long)total * (long)cfg.sequence.size() * 2 + 16;
+    while ((int)eff.size() < total && guard++ < guard_max)
+    {
+        int s = cfg.sequence[idx % cfg.sequence.size()];
+        idx++;
+        if (s >= 0 && s < 7 && used[s] < inv[s])
+        {
+            eff.push_back(s);
+            used[s]++;
+        }
+    }
+    return eff;
+}
+
+inline SeqResult solveSequence(const SeqConfig &cfg)
+{
+    SeqResult best;
+    const int rows = cfg.board_rows, cols = cfg.board_cols;
+    vector<int> eff = seqBuildEffective(cfg);
+    if (eff.empty())
+        return best;
+
+    SeqState init;
+    init.board.assign(rows * cols, 0);
+    vector<SeqState> beam = {init};
+
+    auto consider = [&](const SeqState &st)
+    {
+        if (st.score > best.score || (st.score == best.score && st.placed > best.placed))
+        {
+            best.score = st.score;
+            best.placed = st.placed;
+            best.placements = st.placements;
+        }
+    };
+
+    for (size_t step = 0; step < eff.size() && !beam.empty(); ++step)
+    {
+        int shape = eff[step];
+        vector<SeqState> next;
+        next.reserve(beam.size() * 8);
+        for (auto &st : beam)
+        {
+            vector<SeqPlacement> places = seqEnumPlacements(st, shape, cfg);
+            if (places.empty())
+            {
+                consider(st); // 该状态无法继续，记为候选解
+                continue;
+            }
+            for (auto &p : places)
+            {
+                SeqState ns = st;
+                for (auto &cell : p.cells)
+                    ns.board[cell.x * cols + cell.y] = shape + 1;
+                ns.placements.push_back(p);
+                ns.placed = st.placed + 1;
+                ns.score = seqScore(ns.board, rows, cols);
+                ns.heuristic = seqHeuristic(ns.board, rows, cols, ns.score);
+                consider(ns);
+                next.push_back(std::move(ns));
+            }
+        }
+        // 束剪枝：按启发值降序保留前 beam_width 个
+        if ((int)next.size() > cfg.beam_width)
+        {
+            std::nth_element(next.begin(), next.begin() + cfg.beam_width, next.end(),
+                             [](const SeqState &a, const SeqState &b)
+                             { return a.heuristic > b.heuristic; });
+            next.resize(cfg.beam_width);
+        }
+        beam = std::move(next);
+    }
+    for (auto &st : beam)
+        consider(st);
+    return best;
+}
