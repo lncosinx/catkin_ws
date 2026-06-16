@@ -121,9 +121,9 @@ from the `table_tf` x/y/z/roll/pitch/yaw values in `tetris_config.yaml`.
 ## Calibration data and shape contract
 
 `config/tetris_config.yaml` (everything under the `tetris:` key) holds all
-calibration state: hand-eye frames, `table_tf`, the table/pick plane fits
-(`TABLE_SURFACE_PLANE_BASE` / `PICK_SURFACE_PLANE_BASE`, point+normal+RMS
-residuals), the 14x10 board grid samples/origin/step
+calibration state: hand-eye frames, `table_tf` (whose Z/vertical now comes from
+the **white-board plane fit**, `BOARD_SURFACE_NORMAL_BASE` — base-Z is not
+perpendicular to the table), the 14x10 board grid samples/origin/step
 (`BOARD_SAMPLES_TABLE`, `BOARD_ORIGIN_TABLE`, ...), the pick homography
 (`PICK_HOMOGRAPHY`), and a board "bump height" model
 (`BOARD_BUMP_HEIGHT_MODEL`, `USE_BUMP_HEIGHT_FOR_PLACE`) that corrects 2.5D
@@ -143,9 +143,12 @@ Calibration workflow:
   eye-on-hand calibration via `easy_handeye`, producing the
   `xarm6_realsense_calibration_eye_on_hand` data consumed by
   `easy_handeye/publish.launch` in `tly.launch`.
-- `calibrate_tool.launch` → `scripts/calibration_tool.py` — interactive
-  capture of the board grid / table plane fit (`BOARD_*`,
-  `TABLE_SURFACE_PLANE_BASE`).
+- `calibrate_tool.launch` → `scripts/calibrate_board.py` — interactive
+  white-board calibration: board grid (`BOARD_*`), per-cell place-Z map, bump
+  height, and the board plane whose normal defines `table_frame`'s vertical
+  (`BOARD_SURFACE_NORMAL_BASE`, `table_tf`). The old standalone scatter/pick
+  surface-plane fit (`TABLE_SURFACE_PLANE_BASE` / `PICK_SURFACE_PLANE_BASE`) was
+  dropped — pick Z now comes from RealSense depth, not a plane fit.
 - `affine.launch` → `scripts/pick_affine_calibration_tool.py` (with the
   Python `vision_processor_node.py` variant) — calibrates the pick-side
   homography/affine correction.
