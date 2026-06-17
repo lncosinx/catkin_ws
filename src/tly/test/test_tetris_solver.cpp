@@ -34,7 +34,7 @@ static bool verify(const SeqResult &res, const SeqConfig &cfg)
     for (size_t i = 0; i < res.placements.size(); ++i)
     {
         const auto &pl = res.placements[i];
-        bool touch_bottom = false, connected = false, supported = false;
+        bool connected = false, supported = false;
         for (auto &c : pl.cells)
         {
             if (c.x < 0 || c.x >= rows || c.y < 0 || c.y >= cols)
@@ -47,31 +47,17 @@ static bool verify(const SeqResult &res, const SeqConfig &cfg)
                 printf("FAIL: overlap at (%d,%d)\n", c.x, c.y);
                 return false;
             }
-            if (c.x == rows - 1)
-                touch_bottom = true;
+            if ((c.x + 1 >= rows) || board[(c.x + 1) * cols + c.y])
+                supported = true; // 规则③：下方有方块或触底(第一层)
             if ((c.x - 1 >= 0 && board[(c.x - 1) * cols + c.y]) ||
                 (c.x + 1 < rows && board[(c.x + 1) * cols + c.y]))
                 connected = true;
-            if ((c.x + 1 >= rows) || board[(c.x + 1) * cols + c.y])
-                supported = true;
         }
-        if (i == 0 && !touch_bottom)
+        bool valid = cfg.require_support ? supported : (supported || connected);
+        if (!valid)
         {
-            printf("FAIL: first block does not touch bottom row\n");
+            printf("FAIL: block %zu floating (violates rule3 support)\n", i);
             return false;
-        }
-        if (i > 0)
-        {
-            if (cfg.require_support && !supported)
-            {
-                printf("FAIL: block %zu not supported\n", i);
-                return false;
-            }
-            if (!cfg.require_support && !connected)
-            {
-                printf("FAIL: block %zu not cross-row connected\n", i);
-                return false;
-            }
         }
         for (auto &c : pl.cells)
             board[c.x * cols + c.y] = pl.shape_type + 1;
@@ -99,32 +85,32 @@ static void run_case(const char *name, SeqConfig cfg)
 
 int main()
 {
-    // 用例1：循环序列 0..6，库存各 5（共 35），仅跨行连接。
-    {
-        SeqConfig cfg;
-        cfg.sequence = {0, 1, 2, 3, 4, 5, 6};
-        cfg.cyclic = true;
-        cfg.inventory = {5, 5, 5, 5, 5, 5, 5};
-        cfg.require_support = false;
-        run_case("cyclic 0..6, inv=5 each, connectivity", cfg);
-    }
-    // 用例2：同上，但要求重力支撑。
+    // 用例1：循环序列 0..6，库存各 5（共 35），竞赛规则③(下方支撑)。
     {
         SeqConfig cfg;
         cfg.sequence = {0, 1, 2, 3, 4, 5, 6};
         cfg.cyclic = true;
         cfg.inventory = {5, 5, 5, 5, 5, 5, 5};
         cfg.require_support = true;
-        run_case("cyclic 0..6, inv=5 each, gravity-support", cfg);
+        run_case("cyclic 0..6, inv=5 each, rule3 support", cfg);
     }
-    // 用例3：有限序列，刚好一行（一字形横放需要旋转；这里用田字测试小集）。
+    // 用例2：同上，但用宽松实验模式(支撑或上方相连)。
     {
         SeqConfig cfg;
-        cfg.sequence = {1, 1, 1, 1, 1}; // 田字 5 个
+        cfg.sequence = {0, 1, 2, 3, 4, 5, 6};
+        cfg.cyclic = true;
+        cfg.inventory = {5, 5, 5, 5, 5, 5, 5};
+        cfg.require_support = false;
+        run_case("cyclic 0..6, inv=5 each, loose", cfg);
+    }
+    // 用例3：5 个田字 + 规则③。可并排落在最底两行(都靠盘面支撑) → 应能铺满 2 行。
+    {
+        SeqConfig cfg;
+        cfg.sequence = {1, 1, 1, 1, 1};
         cfg.cyclic = false;
         cfg.inventory = {0, 5, 0, 0, 0, 0, 0};
-        cfg.require_support = false;
-        run_case("finite squares x5, connectivity", cfg);
+        cfg.require_support = true;
+        run_case("finite squares x5, rule3 support", cfg);
     }
     printf("ALL TESTS PASSED\n");
     return 0;

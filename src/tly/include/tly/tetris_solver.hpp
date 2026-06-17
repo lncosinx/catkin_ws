@@ -477,7 +477,9 @@ void generateSubInventories(int type, int current_sum, int target_sum, vector<in
 // ==============================================================================
 // 进阶任务求解器（带形状序列硬约束）
 //   - 按给定形状序列(可循环)逐个放置；放不下即停，目标最大化得分。
-//   - 硬约束：第 1 个方块必须触底行；其后每块满足"跨行连接"或"重力支撑"(可调)。
+//   - 硬约束(竞赛规则③)：每块下方必须有方块支撑(重叠相连)，落在最底行(第一层)
+//     则靠盘面支撑、属例外。第一个方块因此被迫落在最底行。require_support=true 即
+//     此规则；false 为宽松实验(支撑或上方相连)。
 //   - 计分与普通模式一致：满行 +10，满行且 ≥4 色再 +10。
 //   - 采用 beam search（束搜索），在束宽内寻找高分放置序列；纯算法、可离线单测。
 // 坐标约定：BASE_SHAPES 内 Point{x=列偏移, y=行偏移}；输出 cells 用 Point{x=行, y=列}。
@@ -494,7 +496,7 @@ struct SeqConfig
     vector<int> sequence;         // 形状 id (0..6) 放置顺序
     bool cyclic = false;          // 是否循环重复该序列
     vector<int> inventory;        // size 7，各形状可用数量
-    bool require_support = false; // true=重力支撑(下方有支撑)；false=仅跨行连接
+    bool require_support = true; // true=竞赛规则③(下方有方块支撑/第一层除外)；false=宽松实验
     int board_rows = 14;
     int board_cols = 10;
     int beam_width = 120;         // 束宽
@@ -572,7 +574,6 @@ inline vector<SeqPlacement> seqEnumPlacements(const SeqState &st, int shape, con
 {
     vector<SeqPlacement> out;
     const int rows = cfg.board_rows, cols = cfg.board_cols;
-    const bool first = (st.placed == 0);
     auto rots = getUniqueRotations(BASE_SHAPES[shape]);
     for (auto &var : rots)
     {
@@ -587,7 +588,7 @@ inline vector<SeqPlacement> seqEnumPlacements(const SeqState &st, int shape, con
             for (int c0 = 0; c0 + max_x <= cols - 1; ++c0)
             {
                 vector<Point> cells;
-                bool ok = true, touch_bottom = false, connected = false, supported = false;
+                bool ok = true, connected = false, supported = false;
                 for (auto &p : var.coords)
                 {
                     int nr = r0 + p.y; // 行
@@ -598,31 +599,22 @@ inline vector<SeqPlacement> seqEnumPlacements(const SeqState &st, int shape, con
                         break;
                     }
                     cells.push_back({nr, nc});
-                    if (nr == rows - 1)
-                        touch_bottom = true;
+                    // 规则③：下方有方块支撑，或落在最底行(第一层，靠盘面支撑)
+                    if ((nr + 1 >= rows) || st.board[(nr + 1) * cols + nc])
+                        supported = true;
+                    // 宽松实验项：竖直方向(上或下)与已有方块相邻
                     if ((nr - 1 >= 0 && st.board[(nr - 1) * cols + nc]) ||
                         (nr + 1 < rows && st.board[(nr + 1) * cols + nc]))
                         connected = true;
-                    if ((nr + 1 >= rows) || (nr + 1 < rows && st.board[(nr + 1) * cols + nc]))
-                        supported = true;
                 }
                 if (!ok)
                     continue;
-                if (first)
-                {
-                    if (!touch_bottom)
-                        continue; // 第一个方块必须触底
-                }
-                else if (cfg.require_support)
-                {
-                    if (!supported)
-                        continue;
-                }
-                else
-                {
-                    if (!connected)
-                        continue;
-                }
+                // 规则③ = 下方支撑(第一层/触底除外)。require_support=true 即竞赛规则；
+                // false 为宽松实验(支撑或上方相连)。第一个方块在两种模式下都因"需支撑"
+                // 而被迫落在最底行(此时仅盘面可支撑)。
+                bool valid = cfg.require_support ? supported : (supported || connected);
+                if (!valid)
+                    continue;
                 out.push_back({shape, var.real_way, cells});
             }
         }
