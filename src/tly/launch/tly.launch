@@ -8,6 +8,8 @@
     <!-- 视觉实现: vision_processor_node_cpp (经典轮廓+模板) 或
          vision_processor_node_dexined (神经网络边缘检测) -->
     <arg name="vision_node" default="vision_processor_node_cpp" />
+    <!-- 进阶任务模式: true 则策略按 shape_sequence 求解(详见 strategy_node) -->
+    <arg name="advanced_mode" default="false" />
     <param name="robot_description" command="$(find xacro)/xacro --inorder '$(find xarm_description)/urdf/xarm_device.urdf.xacro' robot_type:=xarm dof:=6 add_gripper:=false" />
 
     <!-- =========================
@@ -259,5 +261,13 @@
         <param name="inventory_stable_required_frames" value="5" />
         <param name="min_usable_total_blocks" value="35" />
         <param name="min_usable_stable_required_frames" value="3" />
+
+        <!-- 进阶任务：默认关闭。开启则按 shape_sequence(下方)求解；
+             进阶时只放一部分方块，不要求库存达 34/35。
+             roslaunch tly tly.launch advanced_mode:=true -->
+        <param name="advanced_mode" value="$(arg advanced_mode)" />
+        <param name="seq_cyclic" value="true" />
+        <param name="seq_require_support" value="true" />
+        <rosparam param="shape_sequence">[0, 1, 2, 3, 4, 5, 6]</rosparam>
     </node>
 </launch>

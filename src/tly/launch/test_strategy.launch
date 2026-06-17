@@ -7,11 +7,25 @@
                + [shape,u,v,angle,geom_u,geom_v] * num_blocks
          例（全 0 栅格、库存随便给，像素任意）可用脚本/rostopic pub 构造。
          观察输出： rostopic echo /tetris_plan
+
+         进阶任务：advanced_mode:=true，按 shape_sequence(下方)循环放置；
+         此模式不要求库存达 34/35（只放一部分），稳定即求解。
          ========================================================= -->
+    <arg name="advanced_mode" default="false" />
+    <arg name="seq_cyclic" default="true" />
+    <arg name="seq_require_support" default="true" />
+
     <node pkg="tly" type="strategy_node" name="strategy_node" output="screen">
         <param name="expected_total_blocks" value="35" />
         <param name="inventory_stable_required_frames" value="5" />
         <param name="min_usable_total_blocks" value="35" />
         <param name="min_usable_stable_required_frames" value="3" />
+
+        <!-- 进阶任务参数 -->
+        <param name="advanced_mode" value="$(arg advanced_mode)" />
+        <param name="seq_cyclic" value="$(arg seq_cyclic)" />
+        <param name="seq_require_support" value="$(arg seq_require_support)" />
+        <!-- 形状放置顺序 (0线/1田/2T/3L左/4L右/5Z左/6Z右)，按现场抽签填写 -->
+        <rosparam param="shape_sequence">[0, 1, 2, 3, 4, 5, 6]</rosparam>
     </node>
 </launch>

@@ -30,6 +30,13 @@ int min_usable_stable_required_frames = 3;
 int inventory_stable_count = 0;
 vector<int> last_inventory(7, -1);
 
+// 进阶任务模式：按外部形状序列(硬约束)求解。进阶任务只放 35 块中的一部分，
+// 故不要求库存达到 34/35，只要稳定即可。
+bool advanced_mode = false;
+vector<int> shape_sequence;     // 形状 id 顺序，例如 [0,1,2,3,...]
+bool seq_cyclic = false;        // 是否按序列循环放置
+bool seq_require_support = true; // true=竞赛规则③(下方支撑)；false=宽松实验
+
 void statusCallback(const std_msgs::Bool::ConstPtr &msg)
 {
     is_robot_busy = msg->data;
@@ -64,7 +71,8 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
     }
 
     // 1) 数量太少时不规划；但允许“差 1 个”的 34 块稳定库存作为可用 fallback。
-    if (total_blocks < min_usable_total_blocks)
+    //    进阶模式只放一部分方块，跳过此数量门槛（仅要求稳定 + 非空）。
+    if (!advanced_mode && total_blocks < min_usable_total_blocks)
     {
         inventory_stable_count = 0;
         last_inventory = current_inventory;
@@ -85,9 +93,11 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
         last_inventory = current_inventory;
     }
 
-    int required_stable = (total_blocks >= expected_total_blocks)
+    int required_stable = advanced_mode
                               ? inventory_stable_required_frames
-                              : min_usable_stable_required_frames;
+                              : ((total_blocks >= expected_total_blocks)
+                                     ? inventory_stable_required_frames
+                                     : min_usable_stable_required_frames);
 
     if (inventory_stable_count < required_stable)
     {
@@ -100,7 +110,7 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
         return;
     }
 
-    if (total_blocks < expected_total_blocks)
+    if (!advanced_mode && total_blocks < expected_total_blocks)
     {
         ROS_WARN("[WAIT_VISION] fallback planning with %d/%d blocks after stable inventory. inv=[%d,%d,%d,%d,%d,%d,%d]",
                  total_blocks, expected_total_blocks,
@@ -168,6 +178,102 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
     if (total_blocks == 0)
     {
         ROS_WARN("No blocks recognized. Idle.");
+        is_planning = false;
+        return;
+    }
+
+    // ============================================================
+    // 进阶任务：按外部形状序列(硬约束)求解，按放置顺序直接打包(跳过拓扑排序)。
+    // 棋盘从空开始(进阶任务裁判已清盘)；输出沿用 /tetris_plan 17-int 格式。
+    // ============================================================
+    if (advanced_mode)
+    {
+        if (shape_sequence.empty())
+        {
+            ROS_WARN("[ADVANCED] shape_sequence param is empty; nothing to solve.");
+            is_planning = false;
+            return;
+        }
+
+        SeqConfig cfg;
+        cfg.sequence = shape_sequence;
+        cfg.cyclic = seq_cyclic;
+        cfg.inventory = current_inventory;
+        cfg.require_support = seq_require_support;
+        cfg.board_rows = 14;
+        cfg.board_cols = 10;
+        SeqResult res = solveSequence(cfg);
+        ROS_INFO("[ADVANCED] solveSequence: placed=%d score=%d (seq_len=%lu cyclic=%d support=%d)",
+                 res.placed, res.score, shape_sequence.size(), (int)seq_cyclic, (int)seq_require_support);
+
+        if (res.placements.empty())
+        {
+            ROS_WARN("[ADVANCED] no valid placement found.");
+            is_planning = false;
+            return;
+        }
+
+        const char *SHAPE_NAMES[] = {
+            "linear_red", "grid_orange", "T_shape_brown",
+            "L_left_purple", "L_right_yellow", "Z_left_blue", "Z_right_green"};
+
+        std_msgs::Int32MultiArray plan_msg;
+        plan_msg.data.push_back((int)res.placements.size());
+
+        ROS_INFO("====== ADVANCED pick-and-place sequence ======");
+        for (size_t i = 0; i < res.placements.size(); ++i)
+        {
+            const auto &pl = res.placements[i];
+            int pu = 0, pv = 0, p_ang = 0, geom_u = 0, geom_v = 0;
+            bool has_geom = false;
+            if (pl.shape_type >= 0 && pl.shape_type < 7 && !available_blocks[pl.shape_type].empty())
+            {
+                BlockInfo b = available_blocks[pl.shape_type].back();
+                pu = b.u;
+                pv = b.v;
+                p_ang = b.ang;
+                geom_u = b.geom_u;
+                geom_v = b.geom_v;
+                has_geom = b.has_geom;
+                available_blocks[pl.shape_type].pop_back();
+            }
+            else
+            {
+                ROS_WARN("[ADVANCED] no pixel coordinate for shape %d! Using 0,0.", pl.shape_type);
+            }
+
+            int sum_r = 0, sum_c = 0;
+            for (auto &pt : pl.cells)
+            {
+                sum_r += pt.x;
+                sum_c += pt.y;
+            }
+
+            // 17-int 格式：与普通模式一致
+            plan_msg.data.push_back(pl.shape_type);
+            plan_msg.data.push_back(pl.real_way);
+            plan_msg.data.push_back(sum_r);
+            plan_msg.data.push_back(sum_c);
+            plan_msg.data.push_back(pu);
+            plan_msg.data.push_back(pv);
+            plan_msg.data.push_back(p_ang);
+            plan_msg.data.push_back(geom_u);
+            plan_msg.data.push_back(geom_v);
+            for (auto &pt : pl.cells)
+            {
+                plan_msg.data.push_back(pt.x); // row
+                plan_msg.data.push_back(pt.y); // col
+            }
+
+            ROS_INFO("adv action [%2lu/%lu]: %-18s | center=(%.2f, %.2f) | rotation => %3d degree | pick=(%d,%d,%d) has_geom=%s",
+                     i + 1, res.placements.size(), SHAPE_NAMES[pl.shape_type],
+                     sum_r / 4.0, sum_c / 4.0, pl.real_way * 90, pu, pv, p_ang,
+                     has_geom ? "true" : "false");
+        }
+        ROS_INFO("===============================================================");
+        plan_pub.publish(plan_msg);
+        ROS_INFO("[ADVANCED][SUCCESS] score=%d! Sent %lu blocks to execution.", res.score, res.placements.size());
+        task_completed = true;
         is_planning = false;
         return;
     }
@@ -459,6 +565,14 @@ int main(int argc, char **argv)
     pnh.param("min_usable_total_blocks", min_usable_total_blocks, min_usable_total_blocks);
     pnh.param("inventory_stable_required_frames", inventory_stable_required_frames, inventory_stable_required_frames);
     pnh.param("min_usable_stable_required_frames", min_usable_stable_required_frames, min_usable_stable_required_frames);
+
+    pnh.param("advanced_mode", advanced_mode, advanced_mode);
+    pnh.param("seq_cyclic", seq_cyclic, seq_cyclic);
+    pnh.param("seq_require_support", seq_require_support, seq_require_support);
+    pnh.getParam("shape_sequence", shape_sequence); // 形状 id 列表，例如 [0,1,2,3]
+    if (advanced_mode)
+        ROS_INFO("[ADVANCED] mode ON: seq_len=%lu cyclic=%d require_support=%d",
+                 shape_sequence.size(), (int)seq_cyclic, (int)seq_require_support);
 
     plan_pub = nh.advertise<std_msgs::Int32MultiArray>("/tetris_plan", 10, true);
 
