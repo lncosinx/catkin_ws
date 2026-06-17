@@ -103,14 +103,23 @@ int main()
         cfg.require_support = false;
         run_case("cyclic 0..6, inv=5 each, loose", cfg);
     }
-    // 用例3：5 个田字 + 规则③。可并排落在最底两行(都靠盘面支撑) → 应能铺满 2 行。
+    // 用例3：5 个田字(单一形状) + 规则③。可并排铺满最底两行，但规则④(整盘 <3 种形状)
+    // 使其不计分 → score 必须为 0。
     {
         SeqConfig cfg;
         cfg.sequence = {1, 1, 1, 1, 1};
         cfg.cyclic = false;
         cfg.inventory = {0, 5, 0, 0, 0, 0, 0};
         cfg.require_support = true;
-        run_case("finite squares x5, rule3 support", cfg);
+        SeqResult res = solveSequence(cfg);
+        printf("=== finite squares x5, rule4 gate (single shape) ===\n");
+        printf("placed=%d  score=%d\n", res.placed, res.score);
+        render(res, cfg.board_rows, cfg.board_cols);
+        bool ok = verify(res, cfg);
+        printf("verify: %s\n\n", ok ? "OK" : "FAILED");
+        assert(ok);
+        assert(res.placed > 0);
+        assert(res.score == 0); // 规则④：单一形状不计分
     }
     printf("ALL TESTS PASSED\n");
     return 0;

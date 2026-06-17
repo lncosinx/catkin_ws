@@ -427,6 +427,16 @@ bool solveForMask(const PlanConfig &plan, const vector<int> &sub_inv, const int 
                             score += 10;
                     }
                 }
+                // 规则④：整盘形状种类 <3 则不计分
+                {
+                    std::set<int> board_shapes;
+                    for (int y = 0; y < 14; ++y)
+                        for (int x = 0; x < 10; ++x)
+                            if (temp_board[y][x] != 0)
+                                board_shapes.insert(temp_board[y][x]);
+                    if ((int)board_shapes.size() < 3)
+                        score = 0;
+                }
                 if (score > global_best_score_internal)
                 {
                     global_best_score_internal = score;
@@ -480,7 +490,7 @@ void generateSubInventories(int type, int current_sum, int target_sum, vector<in
 //   - 硬约束(竞赛规则③)：每块下方必须有方块支撑(重叠相连)，落在最底行(第一层)
 //     则靠盘面支撑、属例外。第一个方块因此被迫落在最底行。require_support=true 即
 //     此规则；false 为宽松实验(支撑或上方相连)。
-//   - 计分与普通模式一致：满行 +10，满行且 ≥4 色再 +10。
+//   - 计分与普通模式一致：满行 +10，满行且 ≥4 色再 +10；规则④：整盘形状种类 <3 则 0 分。
 //   - 采用 beam search（束搜索），在束宽内寻找高分放置序列；纯算法、可离线单测。
 // 坐标约定：BASE_SHAPES 内 Point{x=列偏移, y=行偏移}；输出 cells 用 Point{x=行, y=列}。
 // ==============================================================================
@@ -533,6 +543,13 @@ inline int seqScore(const vector<int> &board, int rows, int cols)
                 s += 10;
         }
     }
+    // 规则④：整盘形状种类 <3 则不计分
+    set<int> board_shapes;
+    for (int v : board)
+        if (v)
+            board_shapes.insert(v);
+    if ((int)board_shapes.size() < 3)
+        return 0;
     return s;
 }
 
