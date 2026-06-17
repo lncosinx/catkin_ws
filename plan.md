@@ -297,22 +297,31 @@ xArm6 俄罗斯方块抓取项目的代码重构方案。目标是把现有「�
 
 ---
 
-## 9. 分阶段迁移（建议顺序，逐步可验证）
+## 9. 分阶段迁移（进度跟踪）
 
-1. **清理死代码**：删 `xarm_controller_node_pliz.cpp`、`GetPrecisePose`
-   服务及调用面；确认 `CMakeLists.txt` 编译目标。
-2. **视觉拆分**：DexiNed 迁到 `vision_processor_node_dexined.cpp`，
-   `vision_processor_node.cpp` 回退经典法；两者契约一致，`tly.launch` 可切换。
-3. **深度 Z**：视觉订阅对齐深度，输出带 Z 抓取点（先打 log 验证 Z 合理）。
-4. **标定缩减**：拆 `calibration_tool.py`，删平面拟合输出，定 D1。
-5. **抽路径模块**：把控制里的坐标解算整段搬到 `path_planner_node`，控制改吃
-   `/motion_cmds`；此步先用「策略原有顺序」直通，验证解算搬运无回归。
-6. **策略解耦**：策略不再打包像素、不再做最终排序，改输出「格子 + 形状 + 连接
-   偏序」。
-7. **最短路径**：在路径里实现受偏序约束的排序，替换直通顺序。
-8. **进阶任务**：按 D4 定义实现形状序列模式。
+- [x] **1 清理死代码**：删 `xarm_controller_node_pliz.cpp`、`GetPrecisePose`
+  服务及调用面；`CMakeLists.txt` 已校。
+- [x] **2 视觉拆分**：DexiNed → `vision_processor_node_dexined.cpp`，
+  `vision_processor_node.cpp` 回退经典法；契约一致，`tly.launch` `vision_node:=` 切换。
+- [x] **3 深度 Z**：视觉订阅对齐深度，`DepthSampler` 采样抓取点 Z（含 D415
+  rect→raw 修正），log + `/vision/pick_depth_debug` 调试话题。⚠️ 数值待真机验证。
+- [x] **4 标定缩减**：`calibration_tool.py` → `calibrate_board.py`，删平面拟合输出，
+  板面法向定 table_frame 竖直（D1）。⚠️ 需真机重跑标定验证。
+- [~] **5 路径模块（5a 已做，5b 待真机）**：
+  - [x] **5a** 新建 `path_planner_node`（附加式）：坐标解算 + 深度 Z，发布
+    `/motion_cmds`；控制器未动、仍吃 `/tetris_plan`。⚠️ `/motion_cmds` 待真机对照。
+  - [ ] **5b** 控制器切吃 `/motion_cmds`、删坐标解算（含 yaw 0/180° 翻转归属）。**需真机。**
+- [x] **6 策略解耦 + 进阶求解器**：
+  - [x] DLX 抽成 `tetris_solver.hpp`（可离线单测）。
+  - [x] 进阶 `solveSequence`（beam search）+ 规则③(下方支撑)/规则④(<3 形状不计分)，
+    离线测试全过。
+  - [x] `strategy_node` 接入 `advanced_mode`/`shape_sequence`，打包进现有
+    `/tetris_plan`（不改契约），roslaunch 冒烟通过。
+  - [ ] **输出契约解耦**（策略不再打像素/不做最终排序）随 5b 一起做。**需真机。**
+- [ ] **7 最短路径**：path 里实现受偏序约束的排序替换直通顺序。**依赖 5b**（要改
+  `/tetris_plan`，而控制器届时已挪到 `/motion_cmds`）。
 
-每步都应能用 `test_vision.launch` / `test_pick.launch` 单独回归对应链路。
+每个节点可用 `test_vision/strategy/path/controller.launch` 单独回归对应链路。
 
 ---
 
@@ -330,5 +339,28 @@ xArm6 俄罗斯方块抓取项目的代码重构方案。目标是把现有「�
   软约束（左到右）只作惩罚项。
 - **`-O3` 编译**：DLX 与（新增的）路径搜索都是算力敏感，保留 `CMakeLists.txt`
   里的 `-O3`。
+
+---
+
+## 11. 真机验证清单（已编译/离线验证，待真机确认）
+
+下列改动我（助手）只做了编译 / 离线测试，**无法实跑真机**，需在硬件上确认：
+
+- [ ] **深度 Z（步骤3）**：`roslaunch tly tly.launch`，看 `[DEPTH] pick Z` 日志或
+  `rostopic echo /vision/pick_depth_debug`，确认 Z ≈ 相机到积木顶面距离（~0.7m 量级）；
+  并核对 `/camera/color/camera_info` 的 `D`：若非 0，则 rect→raw 映射应让
+  `(rect)->raw` 有几像素偏移、Z 才准。
+- [ ] **标定缩减（步骤4）**：重跑 `roslaunch tly calibrate_tool.launch`（现在跑
+  `calibrate_board.py`），确认新流程（采白板平面→法向竖直）产出的 `table_tf` /
+  `BOARD_CENTERS` / `PLACE_Z_MAP` 合理。注意：重跑会整文件重写
+  `tetris_config.yaml`，旧的 `PICK_SURFACE_PLANE_BASE` 将消失，旧控制器抓取 Z 会
+  回退到 flat `PICK_Z`（与迁移方向一致）。
+- [ ] **路径节点 5a**：`roslaunch tly test_path.launch`（机械臂只供 TF、不运动），
+  `rostopic echo /motion_cmds`；对照 `[PATH][TASK]` 与 `[CTRL][TASK]` 日志——XY 应
+  与控制器一致，`z_depth` vs `z_plane` 看深度相对平面的差异。**这是 5b 切换前的前置验证。**
+- [ ] **进阶模式（步骤6）**：`roslaunch tly tly.launch advanced_mode:=true`，
+  `shape_sequence` 按现场抽签填；确认 `/tetris_plan` 的放置顺序/落子合法、首块落最底行。
+- [ ] **5b 切换后**：控制器吃 `/motion_cmds` 后，先慢速、`max_tasks_per_plan` 设小值
+  跑单块，确认抓放位姿与原 `/tetris_plan` 路径一致再放开。
 - **LIN 全程**：贴近障碍/边缘格的直线下压要留够 hover 余量，避免直线段撞邻块。
 ```
