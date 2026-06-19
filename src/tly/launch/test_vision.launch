@@ -20,7 +20,7 @@
 
     <!-- 1.5 启动后加载固定曝光/白平衡（camera_config 里调好的，避免每次手调）。 -->
     <node pkg="dynamic_reconfigure" type="dynparam" name="load_rgb_cfg" output="screen"
-          args="load /camera/rgb_camera $(find tly)/config/camera_config"
+          args="load /camera/rgb_camera $(find tly)/config/camera_config.yaml"
           launch-prefix="bash -c 'sleep 6; exec $0 $@'" />
 
     <!-- 2. 生成 /camera/color/image_rect_color -->
