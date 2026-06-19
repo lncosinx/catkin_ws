@@ -164,12 +164,14 @@
 
     <!-- Real board and placement -->
     <param name="place_release_z_margin" value="0.006" />
-    <param name="tcp_pick_offset_z" value="0.004" />
+    <!-- tcp_*_offset_z(波纹管补偿)默认从标定写入的 /tetris/TCP_*_OFFSET_Z 读取；
+         如需手动覆盖，取消下面两行注释即可。 -->
+    <!-- <param name="tcp_pick_offset_z" value="0.004" /> -->
+    <!-- <param name="tcp_place_offset_z" value="0.004" /> -->
     <param name="tcp_pick_offset_x" value="0.0" />
     <param name="tcp_pick_offset_y" value="0.0" />
     <param name="tcp_place_offset_x" value="0.0" />
     <param name="tcp_place_offset_y" value="-0.001" />
-    <param name="tcp_place_offset_z" value="0.004" />
     <param name="verify_native_xyz_after_motion" value="false" />
 
     <!-- Speed: first test must be slow -->
@@ -236,12 +238,14 @@
         <param name="yaw_homography_v_sign" value="-1.0" />
 
         <param name="place_release_z_margin" value="0.006" />
-        <param name="tcp_pick_offset_z" value="0.004" />
+        <!-- tcp_*_offset_z(波纹管补偿)默认从标定写入的 /tetris/TCP_*_OFFSET_Z 读取；
+             如需手动覆盖，取消下面两行注释即可。 -->
+        <!-- <param name="tcp_pick_offset_z" value="0.004" /> -->
+        <!-- <param name="tcp_place_offset_z" value="0.004" /> -->
         <param name="tcp_pick_offset_x" value="0.0" />
         <param name="tcp_pick_offset_y" value="0.0" />
         <param name="tcp_place_offset_x" value="0.0" />
         <param name="tcp_place_offset_y" value="-0.001" />
-        <param name="tcp_place_offset_z" value="0.004" />
 
         <!-- 深度抓取 Z (D2: 两种 XY 来源可切换) -->
         <param name="use_depth_pick_z" value="true" />
