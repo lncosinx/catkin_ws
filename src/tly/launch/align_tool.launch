@@ -1,0 +1,86 @@
+<launch>
+    <!-- 吸嘴对齐桌面（闭环）。一键起：xArm 原生驱动 + 相机 + 手眼TF + 对齐节点。
+         默认 dry-run 只测量；execute:=true 才动机械臂。
+         不要和 tly.launch / 控制器同时跑（会抢 /xarm/move_line）。 -->
+    <arg name="robot_ip" default="192.168.1.228" />
+
+    <arg name="mode" default="align" />          <!-- align=对齐吸嘴；diag=多姿态测法向漂移(查手眼) -->
+    <arg name="execute" default="false" />      <!-- true 才真的发 move_line -->
+    <arg name="auto" default="false" />          <!-- false=每步回车确认 -->
+    <arg name="diag_perturb_deg" default="8.0" /><!-- diag 模式每个姿态扰动角度 -->
+    <arg name="tool_frame" default="link6" />    <!-- 吸嘴所固连的系；吸嘴轴默认其 +Z -->
+    <arg name="tol_deg" default="0.5" />
+    <arg name="max_step_deg" default="6.0" />
+    <arg name="capture_frames" default="50" />
+
+    <!-- ROI / 平面拟合：相机被迫降低(白板上板后)时调小 ROI、收紧深度门，避免框进
+         板边/背景导致 RANSAC 找不到主平面。
+         roi_center_frac: 中心截取比例(调小→只盯最平的正中)；
+         roi_z_min/max:   深度范围门(m)，相机变近就把上限收到实际工作距离附近；
+         ransac_thresh_m: 平面内点阈值(远/斜/噪声大时调大)；
+         min_inliers_frac:主平面最小占比门(安全闸，宁可调小 ROI 也别轻易降这个)。 -->
+    <arg name="roi_center_frac" default="0.5" />
+    <arg name="roi_z_min" default="0.10" />
+    <arg name="roi_z_max" default="1.50" />
+    <arg name="ransac_thresh_m" default="0.004" />
+    <arg name="min_inliers_frac" default="0.3" />
+
+    <param name="robot_description"
+           command="$(find xacro)/xacro --inorder '$(find xarm_description)/urdf/xarm_device.urdf.xacro' robot_type:=xarm dof:=6 add_gripper:=false" />
+
+    <!-- 1. xArm 原生驱动（不要 MoveIt）：提供 /xarm/set_mode|set_state|move_line|xarm_states -->
+    <include file="$(find xarm_bringup)/launch/xarm6_server.launch">
+        <arg name="robot_ip" value="$(arg robot_ip)" />
+        <arg name="use_moveit" value="false" />
+        <arg name="ns" value="xarm" />
+        <arg name="velocity_control" value="false" />
+        <arg name="enforce_limits" value="true" />
+        <arg name="add_gripper" value="false" />
+    </include>
+
+    <!-- 关节 → 连杆 TF（link_base <- … <- link6） -->
+    <node pkg="robot_state_publisher" type="robot_state_publisher" name="robot_state_publisher" output="screen">
+        <remap from="joint_states" to="/xarm/joint_states" />
+    </node>
+
+    <!-- 吸盘 TCP（可选；脚本默认用 link6 +Z 作吸嘴轴，设 tool_frame:=link_tcp 时用到） -->
+    <node pkg="tf2_ros" type="static_transform_publisher" name="suction_tcp_broadcaster"
+          args="0.00046 -0.00026 0.06962 0 0 0 link6 link_tcp" />
+
+    <!-- 2. RealSense（深度对齐到 color；滤波与手眼标定时一致，背光板深度更密更稳） -->
+    <arg name="depth_filters" default="spatial,temporal,hole_filling" />
+    <include file="$(find realsense2_camera)/launch/rs_camera.launch">
+        <arg name="align_depth" value="true" />
+        <arg name="filters" value="$(arg depth_filters)" />
+    </include>
+
+    <!-- 3. 手眼 TF：base <- camera_color_optical_frame（脚本测法向换算到 base 必需） -->
+    <include file="$(find easy_handeye)/launch/publish.launch">
+        <arg name="eye_on_hand" value="true" />
+        <arg name="namespace_prefix" value="xarm6_realsense_calibration" />
+    </include>
+
+    <!-- 4. 对齐节点 -->
+    <node pkg="tly" type="align_tool_to_board.py" name="align_tool_to_board" output="screen"
+          launch-prefix="bash -c 'sleep 6; exec $0 $@'">
+        <param name="base_frame" value="link_base" />
+        <param name="tool_frame" value="$(arg tool_frame)" />
+        <param name="camera_frame" value="camera_color_optical_frame" />
+        <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw" />
+        <param name="camera_info_topic" value="/camera/color/camera_info" />
+
+        <param name="mode" value="$(arg mode)" />
+        <param name="execute" value="$(arg execute)" />
+        <param name="auto" value="$(arg auto)" />
+        <param name="diag_perturb_deg" value="$(arg diag_perturb_deg)" />
+        <param name="config_path" value="$(find tly)/config/tetris_config.yaml" />
+        <param name="tol_deg" value="$(arg tol_deg)" />
+        <param name="max_step_deg" value="$(arg max_step_deg)" />
+        <param name="capture_frames" value="$(arg capture_frames)" />
+        <param name="roi_center_frac" value="$(arg roi_center_frac)" />
+        <param name="ransac_thresh_m" value="$(arg ransac_thresh_m)" />
+        <param name="min_inliers_frac" value="$(arg min_inliers_frac)" />
+        <rosparam param="roi_z" subst_value="true">[$(arg roi_z_min), $(arg roi_z_max)]</rosparam>
+        <rosparam param="tool_axis">[0.0, 0.0, 1.0]</rosparam>
+    </node>
+</launch>
