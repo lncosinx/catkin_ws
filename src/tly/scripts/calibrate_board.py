@@ -15,6 +15,9 @@ table_frame 的竖直方向（D1：实测 base-Z 不垂直于桌面，改用板�
   步骤4  采方块顶面高度 → block_thickness（放置 Z = 凸起/板面高度 + block_thickness + 余量）。
   步骤5  采白板凸起网格 (A=9 / B=25 / C=140) → 仿射网格 + 高度图。
   步骤6  复用步骤2的深度平面内点转入 table 系 → BOARD_SURFACE_PLANE（应近似水平）。
+  步骤7  波纹管长度补偿（可选）：拆波纹管触碰发光板 + 装波纹管触碰同一点，两次 link_tcp
+         高度差即自由长度；配期望压缩量 → tcp_*_offset_z（只补偿下扎 Z，不进入 XY/单应性/
+         射线求交）。控制/路径节点从 /tetris/TCP_*_OFFSET_Z 自动读取。
 
 主要输出（写入 tetris_config.yaml）：
   table_tf, BOARD_CENTERS_14x10_TABLE, PLACE_Z_MAP_14x10, BOARD_BUMP_HEIGHT_MAP_14x10,
@@ -23,6 +26,14 @@ table_frame 的竖直方向（D1：实测 base-Z 不垂直于桌面，改用板�
 
 另两类标定：手眼(easy_handeye)、单应性(pick_affine_calibration_tool.py)。
 采点时输入 'u' / 'undo' 可撤销并重记上一个点。
+
+部分标定（只跑某些步骤）：
+  用 ROS 参数 ~steps 选择要执行的步骤，未选中的步骤会从现有 tetris_config.yaml
+  读取其结果。格式示例：'4'（只标定方块高度）、'3,4,5'、'2-6'、'all'（默认全部）。
+  不给 ~steps 时会交互式提示。写文件时只更新本次产出的键，其余键（含手眼/单应性
+  等其它工具写入的内容）原样保留。
+  注意依赖：重跑步骤 2 会让 3/4/5/6 的旧数据失配；重跑步骤 3 会让 4/5/6 失配
+  （它们都是在 table_frame 下测得）。这种情况脚本会提示并要求确认。
 """
 
 import os
@@ -38,7 +49,7 @@ except Exception:
     cv2 = None
 
 from sensor_msgs.msg import CameraInfo, Image
-from tf.transformations import euler_from_matrix, quaternion_matrix
+from tf.transformations import euler_from_matrix, euler_matrix, quaternion_matrix
 
 
 DEPTH_TOPIC_DEFAULT = "/camera/aligned_depth_to_color/image_raw"
@@ -202,6 +213,18 @@ def ask_yes_no(question, default=True):
     if ans == "":
         return default
     return ans in ("y", "yes", "是", "1", "true")
+
+
+def ask_float(question, default):
+    """提示输入一个浮点数；回车用默认值；非法输入重试。"""
+    while True:
+        ans = input(f"{question} [默认 {default:.4f}]: ").strip()
+        if ans == "":
+            return float(default)
+        try:
+            return float(ans)
+        except ValueError:
+            print("  请输入数字（米），或直接回车用默认值。")
 
 
 def get_camera_info():
@@ -495,6 +518,90 @@ def choose_height_interpolation(board_mode):
     return default
 
 
+ALL_STEPS = [1, 2, 3, 4, 5, 6, 7]
+
+STEP_TITLES = {
+    1: "拍照起点位姿 + 相机内参",
+    2: "深度拟合白板平面（定义 table_frame 竖直方向）",
+    3: "table_frame 原点 / X 方向",
+    4: "散落区方块顶面高度 (block_thickness)",
+    5: "白色底盘凸起网格 + 高度图",
+    6: "放置面高度 / PLACE_Z 设置",
+    7: "波纹管长度补偿 (tcp_pick/place_offset_z)",
+}
+
+
+def parse_steps(spec):
+    """把 '4' / '3,4,5' / '2-6' / 'all' 解析成步骤集合；非法 token 忽略。"""
+    spec = str(spec).strip().lower()
+    if spec in ("", "all", "全部"):
+        return set(ALL_STEPS)
+    out = set()
+    for tok in spec.replace("，", ",").replace(" ", ",").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            if "-" in tok:
+                a, b = tok.split("-", 1)
+                for s in range(int(a), int(b) + 1):
+                    out.add(s)
+            else:
+                out.add(int(tok))
+        except ValueError:
+            continue
+    return {s for s in out if s in ALL_STEPS}
+
+
+def choose_steps():
+    """通过 ~steps 参数或交互选择要执行的步骤；其余步骤从现有配置读取。"""
+    val = str(rospy.get_param("~steps", "")).strip()
+    if val:
+        steps = parse_steps(val)
+        if steps:
+            return steps
+        print(f"⚠️ ~steps='{val}' 无法解析，转为交互选择。")
+
+    print("\n要执行哪些步骤？（未选中的步骤将从现有配置读取其结果）")
+    for s in ALL_STEPS:
+        print(f"  {s} = {STEP_TITLES[s]}")
+    while True:
+        ans = input("输入步骤，如 '4' / '3,4,5' / '2-6' [回车=全部]: ").strip()
+        steps = parse_steps(ans)
+        if steps:
+            return steps
+        print("输入无效，请重试。")
+
+
+def warn_stale_dependencies(run):
+    """重跑较早步骤而不重跑依赖它的步骤时，旧数据会失配，提示并确认。"""
+    downstream = {2: {3, 4, 5, 6}, 3: {4, 5, 6}}
+    stale = set()
+    for s, deps in downstream.items():
+        if s in run:
+            stale |= {d for d in deps if d not in run}
+    if not stale:
+        return
+    print("\n⚠️ 依赖提醒：你重跑了较早的步骤，但以下依赖它的步骤未重跑，")
+    print("   它们的现有数据是在【旧的 table_frame / 板面】下测得的，可能已失配：")
+    print("   步骤 {}".format(", ".join(str(s) for s in sorted(stale))))
+    print("   建议把这些步骤也一并重跑。")
+    if not ask_yes_no("仍要继续（保留这些步骤的旧数据）？", default=False):
+        print("已取消。请调整 ~steps 后重试。")
+        sys.exit(0)
+
+
+def cfg_get(tcfg, key, step_label):
+    """从现有配置取必需键；缺失则报错退出（提示用户把该步骤纳入 ~steps）。"""
+    val = tcfg.get(key) if isinstance(tcfg, dict) else None
+    if val is None:
+        raise SystemExit(
+            "❌ 现有配置缺少 '{}'，无法跳过步骤 {}。\n"
+            "   首次标定或缺数据时，请在 ~steps 里包含该步骤（或运行全部步骤）。".format(key, step_label)
+        )
+    return val
+
+
 def main():
     rospy.init_node("calibration_tool_node", anonymous=True)
     tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(30.0))
@@ -534,226 +641,342 @@ def main():
     except Exception:
         prior_roi = None
 
-    board_mode = choose_board_mode()
-    board_sample_col_row = board_samples_for_mode(board_mode)
-    height_interpolation = choose_height_interpolation(board_mode)
+    tcfg = existing_cfg.get("tetris", {}) if isinstance(existing_cfg, dict) else {}
+    if not isinstance(tcfg, dict):
+        tcfg = {}
+
+    run = choose_steps()
+    warn_stale_dependencies(run)
 
     print("\n" + "=" * 94)
     print("=== 俄罗斯方块标定工具：单帧深度拟板面 + 白板 A/B/C 多模式标定 ===")
+    print("= 本次执行步骤: {}（其余步骤从现有配置读取）".format(
+        ", ".join(str(s) for s in sorted(run))))
     print(f"= 板面法向/放置面: 深度采集 {capture_frames} 帧中值 + RANSAC（ROI 框选）")
-    print(f"= 白板模式: {board_mode}，采样 {len(board_sample_col_row)} 个凸起中心")
-    print(f"= 白板高度插值: {height_interpolation}")
     print("= 凸起/方块/原点仍用吸盘轻触；板面法向与放置高度改由深度采集。")
     print("= (新增) 如果标定失误，可以输入 'u' 撤销并重新记录上一个点。")
     print("=" * 94 + "\n")
 
-    # Step 1.
-    start_pose = require_pose(tf_buffer, "[步骤 1] 请将机械臂移动到【视觉拍照起点高度】", base_frame, eef_frame)
-    cam_fx, cam_fy, cam_cx, cam_cy = get_camera_info()
+    # Step 1: 拍照起点位姿 + 相机内参。
+    if 1 in run:
+        start_pose = require_pose(tf_buffer, "[步骤 1] 请将机械臂移动到【视觉拍照起点高度】", base_frame, eef_frame)
+        cam_fx, cam_fy, cam_cx, cam_cy = get_camera_info()
+    else:
+        start_pose = None
+        if 2 in run:
+            # 步骤 2 的深度反投影需要内参；步骤 1 跳过时单独获取一次。
+            cam_fx, cam_fy, cam_cx, cam_cy = get_camera_info()
+        else:
+            cam_fx = float(cfg_get(tcfg, "CAM_FX", "1"))
+            cam_fy = float(cfg_get(tcfg, "CAM_FY", "1"))
+            cam_cx = float(cfg_get(tcfg, "CAM_CX", "1"))
+            cam_cy = float(cfg_get(tcfg, "CAM_CY", "1"))
+            print("ℹ️ 跳过步骤 1，沿用现有相机内参。")
     intr = (cam_fx, cam_fy, cam_cx, cam_cy)
 
-    if cv2 is None and param_roi is None and prior_roi is None and not roi_force_interactive:
+    if 2 in run and cv2 is None and param_roi is None and prior_roi is None and not roi_force_interactive:
         print("⚠️ 未能导入 cv2，无法交互框选 ROI；请用 ~board_roi 参数给定矩形后重跑。")
 
     # Step 2: 单机位深度拟板面，法向定义 table_frame 竖直方向 (D1)。
     # 同一平面后续也用于放置面 Z (Step 6)。
-    print("\n--- 步骤 2：深度拟合【白板平坦表面】(定义 table_frame 竖直方向) ---")
-    print("把相机摆到能清楚看到【空白板平坦区】的位置，保持静止后按回车开始采集。")
-    input("  就绪后按回车... ")
-    if not tf_buffer.can_transform(base_frame, camera_frame, rospy.Time(0), rospy.Duration(5.0)):
-        rospy.logerr("TF 缺失: %s <- %s（确认手眼发布在线）", base_frame, camera_frame)
-        sys.exit(1)
-
-    depth0 = grab_median_depth(depth_topic, capture_frames)
-    roi, roi_src = resolve_roi(depth0, prior_roi, param_roi, roi_force_interactive)
-    print(f"  ROI={roi}（来源:{roi_src}），深度范围={roi_z} m")
-
-    first = fit_plane_capture(tf_buffer, depth0, roi, roi_z, intr,
-                              camera_frame, base_frame, ransac_thresh, ransac_iters,
-                              min_inliers_frac)
-    surface_centroid_base = first["centroid_base"]
-    surface_normal_base = first["normal_base"]
-    surf_rms = first["rms"]
-    surf_max = first["max_abs"]
-
-    print("\n✅ 白板平面拟合完成（法向作为 table_frame 竖直方向）：")
-    print("  内点/总点: {}/{}".format(first["inlier_count"], first["total"]))
-    print("  normal(base): [{:.6f}, {:.6f}, {:.6f}]".format(*surface_normal_base))
-    print("  centroid(base): [{:.6f}, {:.6f}, {:.6f}]".format(*surface_centroid_base))
-    print("  residual RMS/max: {:.3f} / {:.3f} mm".format(surf_rms * 1000.0, surf_max * 1000.0))
-
-    # 走位差分验证/深度尺度（不改变所存平面，仅报告）。
     verify_report = None
-    if do_verify and ask_yes_no("是否做【走位差分验证/深度尺度】？(手动 free-drive 挪一小段再采)", default=True):
-        try:
-            input("  把相机沿任意方向(建议沿法向)挪 2~5cm，保持仍看白板，静止后按回车... ")
-            depth1 = grab_median_depth(depth_topic, capture_frames)
-            second = fit_plane_capture(tf_buffer, depth1, roi, roi_z, intr,
-                                       camera_frame, base_frame, ransac_thresh, ransac_iters,
-                                       min_inliers_frac)
-            verify_report = verify_motion_report(first, second)
-            print("  位移|Δ|={:.1f}mm, 沿法向={:.1f}mm".format(
-                verify_report["move_norm_m"] * 1000.0, verify_report["move_along_normal_m"] * 1000.0))
-            print("  深度尺度比(应≈1.0): {:.4f}".format(verify_report["depth_scale_ratio"]))
-            print("  两次法向夹角(应≈0): {:.3f}°".format(verify_report["normal_consistency_deg"]))
-            print("  base-Z 与板面法向夹角: {:.3f}°".format(verify_report["baseZ_to_normal_deg"]))
-        except Exception as e:
-            print(f"  ⚠️ 验证步失败（不影响标定）: {e}")
-            verify_report = None
+    if 2 in run:
+        print("\n--- 步骤 2：深度拟合【白板平坦表面】(定义 table_frame 竖直方向) ---")
+        print("把相机摆到能清楚看到【空白板平坦区】的位置，保持静止后按回车开始采集。")
+        input("  就绪后按回车... ")
+        if not tf_buffer.can_transform(base_frame, camera_frame, rospy.Time(0), rospy.Duration(5.0)):
+            rospy.logerr("TF 缺失: %s <- %s（确认手眼发布在线）", base_frame, camera_frame)
+            sys.exit(1)
 
-    # Step 3: table_frame.
-    print("\n--- 步骤 3：定义 table_frame 原点和 X 方向 ---")
-    while True:
-        P_user = require_pose(tf_buffer, "[步骤 3.1] 选择散落区桌面上的 table_frame 原点 P", base_frame, eef_frame, allow_undo=False)
-        X_user = require_pose(tf_buffer, "[步骤 3.2] 沿你希望的 table_frame +X 方向选择一点 X", base_frame, eef_frame, allow_undo=True)
-        if isinstance(X_user, str) and X_user == "UNDO":
-            print("  ↩️ 已撤销，重新标定原点 P。")
-            continue
-        break
+        depth0 = grab_median_depth(depth_topic, capture_frames)
+        roi, roi_src = resolve_roi(depth0, prior_roi, param_roi, roi_force_interactive)
+        print(f"  ROI={roi}（来源:{roi_src}），深度范围={roi_z} m")
 
-    P = project_point_to_plane(P_user, surface_centroid_base, surface_normal_base)
-    X_proj = project_point_to_plane(X_user, surface_centroid_base, surface_normal_base)
+        first = fit_plane_capture(tf_buffer, depth0, roi, roi_z, intr,
+                                  camera_frame, base_frame, ransac_thresh, ransac_iters,
+                                  min_inliers_frac)
+        surface_centroid_base = first["centroid_base"]
+        surface_normal_base = first["normal_base"]
+        surf_rms = first["rms"]
+        surf_max = first["max_abs"]
+        inlier_count = int(first["inlier_count"])
+        total = int(first["total"])
+        inliers_base = first["inliers_base"]
 
-    vZ = surface_normal_base
-    vX = normalize(X_proj - P, "projected table X axis")
-    vY = normalize(np.cross(vZ, vX), "table Y axis")
-    vX = normalize(np.cross(vY, vZ), "table X axis")
+        print("\n✅ 白板平面拟合完成（法向作为 table_frame 竖直方向）：")
+        print("  内点/总点: {}/{}".format(inlier_count, total))
+        print("  normal(base): [{:.6f}, {:.6f}, {:.6f}]".format(*surface_normal_base))
+        print("  centroid(base): [{:.6f}, {:.6f}, {:.6f}]".format(*surface_centroid_base))
+        print("  residual RMS/max: {:.3f} / {:.3f} mm".format(surf_rms * 1000.0, surf_max * 1000.0))
 
-    R_mat = np.eye(3)
-    R_mat[:, 0] = vX
-    R_mat[:, 1] = vY
-    R_mat[:, 2] = vZ
-
-    R_4x4 = np.eye(4)
-    R_4x4[:3, :3] = R_mat
-    rpy = euler_from_matrix(R_4x4, axes="sxyz")
-
-    Cam_table = to_table(R_mat, P, start_pose)
-    table_z_in_cam = float(Cam_table[2])
-
-    # Step 4: block top height.
-    print("\n--- 步骤 4：标定散落区方块顶面高度 ---")
-    print("建议换不同颜色/不同位置采样，最终取中位数。")
-    block_top_points_base = []
-    block_top_points_table = []
-    num_blocks = max(1, block_samples)
-    i = 0
-    while i < num_blocks:
-        pt = require_pose(tf_buffer, f"[步骤 4.{i+1}/{num_blocks}] 方块平放在散落区，吸盘轻触【方块顶面】", base_frame, eef_frame, allow_undo=(i > 0))
-        if isinstance(pt, str) and pt == "UNDO":
-            i -= 1
-            block_top_points_base.pop()
-            block_top_points_table.pop()
-            print(f"  ↩️ 已撤销，重新标定第 {i+1} 个方块高度。")
-            continue
-        block_top_points_base.append(pt)
-        block_top_points_table.append(to_table(R_mat, P, pt))
-        i += 1
-        
-    block_top_points_base = np.asarray(block_top_points_base)
-    block_top_points_table = np.asarray(block_top_points_table)
-    block_thickness = float(np.median(block_top_points_table[:, 2]))
-
-    # Step 5: board samples.
-    print("\n--- 步骤 5：白色底盘凸起网格标定 ---")
-    print("坐标显示为 (col,row)，因为底盘是 10 列 x 14 行。")
-    print(f"当前模式 {board_mode}: 需要采 {len(board_sample_col_row)} 个凸起中心。")
-    if board_mode == "C":
-        print("模式 C 会采完整 140 点，耗时较长，但能最好反映白板局部翘曲。如果误按，输入 'u' 撤销！")
-
-    sample_rows = []
-    sample_cols = []
-    sample_points = []
-    sample_records = []
-
-    i = 0
-    while i < len(board_sample_col_row):
-        col, row = board_sample_col_row[i]
-        p_base = require_pose(
-            tf_buffer,
-            f"[步骤 5.{i+1}/{len(board_sample_col_row)}] 吸盘对准【白色底盘凸起中心】 (col={col}, row={row})",
-            base_frame,
-            eef_frame,
-            allow_undo=(i > 0)
-        )
-        if isinstance(p_base, str) and p_base == "UNDO":
-            i -= 1
-            sample_cols.pop()
-            sample_rows.pop()
-            sample_points.pop()
-            sample_records.pop()
-            prev_col, prev_row = board_sample_col_row[i]
-            print(f"  ↩️ 已撤销！退回上一个点 (col={prev_col}, row={prev_row}) 重新记录。")
-            continue
-            
-        p_tab = to_table(R_mat, P, p_base)
-        sample_cols.append(col)
-        sample_rows.append(row)
-        sample_points.append(p_tab)
-        sample_records.append({
-            "col": int(col), "row": int(row),
-            "table": [float(p_tab[0]), float(p_tab[1]), float(p_tab[2])],
-            "link_base": [float(p_base[0]), float(p_base[1]), float(p_base[2])],
-        })
-        i += 1
-
-    sample_points = np.asarray(sample_points, dtype=float)
-    sample_rows = np.asarray(sample_rows, dtype=float)
-    sample_cols = np.asarray(sample_cols, dtype=float)
-
-    origin, row_vec, col_vec, xy_rms, grid_z_rms = fit_affine_grid(sample_rows, sample_cols, sample_points)
-
-    q_coef = None
-    q_height_map = None
-    q_std = None
-    q_max = None
-    if len(sample_rows) >= 9:
-        q_coef, q_height_map, q_std, q_max = fit_quadratic_height(sample_rows, sample_cols, sample_points[:, 2])
-
-    idw_height_map = idw_interpolate(sample_rows, sample_cols, sample_points[:, 2], ROWS, COLS)
-
-    if height_interpolation == "quadratic" and q_height_map is not None:
-        bump_height_map = q_height_map
-        height_model_type = "quadratic"
-        height_std = q_std
-        height_max_abs = q_max
+        # 走位差分验证/深度尺度（不改变所存平面，仅报告）。
+        if do_verify and ask_yes_no("是否做【走位差分验证/深度尺度】？(手动 free-drive 挪一小段再采)", default=True):
+            try:
+                input("  把相机沿任意方向(建议沿法向)挪 2~5cm，保持仍看白板，静止后按回车... ")
+                depth1 = grab_median_depth(depth_topic, capture_frames)
+                second = fit_plane_capture(tf_buffer, depth1, roi, roi_z, intr,
+                                           camera_frame, base_frame, ransac_thresh, ransac_iters,
+                                           min_inliers_frac)
+                verify_report = verify_motion_report(first, second)
+                print("  位移|Δ|={:.1f}mm, 沿法向={:.1f}mm".format(
+                    verify_report["move_norm_m"] * 1000.0, verify_report["move_along_normal_m"] * 1000.0))
+                print("  深度尺度比(应≈1.0): {:.4f}".format(verify_report["depth_scale_ratio"]))
+                print("  两次法向夹角(应≈0): {:.3f}°".format(verify_report["normal_consistency_deg"]))
+                print("  base-Z 与板面法向夹角: {:.3f}°".format(verify_report["baseZ_to_normal_deg"]))
+            except Exception as e:
+                print(f"  ⚠️ 验证步失败（不影响标定）: {e}")
+                verify_report = None
     else:
-        bump_height_map = idw_height_map
-        height_model_type = "idw"
-        # For IDW, compute residual at measured samples. In Mode C exact values should be zero.
-        pred_at_samples = []
-        for r, c in zip(sample_rows.astype(int), sample_cols.astype(int)):
-            pred_at_samples.append(bump_height_map[int(r)][int(c)])
-        pred_at_samples = np.asarray(pred_at_samples)
-        residual = sample_points[:, 2] - pred_at_samples
-        height_std = float(np.std(residual))
-        height_max_abs = float(np.max(np.abs(residual)))
+        print("\n--- 步骤 2：跳过，沿用现有白板平面拟合结果 ---")
+        surface_normal_base = np.asarray(cfg_get(tcfg, "BOARD_SURFACE_NORMAL_BASE", "2"), dtype=float)
+        surface_centroid_base = np.asarray(cfg_get(tcfg, "BOARD_SURFACE_CENTROID_BASE", "2"), dtype=float)
+        surf_rms = float(tcfg.get("BOARD_PLANE_FIT_RMS_M", 0.0) or 0.0)
+        surf_max = float(tcfg.get("BOARD_PLANE_FIT_MAX_ABS_M", 0.0) or 0.0)
+        inlier_count = int(tcfg.get("BOARD_PLANE_INLIERS", 0) or 0)
+        total = int(tcfg.get("BOARD_PLANE_TOTAL_PTS", 0) or 0)
+        inliers_base = np.asarray(cfg_get(tcfg, "BOARD_PLANE_SAMPLES_BASE", "2"), dtype=float)
+        dz = tcfg.get("BOARD_DEPTH_ROI", {}) or {}
+        roi = dz.get("roi") or param_roi or prior_roi or [0, 0, 0, 0]
+        roi = [int(v) for v in roi]
+        roi_src = "persisted"
+        roi_z = [float(v) for v in dz.get("z_range_m", roi_z)]
+        capture_frames = int(dz.get("capture_frames", capture_frames))
+        ransac_thresh = float(dz.get("ransac_thresh_m", ransac_thresh))
+        depth_topic = dz.get("depth_topic", depth_topic)
+        camera_frame = dz.get("camera_frame", camera_frame)
+        verify_report = tcfg.get("BOARD_DEPTH_VERIFY")
+        first = {
+            "normal_base": surface_normal_base, "centroid_base": surface_centroid_base,
+            "rms": surf_rms, "max_abs": surf_max,
+            "inliers_base": inliers_base, "inlier_count": inlier_count, "total": total,
+        }
+        print("  normal(base): [{:.6f}, {:.6f}, {:.6f}]".format(*surface_normal_base))
+
+    # Step 3: table_frame 原点与 X 方向。
+    if 3 in run:
+        print("\n--- 步骤 3：定义 table_frame 原点和 X 方向 ---")
+        while True:
+            P_user = require_pose(tf_buffer, "[步骤 3.1] 选择散落区桌面上的 table_frame 原点 P", base_frame, eef_frame, allow_undo=False)
+            X_user = require_pose(tf_buffer, "[步骤 3.2] 沿你希望的 table_frame +X 方向选择一点 X", base_frame, eef_frame, allow_undo=True)
+            if isinstance(X_user, str) and X_user == "UNDO":
+                print("  ↩️ 已撤销，重新标定原点 P。")
+                continue
+            break
+
+        P = project_point_to_plane(P_user, surface_centroid_base, surface_normal_base)
+        X_proj = project_point_to_plane(X_user, surface_centroid_base, surface_normal_base)
+
+        vZ = surface_normal_base
+        vX = normalize(X_proj - P, "projected table X axis")
+        vY = normalize(np.cross(vZ, vX), "table Y axis")
+        vX = normalize(np.cross(vY, vZ), "table X axis")
+
+        R_mat = np.eye(3)
+        R_mat[:, 0] = vX
+        R_mat[:, 1] = vY
+        R_mat[:, 2] = vZ
+
+        R_4x4 = np.eye(4)
+        R_4x4[:3, :3] = R_mat
+        rpy = euler_from_matrix(R_4x4, axes="sxyz")
+    else:
+        print("\n--- 步骤 3：跳过，沿用现有 table_frame ---")
+        tt = cfg_get(tcfg, "table_tf", "3")
+        P = np.array([float(tt["x"]), float(tt["y"]), float(tt["z"])], dtype=float)
+        rpy = (float(tt["roll"]), float(tt["pitch"]), float(tt["yaw"]))
+        R_mat = euler_matrix(rpy[0], rpy[1], rpy[2], axes="sxyz")[:3, :3]
+        xdir = tcfg.get("TABLE_FRAME_XDIR_BASE")
+        X_proj = np.asarray(xdir, dtype=float) if xdir else (P + R_mat[:, 0])
+
+    if start_pose is not None:
+        table_z_in_cam = float(to_table(R_mat, P, start_pose)[2])
+    else:
+        table_z_in_cam = float(tcfg.get("TABLE_Z_IN_CAMERA", 0.0) or 0.0)
+
+    # Step 4: 散落区方块顶面高度 → block_thickness。
+    if 4 in run:
+        print("\n--- 步骤 4：标定散落区方块顶面高度 ---")
+        print("建议换不同颜色/不同位置采样，最终取中位数。")
+        block_top_points_base = []
+        block_top_points_table = []
+        num_blocks = max(1, block_samples)
+        i = 0
+        while i < num_blocks:
+            pt = require_pose(tf_buffer, f"[步骤 4.{i+1}/{num_blocks}] 方块平放在散落区，吸盘轻触【方块顶面】", base_frame, eef_frame, allow_undo=(i > 0))
+            if isinstance(pt, str) and pt == "UNDO":
+                i -= 1
+                block_top_points_base.pop()
+                block_top_points_table.pop()
+                print(f"  ↩️ 已撤销，重新标定第 {i+1} 个方块高度。")
+                continue
+            block_top_points_base.append(pt)
+            block_top_points_table.append(to_table(R_mat, P, pt))
+            i += 1
+
+        block_top_points_table = np.asarray(block_top_points_table)
+        block_thickness = float(np.median(block_top_points_table[:, 2]))
+    else:
+        print("\n--- 步骤 4：跳过，沿用现有方块厚度 ---")
+        block_thickness = float(cfg_get(tcfg, "BLOCK_THICKNESS", "4"))
+        print(f"  block_thickness = {block_thickness:.6f} m")
+
+    # Step 5: 白色底盘凸起网格 → 仿射网格 + 高度图。
+    if 5 in run:
+        board_mode = choose_board_mode()
+        board_sample_col_row = board_samples_for_mode(board_mode)
+        height_interpolation = choose_height_interpolation(board_mode)
+
+        print("\n--- 步骤 5：白色底盘凸起网格标定 ---")
+        print("坐标显示为 (col,row)，因为底盘是 10 列 x 14 行。")
+        print(f"当前模式 {board_mode}: 需要采 {len(board_sample_col_row)} 个凸起中心。")
+        if board_mode == "C":
+            print("模式 C 会采完整 140 点，耗时较长，但能最好反映白板局部翘曲。如果误按，输入 'u' 撤销！")
+
+        sample_rows = []
+        sample_cols = []
+        sample_points = []
+        sample_records = []
+
+        i = 0
+        while i < len(board_sample_col_row):
+            col, row = board_sample_col_row[i]
+            p_base = require_pose(
+                tf_buffer,
+                f"[步骤 5.{i+1}/{len(board_sample_col_row)}] 吸盘对准【白色底盘凸起中心】 (col={col}, row={row})",
+                base_frame,
+                eef_frame,
+                allow_undo=(i > 0)
+            )
+            if isinstance(p_base, str) and p_base == "UNDO":
+                i -= 1
+                sample_cols.pop()
+                sample_rows.pop()
+                sample_points.pop()
+                sample_records.pop()
+                prev_col, prev_row = board_sample_col_row[i]
+                print(f"  ↩️ 已撤销！退回上一个点 (col={prev_col}, row={prev_row}) 重新记录。")
+                continue
+
+            p_tab = to_table(R_mat, P, p_base)
+            sample_cols.append(col)
+            sample_rows.append(row)
+            sample_points.append(p_tab)
+            sample_records.append({
+                "col": int(col), "row": int(row),
+                "table": [float(p_tab[0]), float(p_tab[1]), float(p_tab[2])],
+                "link_base": [float(p_base[0]), float(p_base[1]), float(p_base[2])],
+            })
+            i += 1
+
+        sample_points = np.asarray(sample_points, dtype=float)
+        sample_rows = np.asarray(sample_rows, dtype=float)
+        sample_cols = np.asarray(sample_cols, dtype=float)
+
+        origin, row_vec, col_vec, xy_rms, grid_z_rms = fit_affine_grid(sample_rows, sample_cols, sample_points)
+
+        q_coef = None
+        q_height_map = None
+        q_std = None
+        q_max = None
+        if len(sample_rows) >= 9:
+            q_coef, q_height_map, q_std, q_max = fit_quadratic_height(sample_rows, sample_cols, sample_points[:, 2])
+
+        idw_height_map = idw_interpolate(sample_rows, sample_cols, sample_points[:, 2], ROWS, COLS)
+
+        if height_interpolation == "quadratic" and q_height_map is not None:
+            bump_height_map = q_height_map
+            height_model_type = "quadratic"
+            height_std = q_std
+            height_max_abs = q_max
+        else:
+            bump_height_map = idw_height_map
+            height_model_type = "idw"
+            # For IDW, compute residual at measured samples. In Mode C exact values should be zero.
+            pred_at_samples = []
+            for r, c in zip(sample_rows.astype(int), sample_cols.astype(int)):
+                pred_at_samples.append(bump_height_map[int(r)][int(c)])
+            pred_at_samples = np.asarray(pred_at_samples)
+            residual = sample_points[:, 2] - pred_at_samples
+            height_std = float(np.std(residual))
+            height_max_abs = float(np.max(np.abs(residual)))
+
+        height_model_info = {
+            "selected_type": height_model_type,
+            "idw": {
+                "power": 2.0,
+                "residual_std_m_at_samples": float(height_std) if height_model_type == "idw" else None,
+                "residual_max_abs_m_at_samples": float(height_max_abs) if height_model_type == "idw" else None,
+            },
+            "quadratic": {
+                "available": q_coef is not None,
+                "z =": "a0 + ar*r + ac*c + arr*r^2 + acc*c^2 + arc*r*c, r/c normalized to 0..1",
+                "coefficients": [float(v) for v in q_coef] if q_coef is not None else [],
+                "residual_std_m": float(q_std) if q_std is not None else None,
+                "residual_max_abs_m": float(q_max) if q_max is not None else None,
+            },
+            "selected_residual_std_m": float(height_std),
+            "selected_residual_max_abs_m": float(height_max_abs),
+        }
+    else:
+        print("\n--- 步骤 5：跳过，沿用现有白板网格/高度图 ---")
+        origin = np.asarray(cfg_get(tcfg, "BOARD_ORIGIN_TABLE", "5"), dtype=float)
+        row_vec = np.asarray(cfg_get(tcfg, "BOARD_ROW_STEP_TABLE", "5"), dtype=float)
+        col_vec = np.asarray(cfg_get(tcfg, "BOARD_COL_STEP_TABLE", "5"), dtype=float)
+        bump_height_map = cfg_get(tcfg, "BOARD_BUMP_HEIGHT_MAP_14x10", "5")
+        height_model_info = tcfg.get("BOARD_BUMP_HEIGHT_MODEL", {}) or {}
+        sample_records = tcfg.get("BOARD_SAMPLES_TABLE", []) or []
+        bcm = tcfg.get("BOARD_CALIBRATION_MODE", {}) or {}
+        board_mode = str(bcm.get("mode", "?"))
+        board_sample_col_row = sample_records
+        xy_rms = float(tcfg.get("BOARD_GRID_FIT_RMS_XY_M", 0.0) or 0.0)
+        grid_z_rms = float(tcfg.get("BOARD_GRID_FIT_RMS_Z_M", 0.0) or 0.0)
+        height_model_type = str(height_model_info.get("selected_type", "?"))
+        height_interpolation = height_model_type
+        height_std = float(height_model_info.get("selected_residual_std_m") or 0.0)
+        height_max_abs = float(height_model_info.get("selected_residual_max_abs_m") or 0.0)
+        rows_n = len(bump_height_map)
+        cols_n = len(bump_height_map[0]) if rows_n else 0
+        print(f"  网格/高度图沿用现有 {rows_n}x{cols_n}，高度模型={height_model_type}")
 
     # Step 6: 复用 Step 2 的深度平面内点，转入 table 系得放置面 Z（同一物理白板，不再触点）。
-    print("\n--- 步骤 6：白色底盘无凸起平面高度（复用 Step 2 深度平面）---")
-    inl_base_s6 = first["inliers_base"]
-    if len(inl_base_s6) > 2000:
-        sel = np.linspace(0, len(inl_base_s6) - 1, 2000).astype(int)
-        inl_base_s6 = inl_base_s6[sel]
-    surface_points = (inl_base_s6 - P) @ R_mat   # base→table（逐行 R_mat.T·(p-P)）
-    board_surface_z = float(np.median(surface_points[:, 2]))
-    surf_a, surf_b, surf_c, board_surf_std = fit_plane_xyz(surface_points)
-    print("  放置面 z(table) 中值: {:.6f} m, 平面拟合残差 std: {:.3f} mm".format(
-        board_surface_z, board_surf_std * 1000.0))
+    if 6 in run:
+        print("\n--- 步骤 6：白色底盘无凸起平面高度（复用 Step 2 深度平面）---")
+        inl_base_s6 = first["inliers_base"]
+        if len(inl_base_s6) > 2000:
+            sel = np.linspace(0, len(inl_base_s6) - 1, 2000).astype(int)
+            inl_base_s6 = inl_base_s6[sel]
+        surface_points = (inl_base_s6 - P) @ R_mat   # base→table（逐行 R_mat.T·(p-P)）
+        board_surface_z = float(np.median(surface_points[:, 2]))
+        surf_a, surf_b, surf_c, board_surf_std = fit_plane_xyz(surface_points)
+        print("  放置面 z(table) 中值: {:.6f} m, 平面拟合残差 std: {:.3f} mm".format(
+            board_surface_z, board_surf_std * 1000.0))
 
-    use_bump_height_for_place = ask_yes_no(
-        "放置高度是否按局部凸起/鼓包高度补偿？如果方块主要压在凸起上，选是；如果落在底板平面上，选否",
-        default=True,
-    )
+        use_bump_height_for_place = ask_yes_no(
+            "放置高度是否按局部凸起/鼓包高度补偿？如果方块主要压在凸起上，选是；如果落在底板平面上，选否",
+            default=True,
+        )
 
-    place_z_margin = float(rospy.get_param("~place_z_margin", 0.0))
-    try:
-        txt = input(f"放置高度额外余量 place_z_margin，单位 m [默认 {place_z_margin:.4f}]: ").strip()
-        if txt:
-            place_z_margin = float(txt)
-    except Exception:
-        pass
+        place_z_margin = float(rospy.get_param("~place_z_margin", 0.0))
+        try:
+            txt = input(f"放置高度额外余量 place_z_margin，单位 m [默认 {place_z_margin:.4f}]: ").strip()
+            if txt:
+                place_z_margin = float(txt)
+        except Exception:
+            pass
+    else:
+        print("\n--- 步骤 6：跳过，沿用现有放置面/放置高度设置 ---")
+        board_surface_z = float(tcfg.get("BOARD_SURFACE_Z", 0.0) or 0.0)
+        sp = cfg_get(tcfg, "BOARD_SURFACE_PLANE", "6")
+        surf_a = float(sp.get("a", 0.0))
+        surf_b = float(sp.get("b", 0.0))
+        surf_c = float(sp.get("c", board_surface_z))
+        board_surf_std = float(sp.get("residual_std_m", 0.0) or 0.0)
+        use_bump_height_for_place = bool(tcfg.get("USE_BUMP_HEIGHT_FOR_PLACE", True))
+        place_z_margin = float(tcfg.get("PLACE_Z_MARGIN", 0.0) or 0.0)
+        print(f"  use_bump={use_bump_height_for_place}, place_z_margin={place_z_margin:.4f} m")
 
+    # 派生输出：放置高度图/中心点/legacy 字段。无论跑哪些步骤都按当前(新或旧)值重算，
+    # 以保证它们与 block_thickness / 网格 / 放置面设置一致。
     place_z_map = []
     for r in range(ROWS):
         row = []
@@ -782,23 +1005,63 @@ def main():
     hover_z = place_z_legacy + 0.10
     pick_z = float(block_thickness)
 
-    height_model_info = {
-        "selected_type": height_model_type,
-        "idw": {
-            "power": 2.0,
-            "residual_std_m_at_samples": float(height_std) if height_model_type == "idw" else None,
-            "residual_max_abs_m_at_samples": float(height_max_abs) if height_model_type == "idw" else None,
-        },
-        "quadratic": {
-            "available": q_coef is not None,
-            "z =": "a0 + ar*r + ac*c + arr*r^2 + acc*c^2 + arc*r*c, r/c normalized to 0..1",
-            "coefficients": [float(v) for v in q_coef] if q_coef is not None else [],
-            "residual_std_m": float(q_std) if q_std is not None else None,
-            "residual_max_abs_m": float(q_max) if q_max is not None else None,
-        },
-        "selected_residual_std_m": float(height_std),
-        "selected_residual_max_abs_m": float(height_max_abs),
-    }
+    # Step 7: 波纹管长度补偿（可选）。所有几何标定都用硬吸嘴(link_tcp)完成；波纹管挂在
+    # 吸嘴尖下方、软、会压缩。这里只把它换算成一个【下扎 Z 偏置】，不影响 XY/单应性/射线
+    # 求交（那些是几何位置，波纹管不改变；积木高度视差另由控制/路径节点处理）。
+    # 推导：tcp_*_offset_z = 波纹管自由长度 L − 期望密封压缩量 δ（正值=抬高吸嘴给波纹管让位）。
+    bellows_cfg = None
+    if 7 in run:
+        print("\n--- 步骤 7：波纹管长度补偿（两次触碰测量）---")
+        print("所有几何标定都用硬吸嘴(link_tcp)完成；波纹管挂在吸嘴尖下方、软、会压缩。")
+        print("先拆波纹管用吸嘴尖触碰发光板，再装上波纹管触碰同一点，两次 link_tcp 高度差即自由长度。")
+        print("它只换算成下扎 Z 偏置(tcp_pick/place_offset_z)，不进入 XY/单应性/射线求交。")
+        prev_pick = float(tcfg.get("BELLOWS_PICK_COMPRESSION_M", 0.004) or 0.004)
+        prev_place = float(tcfg.get("BELLOWS_PLACE_COMPRESSION_M", 0.003) or 0.003)
+        # 投影轴优先用 align_tool_to_board 写入的对齐法向；缺失时回退步骤2的板面法向。
+        align_cfg = tcfg.get("TOOL_BOARD_ALIGN", {}) or {}
+        align_normal = align_cfg.get("normal_base")
+        if align_normal:
+            n_up = normalize(np.asarray(align_normal, dtype=float), "aligned board normal")
+            print("  投影轴：使用 align_tool_to_board 写入的板面法向 TOOL_BOARD_ALIGN.normal_base。")
+        else:
+            n_up = normalize(np.asarray(surface_normal_base, dtype=float), "board normal")
+            print("  投影轴：未找到 TOOL_BOARD_ALIGN，回退用步骤2的板面法向。")
+
+        bellows_len = None
+        while True:
+            p_nozzle = require_pose(tf_buffer, "[步骤 7.1] 【拆掉波纹管】，用吸嘴尖轻触发光板上某一点", base_frame, eef_frame, allow_undo=False)
+            p_bellows = require_pose(tf_buffer, "[步骤 7.2] 【装上波纹管】，在同一点用波纹管尖轻触发光板", base_frame, eef_frame, allow_undo=True)
+            if isinstance(p_bellows, str) and p_bellows == "UNDO":
+                print("  ↩️ 已撤销，重新测量（从吸嘴触碰开始）。")
+                continue
+            # 沿板面法向投影两次 link_tcp 的差 = 波纹管自由长度（对两次落点的微小横向差不敏感）。
+            L = float(np.dot(p_bellows - p_nozzle, n_up))
+            if L <= 1e-4:
+                print(f"  ⚠️ 量出的长度 = {L*1000:.1f} mm，异常（可能两次顺序反了/触碰太轻）。")
+                if ask_yes_no("重新测量？", default=True):
+                    continue
+                print("  跳过波纹管步骤（不写入）。")
+                break
+            bellows_len = L
+            break
+
+        if bellows_len is not None:
+            print(f"  ✅ 波纹管自由长度 L = {bellows_len*1000:.1f} mm")
+            bellows_pick_press = ask_float("抓取期望密封压缩量 δ_pick，单位 m", prev_pick)
+            bellows_place_press = ask_float("放置期望压缩量 δ_place（别太大以免压乱已放方块），单位 m", prev_place)
+            tcp_pick_offset_z = bellows_len - bellows_pick_press
+            tcp_place_offset_z = bellows_len - bellows_place_press
+            bellows_cfg = {
+                "BELLOWS_FREE_LENGTH_M": float(bellows_len),
+                "BELLOWS_PICK_COMPRESSION_M": float(bellows_pick_press),
+                "BELLOWS_PLACE_COMPRESSION_M": float(bellows_place_press),
+                # = L − δ；控制/路径节点会从 /tetris/TCP_*_OFFSET_Z 自动读取（launch 同名参数可覆盖）。
+                "TCP_PICK_OFFSET_Z": float(tcp_pick_offset_z),
+                "TCP_PLACE_OFFSET_Z": float(tcp_place_offset_z),
+            }
+            print("\n✅ 波纹管补偿（正值=抬高吸嘴给波纹管让位，已写入 /tetris，节点自动读取）：")
+            print(f"  tcp_pick_offset_z  = {tcp_pick_offset_z:.4f} m")
+            print(f"  tcp_place_offset_z = {tcp_place_offset_z:.4f} m")
 
     inl_all = first["inliers_base"]
     if len(inl_all) > 300:
@@ -858,7 +1121,7 @@ def main():
                     "A": "9 points",
                     "B": "25 points",
                     "C": "140 points",
-                }[board_mode],
+                }.get(board_mode, f"{len(board_sample_col_row)} points"),
             },
             "BOARD_SAMPLE_FORMAT": "samples are prompted as (col,row), stored internally as row/col",
             "BOARD_SAMPLES_TABLE": sample_records,
@@ -885,9 +1148,18 @@ def main():
         }
     }
 
+    if bellows_cfg is not None:
+        config["tetris"].update(bellows_cfg)
+
+    # 合并写回：只更新本次产出的键，其余键（含手眼/单应性等其它工具写入的内容）原样保留。
+    out_cfg = existing_cfg if isinstance(existing_cfg, dict) else {}
+    merged_tetris = dict(out_cfg.get("tetris", {})) if isinstance(out_cfg.get("tetris"), dict) else {}
+    merged_tetris.update(config["tetris"])
+    out_cfg["tetris"] = merged_tetris
+
     os.makedirs(os.path.dirname(config_path), exist_ok=True)
     with open(config_path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(config, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        yaml.safe_dump(out_cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
     print("\n🎉 增强标定完成！")
     print("配置已保存:", config_path)
@@ -904,6 +1176,9 @@ def main():
     print(f"  9/25/140 点网格 XY 拟合 RMS: {xy_rms*1000:.3f} mm")
     print(f"  底板无凸起平面拟合残差 std: {board_surf_std*1000:.3f} mm")
     print(f"  PLACE_Z extra margin: {place_z_margin*1000:.3f} mm")
+    if bellows_cfg is not None:
+        print(f"  波纹管补偿: 推荐 tcp_pick_offset_z={bellows_cfg['TCP_PICK_OFFSET_Z']:.4f} m, "
+              f"tcp_place_offset_z={bellows_cfg['TCP_PLACE_OFFSET_Z']:.4f} m（记得同步到 launch）")
     print("\n建议：")
     print("  - 如果白板局部翘曲明显，优先用模式 C=140 点。")
     print("  - 抓取 Z 由视觉/路径节点用 RealSense 深度在线获得，无需再标定抓取面。")
