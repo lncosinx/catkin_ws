@@ -9,11 +9,12 @@ table_frame 的竖直方向（D1：实测 base-Z 不垂直于桌面，改用板�
 抓取点 Z 由 RealSense 对齐深度在线获得，见 vision / path_planner 节点。
 
 流程：
-  步骤2  在白板平坦(无凸起)表面均匀采点 → PCA 拟合板面 → 法向定义 table_frame 的 Z 轴。
+  步骤2  单机位对齐深度多帧中值 + ROI + RANSAC 拟板面 → 法向定义 table_frame 的 Z 轴
+         （D2：随机噪声靠多帧×几千像素打平，系统偏置靠走位差分验证步量出）。
   步骤3  选 table_frame 原点 P 与 +X 方向（投影到板面）。
   步骤4  采方块顶面高度 → block_thickness（放置 Z = 凸起/板面高度 + block_thickness + 余量）。
   步骤5  采白板凸起网格 (A=9 / B=25 / C=140) → 仿射网格 + 高度图。
-  步骤6  采白板无凸起平面 → BOARD_SURFACE_PLANE（table 系，应近似水平）。
+  步骤6  复用步骤2的深度平面内点转入 table 系 → BOARD_SURFACE_PLANE（应近似水平）。
 
 主要输出（写入 tetris_config.yaml）：
   table_tf, BOARD_CENTERS_14x10_TABLE, PLACE_Z_MAP_14x10, BOARD_BUMP_HEIGHT_MAP_14x10,
@@ -30,8 +31,18 @@ import yaml
 import rospy
 import tf2_ros
 import numpy as np
-from sensor_msgs.msg import CameraInfo
-from tf.transformations import euler_from_matrix
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
+from sensor_msgs.msg import CameraInfo, Image
+from tf.transformations import euler_from_matrix, quaternion_matrix
+
+
+DEPTH_TOPIC_DEFAULT = "/camera/aligned_depth_to_color/image_raw"
+CAMERA_FRAME_DEFAULT = "camera_color_optical_frame"
 
 
 DEFAULT_CONFIG_PATH = "/root/catkin_ws/src/tly/config/tetris_config.yaml"
@@ -94,23 +105,6 @@ def normalize(v, name="vector"):
 
 def project_point_to_plane(point, plane_point, normal):
     return point - np.dot(point - plane_point, normal) * normal
-
-
-def fit_plane_pca(points_base):
-    pts = np.asarray(points_base, dtype=float)
-    centroid = np.mean(pts, axis=0)
-    q = pts - centroid
-    _, _, vh = np.linalg.svd(q, full_matrices=False)
-    normal = normalize(vh[-1], "surface normal")
-
-    # link_base usually has +Z upward. Force normal roughly upward.
-    if normal[2] < 0:
-        normal = -normal
-
-    signed = q.dot(normal)
-    rms = float(np.sqrt(np.mean(signed ** 2)))
-    max_abs = float(np.max(np.abs(signed)))
-    return centroid, normal, signed, rms, max_abs
 
 
 def to_table(R_mat, P, point_base):
@@ -223,27 +217,238 @@ def get_camera_info():
         return 911.8016, 911.2428, 634.7139, 357.0596
 
 
-def choose_pick_surface_sample_count():
-    val = rospy.get_param("~pick_surface_samples", 0)
+# ---------------------------------------------------------------------------
+# 深度采板面（替代旧的触点 Step 2 / Step 6）
+# ---------------------------------------------------------------------------
+
+def load_existing_config(path):
+    """读取已有 YAML 配置（用于复用持久化的 ROI 等）。缺失时返回 {}。"""
     try:
-        val = int(val)
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        if isinstance(data, dict):
+            return data
     except Exception:
-        val = 0
+        pass
+    return {}
 
-    if val in (9, 16):
-        return val
 
-    while True:
-        ans = input("白板平面拟合采样点数选择 9 或 16 [默认 16]: ").strip()
-        if ans == "":
-            return 16
+def parse_roi(val):
+    """把 ~board_roi 解析成 [u0,v0,w,h]；接受 list 或 'u0,v0,w,h' 字符串；非法返回 None。"""
+    if val is None:
+        return None
+    if isinstance(val, str):
+        parts = [p for p in val.replace(",", " ").split() if p]
+        if len(parts) != 4:
+            return None
         try:
-            n = int(ans)
-            if n in (9, 16):
-                return n
+            return [int(float(p)) for p in parts]
         except Exception:
-            pass
-        print("请输入 9 或 16。")
+            return None
+    try:
+        seq = list(val)
+        if len(seq) < 4:
+            return None
+        return [int(seq[0]), int(seq[1]), int(seq[2]), int(seq[3])]
+    except Exception:
+        return None
+
+
+def depth_msg_to_meters(msg):
+    """sensor_msgs/Image 深度帧 → float32 米。支持 16UC1(mm) / 32FC1(m)。"""
+    if msg.encoding in ("16UC1", "mono16"):
+        arr = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
+        depth = arr.astype(np.float32) / 1000.0
+    elif msg.encoding == "32FC1":
+        arr = np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width)
+        depth = arr.astype(np.float32).copy()
+    else:
+        raise RuntimeError("不支持的深度编码: %s" % msg.encoding)
+    depth[~np.isfinite(depth)] = 0.0
+    return depth
+
+
+def grab_median_depth(depth_topic, n_frames, timeout=5.0):
+    """静止连抓 n_frames 帧，逐像素对有效(>0)样本取中值，返回米制 HxW。"""
+    print(f"  连抓 {n_frames} 帧深度做逐像素中值（保持静止）...")
+    stack = []
+    h = w = None
+    for _ in range(max(1, n_frames)):
+        try:
+            msg = rospy.wait_for_message(depth_topic, Image, timeout=timeout)
+        except Exception as e:
+            print(f"  ⚠️ 等待深度帧失败: {e}")
+            continue
+        d = depth_msg_to_meters(msg)
+        if h is None:
+            h, w = d.shape
+        elif d.shape != (h, w):
+            continue
+        stack.append(d)
+    if not stack:
+        raise RuntimeError("未取到任何深度帧，检查 %s 是否在线" % depth_topic)
+    arr = np.stack(stack, axis=0)
+    arr[arr <= 0.0] = np.nan
+    with np.errstate(all="ignore"):
+        median = np.nanmedian(arr, axis=0)
+    median[~np.isfinite(median)] = 0.0
+    print(f"  ✅ 有效帧 {len(stack)}/{n_frames}")
+    return median.astype(np.float32)
+
+
+def depth_preview(depth_m):
+    """把米制深度图转成 8-bit 伪彩预览，供拖框用。"""
+    valid = depth_m[depth_m > 0]
+    if valid.size == 0:
+        lo, hi = 0.0, 1.0
+    else:
+        lo, hi = float(np.percentile(valid, 2)), float(np.percentile(valid, 98))
+    if hi - lo < 1e-6:
+        hi = lo + 1e-6
+    norm = np.clip((depth_m - lo) / (hi - lo), 0.0, 1.0)
+    img8 = (norm * 255).astype(np.uint8)
+    img8[depth_m <= 0] = 0
+    return cv2.applyColorMap(img8, cv2.COLORMAP_JET)
+
+
+def select_roi_interactive(depth_m):
+    """在深度预览上拖一个矩形 ROI。返回 [u0,v0,w,h] 或 None。"""
+    if cv2 is None:
+        raise RuntimeError("cv2 不可用，无法交互框选；请用 ~board_roi 给定矩形")
+    preview = depth_preview(depth_m)
+    win = "select board ROI (drag a box, ENTER=ok, c=cancel)"
+    r = cv2.selectROI(win, preview, showCrosshair=False, fromCenter=False)
+    cv2.destroyWindow(win)
+    u0, v0, w, h = [int(v) for v in r]
+    if w <= 0 or h <= 0:
+        return None
+    return [u0, v0, w, h]
+
+
+def resolve_roi(depth_m, prior_roi, param_roi, force_interactive):
+    """优先级: force_interactive > ~board_roi 参数 > 持久化 ROI > 交互框选。"""
+    if not force_interactive:
+        if param_roi is not None:
+            return list(param_roi), "param"
+        if prior_roi is not None:
+            return list(prior_roi), "persisted"
+    roi = select_roi_interactive(depth_m)
+    if roi is None:
+        raise RuntimeError("未选择有效 ROI")
+    return roi, "interactive"
+
+
+def deproject_roi(depth_m, roi, z_range, intr):
+    """ROI + 深度范围门 → Nx3 相机系点（光学系：x右 y下 z前）。"""
+    fx, fy, cx, cy = intr
+    u0, v0, w, h = roi
+    H, W = depth_m.shape
+    u0 = max(0, min(int(u0), W - 1))
+    v0 = max(0, min(int(v0), H - 1))
+    u1 = max(u0 + 1, min(u0 + int(w), W))
+    v1 = max(v0 + 1, min(v0 + int(h), H))
+    sub = depth_m[v0:v1, u0:u1]
+    us, vs = np.meshgrid(np.arange(u0, u1), np.arange(v0, v1))
+    z = sub.reshape(-1).astype(np.float64)
+    us = us.reshape(-1).astype(np.float64)
+    vs = vs.reshape(-1).astype(np.float64)
+    zmin, zmax = float(z_range[0]), float(z_range[1])
+    m = (z > max(1e-3, zmin)) & (z < zmax)
+    z, us, vs = z[m], us[m], vs[m]
+    x = (us - cx) * z / fx
+    y = (vs - cy) * z / fy
+    return np.stack([x, y, z], axis=1)
+
+
+def ransac_plane(points, thresh=0.004, iters=300, min_inliers_frac=0.3, seed=0):
+    """RANSAC 主平面 → (normal, centroid, inlier_mask)，内点上 PCA 复拟合。"""
+    pts = np.asarray(points, dtype=float)
+    n = len(pts)
+    if n < 50:
+        raise RuntimeError("ROI 内有效深度点太少(%d)，调整 ROI/深度范围" % n)
+    rng = np.random.default_rng(seed)
+    best_inliers, best_count = None, -1
+    for _ in range(iters):
+        idx = rng.choice(n, size=3, replace=False)
+        p0, p1, p2 = pts[idx]
+        nrm = np.cross(p1 - p0, p2 - p0)
+        ln = np.linalg.norm(nrm)
+        if ln < 1e-9:
+            continue
+        nrm = nrm / ln
+        inliers = np.abs((pts - p0).dot(nrm)) < thresh
+        c = int(np.count_nonzero(inliers))
+        if c > best_count:
+            best_count, best_inliers = c, inliers
+    if best_inliers is None or best_count < max(50, int(min_inliers_frac * n)):
+        raise RuntimeError("RANSAC 未找到稳定平面(inliers=%d/%d)" % (best_count, n))
+    inl = pts[best_inliers]
+    centroid = inl.mean(axis=0)
+    _, _, vh = np.linalg.svd(inl - centroid, full_matrices=False)
+    normal = vh[-1]
+    normal = normal / np.linalg.norm(normal)
+    return normal, centroid, best_inliers
+
+
+def lookup_R_t(tf_buffer, target_frame, source_frame, timeout=3.0):
+    """返回 source→target 的 (R 3x3, t 3)，即 point_target = R·point_source + t。"""
+    tr = tf_buffer.lookup_transform(target_frame, source_frame, rospy.Time(0), rospy.Duration(timeout))
+    q = tr.transform.rotation
+    R = quaternion_matrix([q.x, q.y, q.z, q.w])[:3, :3]
+    t = np.array([tr.transform.translation.x,
+                  tr.transform.translation.y,
+                  tr.transform.translation.z], dtype=float)
+    return R, t
+
+
+def fit_plane_capture(tf_buffer, depth_m, roi, z_range, intr, camera_frame, base_frame,
+                      thresh, iters, min_inliers_frac=0.3):
+    """从一张(已多帧中值的)深度图拟板面，并转入 base 系。返回结果字典。"""
+    pts_cam = deproject_roi(depth_m, roi, z_range, intr)
+    normal_cam, centroid_cam, inliers = ransac_plane(pts_cam, thresh=thresh, iters=iters,
+                                                     min_inliers_frac=min_inliers_frac)
+    R, t = lookup_R_t(tf_buffer, base_frame, camera_frame)   # camera → base
+    inl_cam = pts_cam[inliers]
+    inl_base = inl_cam.dot(R.T) + t
+    centroid_base = centroid_cam.dot(R.T) + t
+    normal_base = R.dot(normal_cam)
+    normal_base = normal_base / np.linalg.norm(normal_base)
+    if normal_base[2] < 0:                     # link_base +Z 大致向上
+        normal_base = -normal_base
+        normal_cam = -normal_cam
+    signed = (inl_base - centroid_base).dot(normal_base)
+    return {
+        "normal_cam": normal_cam, "centroid_cam": centroid_cam,
+        "normal_base": normal_base, "centroid_base": centroid_base,
+        "inliers_base": inl_base,
+        "inlier_count": int(len(inl_base)), "total": int(len(pts_cam)),
+        "rms": float(np.sqrt(np.mean(signed ** 2))),
+        "max_abs": float(np.max(np.abs(signed))),
+        "cam_dist": float(normal_cam.dot(centroid_cam)),   # 相机原点→平面的有符号距离
+        "cam_R": R, "cam_t": t,
+    }
+
+
+def verify_motion_report(first, second):
+    """走位差分：用两个机位的深度+TF 互校，估深度尺度、法向一致性、base-Z↔法向夹角。"""
+    c1, c2 = first["cam_t"], second["cam_t"]
+    dmove = c2 - c1
+    n = first["normal_base"]
+    move_along_normal = float(n.dot(dmove))
+    meas = abs(second["cam_dist"]) - abs(first["cam_dist"])
+    pred = -move_along_normal                  # 朝平面靠近 → 相机距离变小
+    scale = float(meas / pred) if abs(pred) > 1e-4 else float("nan")
+    cosc = float(np.clip(abs(first["normal_base"].dot(second["normal_base"])), -1.0, 1.0))
+    return {
+        "move_base_m": [float(v) for v in dmove],
+        "move_norm_m": float(np.linalg.norm(dmove)),
+        "move_along_normal_m": move_along_normal,
+        "measured_cam_dist_delta_m": float(meas),
+        "predicted_cam_dist_delta_m": float(pred),
+        "depth_scale_ratio": scale,
+        "normal_consistency_deg": float(np.degrees(np.arccos(cosc))),
+        "baseZ_to_normal_deg": float(np.degrees(np.arccos(np.clip(abs(n[2]), -1.0, 1.0)))),
+    }
 
 
 def choose_board_mode():
@@ -262,21 +467,6 @@ def choose_board_mode():
         if ans in ("A", "B", "C"):
             return ans
         print("请输入 A、B 或 C。")
-
-
-def surface_prompt_positions(n):
-    if n == 9:
-        return [
-            "左上", "上中", "右上",
-            "左中", "中心", "右中",
-            "左下", "下中", "右下",
-        ]
-    return [
-        "第1行第1列", "第1行第2列", "第1行第3列", "第1行第4列",
-        "第2行第1列", "第2行第2列", "第2行第3列", "第2行第4列",
-        "第3行第1列", "第3行第2列", "第3行第3列", "第3行第4列",
-        "第4行第1列", "第4行第2列", "第4行第3列", "第4行第4列",
-    ]
 
 
 def board_samples_for_mode(mode):
@@ -322,55 +512,94 @@ def main():
 
     config_path = rospy.get_param("~config_path", DEFAULT_CONFIG_PATH)
     block_samples = int(rospy.get_param("~block_samples", 3))
-    board_surface_samples = int(rospy.get_param("~board_surface_samples", 5))
 
-    pick_surface_samples = choose_pick_surface_sample_count()
+    # 深度采板面相关参数（替代旧的触点 Step 2 / Step 6）。
+    depth_topic = rospy.get_param("~depth_topic", DEPTH_TOPIC_DEFAULT)
+    camera_frame = rospy.get_param("~camera_frame", CAMERA_FRAME_DEFAULT)
+    capture_frames = int(rospy.get_param("~board_capture_frames", 50))
+    roi_z = rospy.get_param("~board_roi_z", [0.10, 1.50])
+    roi_z = [float(roi_z[0]), float(roi_z[1])]
+    param_roi = parse_roi(rospy.get_param("~board_roi", None))
+    roi_force_interactive = bool(rospy.get_param("~board_roi_force_interactive", False))
+    ransac_thresh = float(rospy.get_param("~board_ransac_thresh_m", 0.004))
+    ransac_iters = int(rospy.get_param("~board_ransac_iters", 300))
+    min_inliers_frac = float(rospy.get_param("~board_min_inliers_frac", 0.3))
+    do_verify = bool(rospy.get_param("~board_verify_scale", True))
+
+    existing_cfg = load_existing_config(config_path)
+    prior_roi = None
+    try:
+        prior_roi = existing_cfg.get("tetris", {}).get("BOARD_DEPTH_ROI", {}).get("roi", None)
+        prior_roi = [int(v) for v in prior_roi] if prior_roi else None
+    except Exception:
+        prior_roi = None
+
     board_mode = choose_board_mode()
     board_sample_col_row = board_samples_for_mode(board_mode)
     height_interpolation = choose_height_interpolation(board_mode)
 
     print("\n" + "=" * 94)
-    print("=== 俄罗斯方块增强标定工具：真实抓取平面 + 白板 A/B/C 多模式标定 ===")
-    print(f"= 抓取/散落平面采样: {pick_surface_samples} 点")
+    print("=== 俄罗斯方块标定工具：单帧深度拟板面 + 白板 A/B/C 多模式标定 ===")
+    print(f"= 板面法向/放置面: 深度采集 {capture_frames} 帧中值 + RANSAC（ROI 框选）")
     print(f"= 白板模式: {board_mode}，采样 {len(board_sample_col_row)} 个凸起中心")
     print(f"= 白板高度插值: {height_interpolation}")
-    print("= 所有点都用吸盘中心轻触目标点，不要压弯发光板/白板。")
+    print("= 凸起/方块/原点仍用吸盘轻触；板面法向与放置高度改由深度采集。")
     print("= (新增) 如果标定失误，可以输入 'u' 撤销并重新记录上一个点。")
     print("=" * 94 + "\n")
 
     # Step 1.
     start_pose = require_pose(tf_buffer, "[步骤 1] 请将机械臂移动到【视觉拍照起点高度】", base_frame, eef_frame)
     cam_fx, cam_fy, cam_cx, cam_cy = get_camera_info()
+    intr = (cam_fx, cam_fy, cam_cx, cam_cy)
 
-    # Step 2: fit the white board plane (defines table_frame vertical / Z axis).
-    print("\n--- 步骤 2：多点拟合【白板平坦表面】(定义 table_frame 竖直方向) ---")
-    print("请在白板【平坦、无凸起】区域均匀采点。不要采凸起顶面，也不要采方块顶面。")
-    scatter_surface_points = []
-    labels = surface_prompt_positions(pick_surface_samples)
-    i = 0
-    while i < len(labels):
-        label = labels[i]
-        p = require_pose(
-            tf_buffer,
-            f"[步骤 2.{i+1}/{len(labels)}] 吸盘轻触【白板平坦(无凸起)表面】【{label}】点",
-            base_frame,
-            eef_frame,
-            allow_undo=(i > 0)
-        )
-        if isinstance(p, str) and p == "UNDO":
-            i -= 1
-            scatter_surface_points.pop()
-            print(f"  ↩️ 已撤销，重新回到上一个点:【{labels[i]}】。")
-            continue
-        scatter_surface_points.append(p)
-        i += 1
-    scatter_surface_points = np.asarray(scatter_surface_points, dtype=float)
+    if cv2 is None and param_roi is None and prior_roi is None and not roi_force_interactive:
+        print("⚠️ 未能导入 cv2，无法交互框选 ROI；请用 ~board_roi 参数给定矩形后重跑。")
 
-    surface_centroid_base, surface_normal_base, signed_resid, surf_rms, surf_max = fit_plane_pca(scatter_surface_points)
+    # Step 2: 单机位深度拟板面，法向定义 table_frame 竖直方向 (D1)。
+    # 同一平面后续也用于放置面 Z (Step 6)。
+    print("\n--- 步骤 2：深度拟合【白板平坦表面】(定义 table_frame 竖直方向) ---")
+    print("把相机摆到能清楚看到【空白板平坦区】的位置，保持静止后按回车开始采集。")
+    input("  就绪后按回车... ")
+    if not tf_buffer.can_transform(base_frame, camera_frame, rospy.Time(0), rospy.Duration(5.0)):
+        rospy.logerr("TF 缺失: %s <- %s（确认手眼发布在线）", base_frame, camera_frame)
+        sys.exit(1)
+
+    depth0 = grab_median_depth(depth_topic, capture_frames)
+    roi, roi_src = resolve_roi(depth0, prior_roi, param_roi, roi_force_interactive)
+    print(f"  ROI={roi}（来源:{roi_src}），深度范围={roi_z} m")
+
+    first = fit_plane_capture(tf_buffer, depth0, roi, roi_z, intr,
+                              camera_frame, base_frame, ransac_thresh, ransac_iters,
+                              min_inliers_frac)
+    surface_centroid_base = first["centroid_base"]
+    surface_normal_base = first["normal_base"]
+    surf_rms = first["rms"]
+    surf_max = first["max_abs"]
+
     print("\n✅ 白板平面拟合完成（法向作为 table_frame 竖直方向）：")
+    print("  内点/总点: {}/{}".format(first["inlier_count"], first["total"]))
     print("  normal(base): [{:.6f}, {:.6f}, {:.6f}]".format(*surface_normal_base))
     print("  centroid(base): [{:.6f}, {:.6f}, {:.6f}]".format(*surface_centroid_base))
     print("  residual RMS/max: {:.3f} / {:.3f} mm".format(surf_rms * 1000.0, surf_max * 1000.0))
+
+    # 走位差分验证/深度尺度（不改变所存平面，仅报告）。
+    verify_report = None
+    if do_verify and ask_yes_no("是否做【走位差分验证/深度尺度】？(手动 free-drive 挪一小段再采)", default=True):
+        try:
+            input("  把相机沿任意方向(建议沿法向)挪 2~5cm，保持仍看白板，静止后按回车... ")
+            depth1 = grab_median_depth(depth_topic, capture_frames)
+            second = fit_plane_capture(tf_buffer, depth1, roi, roi_z, intr,
+                                       camera_frame, base_frame, ransac_thresh, ransac_iters,
+                                       min_inliers_frac)
+            verify_report = verify_motion_report(first, second)
+            print("  位移|Δ|={:.1f}mm, 沿法向={:.1f}mm".format(
+                verify_report["move_norm_m"] * 1000.0, verify_report["move_along_normal_m"] * 1000.0))
+            print("  深度尺度比(应≈1.0): {:.4f}".format(verify_report["depth_scale_ratio"]))
+            print("  两次法向夹角(应≈0): {:.3f}°".format(verify_report["normal_consistency_deg"]))
+            print("  base-Z 与板面法向夹角: {:.3f}°".format(verify_report["baseZ_to_normal_deg"]))
+        except Exception as e:
+            print(f"  ⚠️ 验证步失败（不影响标定）: {e}")
+            verify_report = None
 
     # Step 3: table_frame.
     print("\n--- 步骤 3：定义 table_frame 原点和 X 方向 ---")
@@ -500,24 +729,17 @@ def main():
         height_std = float(np.std(residual))
         height_max_abs = float(np.max(np.abs(residual)))
 
-    # Step 6: board flat surface.
-    print("\n--- 步骤 6：标定白色底盘无凸起平面高度 ---")
-    surface_points = []
-    num_surf = max(1, board_surface_samples)
-    i = 0
-    while i < num_surf:
-        pt = require_pose(tf_buffer, f"[步骤 6.{i+1}/{num_surf}] 吸盘轻触【底盘无凸起的平坦表面】", base_frame, eef_frame, allow_undo=(i > 0))
-        if isinstance(pt, str) and pt == "UNDO":
-            i -= 1
-            surface_points.pop()
-            print(f"  ↩️ 已撤销，重新记录平坦表面的第 {i+1} 个点。")
-            continue
-        surface_points.append(to_table(R_mat, P, pt))
-        i += 1
-        
-    surface_points = np.asarray(surface_points, dtype=float)
+    # Step 6: 复用 Step 2 的深度平面内点，转入 table 系得放置面 Z（同一物理白板，不再触点）。
+    print("\n--- 步骤 6：白色底盘无凸起平面高度（复用 Step 2 深度平面）---")
+    inl_base_s6 = first["inliers_base"]
+    if len(inl_base_s6) > 2000:
+        sel = np.linspace(0, len(inl_base_s6) - 1, 2000).astype(int)
+        inl_base_s6 = inl_base_s6[sel]
+    surface_points = (inl_base_s6 - P) @ R_mat   # base→table（逐行 R_mat.T·(p-P)）
     board_surface_z = float(np.median(surface_points[:, 2]))
     surf_a, surf_b, surf_c, board_surf_std = fit_plane_xyz(surface_points)
+    print("  放置面 z(table) 中值: {:.6f} m, 平面拟合残差 std: {:.3f} mm".format(
+        board_surface_z, board_surf_std * 1000.0))
 
     use_bump_height_for_place = ask_yes_no(
         "放置高度是否按局部凸起/鼓包高度补偿？如果方块主要压在凸起上，选是；如果落在底板平面上，选否",
@@ -578,6 +800,13 @@ def main():
         "selected_residual_max_abs_m": float(height_max_abs),
     }
 
+    inl_all = first["inliers_base"]
+    if len(inl_all) > 300:
+        _sel = np.linspace(0, len(inl_all) - 1, 300).astype(int)
+        plane_samples_out = inl_all[_sel]
+    else:
+        plane_samples_out = inl_all
+
     config = {
         "tetris": {
             "calibration_frames": {"base_frame": str(base_frame), "eef_frame": str(eef_frame)},
@@ -587,12 +816,24 @@ def main():
                 "roll": float(rpy[0]), "pitch": float(rpy[1]), "yaw": float(rpy[2]),
             },
 
-            # 白板平面法向 = table_frame 竖直参考 (D1)。不再输出独立的散落/抓取面平面。
+            # 白板平面法向 = table_frame 竖直参考 (D1)。由对齐深度单机位多帧 + RANSAC 拟合得到。
             "BOARD_SURFACE_NORMAL_BASE": [float(x) for x in surface_normal_base],
             "BOARD_SURFACE_CENTROID_BASE": [float(x) for x in surface_centroid_base],
             "BOARD_PLANE_FIT_RMS_M": float(surf_rms),
             "BOARD_PLANE_FIT_MAX_ABS_M": float(surf_max),
-            "BOARD_PLANE_SAMPLES_BASE": [[float(v) for v in p] for p in scatter_surface_points],
+            "BOARD_PLANE_INLIERS": int(first["inlier_count"]),
+            "BOARD_PLANE_TOTAL_PTS": int(first["total"]),
+            "BOARD_PLANE_SAMPLES_BASE": [[float(v) for v in p] for p in plane_samples_out],
+            "BOARD_DEPTH_ROI": {
+                "roi": [int(v) for v in roi],
+                "source": str(roi_src),
+                "z_range_m": [float(roi_z[0]), float(roi_z[1])],
+                "capture_frames": int(capture_frames),
+                "ransac_thresh_m": float(ransac_thresh),
+                "depth_topic": str(depth_topic),
+                "camera_frame": str(camera_frame),
+            },
+            "BOARD_DEPTH_VERIFY": verify_report,
             "TABLE_FRAME_ORIGIN_BASE": [float(v) for v in P],
             "TABLE_FRAME_XDIR_BASE": [float(v) for v in X_proj],
 
@@ -651,7 +892,10 @@ def main():
     print("\n🎉 增强标定完成！")
     print("配置已保存:", config_path)
     print("\n关键结果：")
-    print(f"  白板平面拟合采样点数: {pick_surface_samples}")
+    print(f"  板面深度采集: ROI={roi}（{roi_src}）, 内点 {first['inlier_count']}/{first['total']}")
+    if verify_report is not None:
+        print(f"  深度尺度比: {verify_report['depth_scale_ratio']:.4f}, "
+              f"base-Z↔法向: {verify_report['baseZ_to_normal_deg']:.3f}°")
     print(f"  白板平面 residual RMS/max: {surf_rms*1000:.3f} / {surf_max*1000:.3f} mm")
     print(f"  board 法向(base) = table_frame 竖直方向: {[round(float(v), 6) for v in surface_normal_base]}")
     print(f"  方块厚度 block_thickness(=PICK_Z, 平面回退用): {pick_z:.6f} m")
