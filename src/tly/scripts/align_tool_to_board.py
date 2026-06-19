@@ -30,10 +30,15 @@
   # 诊断手眼质量（自动转几个姿态，测桌面法向漂移；需 execute 才会动）：
   rosrun tly align_tool_to_board.py _mode:=diag _execute:=true
 
+写回：默认把【板面法向 + 修改后的机械臂原生位姿】合并写入 tetris_config.yaml 的
+      tetris.TOOL_BOARD_ALIGN（只更新这一个键，其余原样保留）。calibrate_board.py 的
+      第 7 步（波纹管长度）优先用这个法向作投影轴。用 _save_to_config:=false 关闭。
+
 需要：xArm 原生驱动（提供 /xarm/set_mode|set_state|move_line|xarm_states 与 TF）
       + RealSense（align_depth:=true）。**不要**和 tetris 控制器同时跑（抢 move_line）。
 """
 
+import os
 import sys
 import yaml
 import numpy as np
@@ -180,6 +185,8 @@ class Aligner(object):
         self.config_path = rospy.get_param(
             "~config_path", "/root/catkin_ws/src/tly/config/tetris_config.yaml")
         self.diag_perturb_deg = float(rospy.get_param("~diag_perturb_deg", 8.0))
+        # 把对齐后的板面法向 + 修改后的机械臂姿态写入 config（供 calibrate_board 第7步等使用）。
+        self.save_cfg = bool(rospy.get_param("~save_to_config", True))
 
         self.execute = bool(rospy.get_param("~execute", False))
         self.auto = bool(rospy.get_param("~auto", False))
@@ -367,6 +374,52 @@ class Aligner(object):
         verdict = "良好" if max_pair < 1.5 else ("可疑" if max_pair < 3.0 else "明显偏差(建议重标手眼)")
         rospy.loginfo("  判定: %s", verdict)
 
+    # ---------- 写回 config ----------
+    def save_to_config(self, n_base, note=""):
+        """把板面法向 + 当前(修改后的)机械臂原生位姿合并写入 tetris_config.yaml。
+        只更新 TOOL_BOARD_ALIGN 这一个键，其余键（手眼/单应性/标定数据）原样保留。"""
+        if not self.save_cfg:
+            return
+        n = np.asarray(n_base, dtype=float)
+        ln = np.linalg.norm(n)
+        if ln < 1e-9:
+            rospy.logwarn("法向无效，跳过写入 config。")
+            return
+        n = n / ln
+        if n[2] < 0:
+            n = -n
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        tetris = data.get("tetris")
+        if not isinstance(tetris, dict):
+            tetris = {}
+        pose = [float(v) for v in (self.native_pose or [])][:6]
+        tetris["TOOL_BOARD_ALIGN"] = {
+            "normal_base": [float(n[0]), float(n[1]), float(n[2])],
+            "tool_pose_native": pose,
+            "tool_frame": str(self.tool_frame),
+            "tool_axis": [float(v) for v in self.tool_axis],
+            "executed": bool(self.execute),
+            "note": str(note),
+        }
+        data["tetris"] = tetris
+        try:
+            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(data, f, allow_unicode=True,
+                               default_flow_style=False, sort_keys=False)
+        except Exception as e:
+            rospy.logerr("写入 config 失败：%s", e)
+            return
+        rospy.loginfo("已写入 %s: TOOL_BOARD_ALIGN.normal_base=%s, tool_pose_native=%s (%s)",
+                      self.config_path, np.array2string(n, precision=5),
+                      ["%.4f" % v for v in pose], note)
+
     # ---------- 主循环 ----------
     def run(self):
         # 等当前姿态
@@ -400,6 +453,7 @@ class Aligner(object):
 
         if not self.execute:
             rospy.loginfo("dry-run：不动机械臂。加 _execute:=true 才执行对齐。")
+            self.save_to_config(n_base, note="dry-run (arm not modified)")
             return
 
         self.enable_motion()
@@ -410,6 +464,7 @@ class Aligner(object):
                           it, theta_deg, inl, tot, rms * 1000.0)
             if target is None:
                 rospy.loginfo("✅ 已对齐（夹角 %.3f° ≤ %.2f°）。", theta_deg, self.tol_deg)
+                self.save_to_config(n_base, note="converged %.3fdeg" % theta_deg)
                 return
             rospy.loginfo("  目标 RPY=(%.3f %.3f %.3f)（仅改姿态，位置不变，步长≤%.1f°）",
                           target[3], target[4], target[5], self.max_step_deg)
@@ -425,6 +480,11 @@ class Aligner(object):
                 return
         rospy.logwarn("达到 max_iters=%d 仍未收敛到 %.2f°，检查手眼旋转标定/深度噪声。",
                       self.max_iters, self.tol_deg)
+        try:
+            n_base, _, _, _ = self.measure_normal_base()
+            self.save_to_config(n_base, note="max_iters not converged")
+        except Exception as e:
+            rospy.logwarn("收尾测量/写入失败：%s", e)
 
 
 def main():
