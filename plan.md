@@ -6,7 +6,8 @@ xArm6 俄罗斯方块抓取项目的代码重构方案。目标是把现有「�
 重新切分，并补齐进阶任务所需的能力。
 
 > 说明：图像里方块本身是**有颜色**的（颜色与形状一一绑定）。当前通过调相机
-> 参数把整幅画面压成黑白——白色是发光板、黑色是放在板上的方块，便于分割。
+> 参数把整幅画面压成黑白——白色是发光板、黑色是放在板上的方块，便于/root/catkin_ws/src/tly/src/xarm_controller_node.cpp分割。
+> 但是还可以通过调整相机参数，将画面变回彩色，方便/root/catkin_ws/src/tly/src/vision_processor_node_dexined.cpp分割。
 > 现有源码注释里「black blocks」的说法不准确，重构时一并订正。
 
 ---
@@ -81,9 +82,10 @@ xArm6 俄罗斯方块抓取项目的代码重构方案。目标是把现有「�
 **目标：从 4~5 类标定缩减为 3 类。**
 
 保留：
-1. **手眼标定**（eye-on-hand，ArUco + easy_handeye）——
+1. **手眼标定**（eye-on-hand，**ChArUco** + easy_handeye）——
    `xarm_calibration_setup.launch` + `calibrate_xarm.launch`，产出
    `camera_color_optical_frame` 在机械臂 TF 树中的位姿。**不动。**
+   （实测 ChArUco 明显优于单 ArUco，详见 §10。）
 2. **单应性标定**——`pick_affine_calibration_tool.py`（`affine.launch`），
    产出 `tetris/PICK_HOMOGRAPHY`（像素 → 平面 XY）。
 3. **白板标定**——从 `calibration_tool.py` 中拆出「白板格心 + 放置高度」部分，
@@ -104,16 +106,27 @@ xArm6 俄罗斯方块抓取项目的代码重构方案。目标是把现有「�
 > 坐标系**——直接从**白板标定**的平面拟合（`BOARD_SURFACE_PLANE` /
 > `BOARD_GRID_FIT_*`，本来就保留）里取板面法向，作为抓取下压与放置的竖直方向
 > 和工具姿态参考。这样既满足「只留 3 类标定」，又自然吸收了倾斜。
+> （**实现细化**：板面法向与放置面 Z 由 `calibrate_board.py` 用**单帧对齐深度 +
+> RANSAC** 拟合得到，不再触点采集；并用一段已知走位做**差分验证深度尺度**——
+> 多帧×几千像素治随机噪声，走位差分治系统偏置。详见 §2 动作项。）
 > `table_frame` 以何种形式存在（继续发 TF，还是只存一个法向量在 base 系里用）
 > 属实现细节，二者等价；单应性与白板格心相应统一到所选参考系。
 
 动作项：
-- [ ] 把 `calibration_tool.py` 拆成 `calibrate_board.py`（只做白板：格心 +
-      `PLACE_Z_MAP` + `BUMP_HEIGHT` + 板面平面拟合 `BOARD_SURFACE_PLANE`）。
-- [ ] 板面法向 → 抓取/放置的工具姿态（垂直板面，而非 base-Z）。
-- [ ] `affine.launch` / `calibrate_tool.launch` 更新到新脚本与新输出键。
+- [x] 把 `calibration_tool.py` 拆成 `calibrate_board.py`（只做白板：格心 +
+      `PLACE_Z_MAP` + `BUMP_HEIGHT` + 板面平面）。
+- [x] **板面平面改由单帧对齐深度采集**（替代触点采集）：静止机位多帧逐像素中值
+      + ROI（交互框选 / 参数 / 持久化复用）+ 深度范围门 + RANSAC 主平面 → 法向
+      (base，定 table_frame 竖直) 与放置面 Z（同一物理白板，转 table 系）。
+- [x] 新增**走位差分验证 / 尺度**步：手动挪一小段二次采集，差分估深度尺度、两次
+      法向一致性、base-Z↔法向夹角（差分抵消常值偏置）；结果存 `BOARD_DEPTH_VERIFY`。
+- [ ] 板面法向 → 抓取/放置的工具姿态（垂直板面，而非 base-Z）。**随路径/控制做。**
+- [x] `calibrate_tool.launch` 更新到 `calibrate_board.py` + 深度/ROI 新参数
+      （`board_capture_frames` / `board_roi` / `board_roi_force_interactive` /
+      `board_roi_z` / `board_ransac_thresh_m` / `board_verify_scale`）；`affine.launch` 待核。
 - [ ] `tetris_config.yaml` 移除 `TABLE_SURFACE_PLANE_BASE` /
-      `PICK_SURFACE_PLANE_BASE` / `PICK_SURFACE_*` 系列键（保留 `.bak`）。
+      `PICK_SURFACE_PLANE_BASE` / `PICK_SURFACE_*` 系列键（真机重跑标定时整文件
+      重写自然移除；保留 `.bak`）。
 
 ---
 
@@ -305,8 +318,9 @@ xArm6 俄罗斯方块抓取项目的代码重构方案。目标是把现有「�
   `vision_processor_node.cpp` 回退经典法；契约一致，`tly.launch` `vision_node:=` 切换。
 - [x] **3 深度 Z**：视觉订阅对齐深度，`DepthSampler` 采样抓取点 Z（含 D415
   rect→raw 修正），log + `/vision/pick_depth_debug` 调试话题。⚠️ 数值待真机验证。
-- [x] **4 标定缩减**：`calibration_tool.py` → `calibrate_board.py`，删平面拟合输出，
-  板面法向定 table_frame 竖直（D1）。⚠️ 需真机重跑标定验证。
+- [x] **4 标定缩减**：`calibration_tool.py` → `calibrate_board.py`；板面法向 + 放置面 Z
+  改由**单帧对齐深度 + ROI + RANSAC**（替代触点），新增走位差分验证/尺度步；法向定
+  table_frame 竖直（D1）。⚠️ 需真机重跑标定验证（命令见 [test_schedule.md](test_schedule.md) 第 3 项）。
 - [~] **5 路径模块（5a 已做，5b 待真机）**：
   - [x] **5a** 新建 `path_planner_node`（附加式）：坐标解算 + 深度 Z，发布
     `/motion_cmds`；控制器未动、仍吃 `/tetris_plan`。⚠️ `/motion_cmds` 待真机对照。
@@ -332,6 +346,18 @@ xArm6 俄罗斯方块抓取项目的代码重构方案。目标是把现有「�
   运动学误差（底座已固定）——若误差是位置相关的非平面形变，单纯平面法向修不
   净，但**密集的逐格 `PLACE_Z_MAP` + 逐像素深度 Z 是在真实位置采样/测量的**，
   能经验性吸收倾斜与轻度运动学误差；必要时加密白板采样点。
+- **手眼旋转质量门控深度法向（已踩坑）**：深度反投影、板面法向、`align_tool` 对齐
+  都经 `base←camera` 手眼 TF，精度上限 = 手眼**旋转**标定精度。实测旧的**单 ArUco**
+  手眼旋转偏约 **15°**，导致深度法向/对齐/深度版白板标定全部偏 15°；换 **ChArUco**
+  标定板（`charuco_tracker.py`，11×8 格）后降到 **~1.4°**，与**触点法向**（纯运动学、
+  不经相机，是地面真值）一致。→ **手眼优先用 ChArUco，不用单 ArUco**；深度法向采信
+  前先对照触点法向，或用 `align_tool.py mode:=diag`（多姿态测法向漂移）验收。
+  附带澄清：桌面相对 base-Z 的**真实**倾斜只有 ~1.4°（之前直觉的"大倾斜"里那 15°
+  其实是手眼误差，非真实倾斜）。
+- **相机深度滤波**：RealSense 起相机统一开 `filters=spatial,temporal,hole_filling`
+  （`tly.launch` 与 `align_tool`/`verify_camera`/`calibrate_tool` 均已加，可用
+  `depth_filters:=` 覆盖）；背光发光板半透/反光，无滤波时深度孔洞多，反投影/深度 Z
+  受影响。
 - **深度噪声**：RealSense 深度在黑色/反光/边缘处易出孔洞；抓取点取邻域中值并
   做有效性兜底（无效时回退到板面常数 Z）。
 - **契约迁移期**：第 5~6 步会同时改多个收发端，务必一次性对齐 msg 定义。
@@ -344,17 +370,20 @@ xArm6 俄罗斯方块抓取项目的代码重构方案。目标是把现有「�
 
 ## 11. 真机验证清单（已编译/离线验证，待真机确认）
 
-下列改动我（助手）只做了编译 / 离线测试，**无法实跑真机**，需在硬件上确认：
+下列改动我（助手）只做了编译 / 离线测试，**无法实跑真机**，需在硬件上确认。
+逐项可执行命令与通过判据见 [test_schedule.md](test_schedule.md)。
 
 - [ ] **深度 Z（步骤3）**：`roslaunch tly tly.launch`，看 `[DEPTH] pick Z` 日志或
   `rostopic echo /vision/pick_depth_debug`，确认 Z ≈ 相机到积木顶面距离（~0.7m 量级）；
   并核对 `/camera/color/camera_info` 的 `D`：若非 0，则 rect→raw 映射应让
   `(rect)->raw` 有几像素偏移、Z 才准。
-- [ ] **标定缩减（步骤4）**：重跑 `roslaunch tly calibrate_tool.launch`（现在跑
-  `calibrate_board.py`），确认新流程（采白板平面→法向竖直）产出的 `table_tf` /
-  `BOARD_CENTERS` / `PLACE_Z_MAP` 合理。注意：重跑会整文件重写
-  `tetris_config.yaml`，旧的 `PICK_SURFACE_PLANE_BASE` 将消失，旧控制器抓取 Z 会
-  回退到 flat `PICK_Z`（与迁移方向一致）。
+- [ ] **标定缩减（步骤4，深度版）**：重跑 `roslaunch tly calibrate_tool.launch`（跑
+  `calibrate_board.py`）。首次交互框选 ROI（空板、看白板平坦区），确认：拟合内点率/
+  残差(mm级)合理、走位验证 `深度尺度比≈1` / `两次法向夹角≈0` / `base-Z↔法向夹角`
+  (实测倾斜值)、新键 `BOARD_SURFACE_NORMAL_BASE` / `BOARD_SURFACE_PLANE` /
+  `BOARD_DEPTH_ROI` / `BOARD_DEPTH_VERIFY` 及 `table_tf` / `BOARD_CENTERS` /
+  `PLACE_Z_MAP` 合理。注意：重跑整文件重写 `tetris_config.yaml`，旧
+  `PICK_SURFACE_PLANE_BASE` 消失、旧控制器抓取 Z 回退 flat `PICK_Z`（与迁移方向一致）。
 - [ ] **路径节点 5a**：`roslaunch tly test_path.launch`（机械臂只供 TF、不运动），
   `rostopic echo /motion_cmds`；对照 `[PATH][TASK]` 与 `[CTRL][TASK]` 日志——XY 应
   与控制器一致，`z_depth` vs `z_plane` 看深度相对平面的差异。**这是 5b 切换前的前置验证。**
