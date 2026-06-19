@@ -8,3 +8,4 @@ images/
 src/easy_handeye
 OpenCV_Source/
 *.onnx
+*.pyc
