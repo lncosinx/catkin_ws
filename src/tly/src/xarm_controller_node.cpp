@@ -99,7 +99,6 @@ public:
         move_line_client_.waitForExistence();
         io_client_.waitForExistence();
 
-        // 学长式控制：只在启动时切到位置模式并使能；不在每一步 clear_err / 重复抢状态。
         setNativeModeOnce();
         nh_.setParam("/xarm/wait_for_finish", xarm_wait_for_finish_);
 
@@ -214,7 +213,7 @@ private:
     double tcp_place_offset_z_ = 0.0;
     double place_release_z_margin_ = 0.004;
 
-    // 学长式固定姿态：roll/pitch 固定，yaw 只按任务角度给；不连续累计，不解绕。
+    // roll/pitch 固定，yaw 只按任务角度给；不连续累计，不解绕。
     double fixed_roll_rad_ = M_PI;
     double fixed_pitch_rad_ = 0.0;
 
