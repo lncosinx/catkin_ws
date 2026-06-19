@@ -33,9 +33,12 @@
 
     <!-- =========================
          2. RealSense camera
+         滤波与手眼标定/工具脚本一致：背光板深度更密更稳，反投影/深度Z 更可靠
          ========================= -->
+    <arg name="depth_filters" default="spatial,temporal,hole_filling" />
     <include file="$(find realsense2_camera)/launch/rs_camera.launch">
         <arg name="align_depth" value="true" />
+        <arg name="filters" value="$(arg depth_filters)" />
     </include>
 
     <!-- =========================
