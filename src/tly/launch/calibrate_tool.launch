@@ -1,8 +1,14 @@
 <launch>
     <arg name="robot_ip" default="192.168.1.228" />
 
-    <!-- 可选：9 或 16。建议 16，用于拟合白板平坦表面 → table_frame 竖直方向 -->
-    <arg name="pick_surface_samples" default="16" />
+    <!-- 板面法向/放置面由对齐深度采集（替代旧触点）。空 board_roi=首次交互框选并存盘复用 -->
+    <arg name="board_capture_frames" default="50" />
+    <arg name="board_roi" default="" />
+    <arg name="board_roi_force_interactive" default="false" />
+    <arg name="board_roi_z" default="[0.10, 1.50]" />
+    <arg name="board_ransac_thresh_m" default="0.004" />
+    <arg name="board_min_inliers_frac" default="0.3" /><!-- 主平面最小占比安全闸；宁可调小 ROI 也别轻易降 -->
+    <arg name="board_verify_scale" default="true" />
 
     <!-- 白板标定模式：A=9点，B=25点，C=140点。白板翘曲明显建议 C -->
     <arg name="board_mode" default="B" />
@@ -24,9 +30,18 @@
     <node pkg="tf2_ros" type="static_transform_publisher" name="suction_tcp_broadcaster" 
           args="0.00046 -0.00026 0.06962 0 0 0 link6 link_tcp" />
 
-    <!-- 2. 启动 RealSense，相机内参来自 /camera/color/camera_info -->
+    <!-- 2. 启动 RealSense，相机内参来自 /camera/color/camera_info（滤波与手眼标定时一致） -->
+    <arg name="depth_filters" default="spatial,temporal,hole_filling" />
     <include file="$(find realsense2_camera)/launch/rs_camera.launch">
         <arg name="align_depth" value="true" />
+        <arg name="filters" value="$(arg depth_filters)" />
+    </include>
+
+    <!-- 2.5 手眼 TF：base <- camera_color_optical_frame。
+         步骤2 深度拟板面要把法向从相机系换到 base 系，必须有这段（旧触点版不需要，故此前漏了）。 -->
+    <include file="$(find easy_handeye)/launch/publish.launch">
+        <arg name="eye_on_hand" value="true" />
+        <arg name="namespace_prefix" value="xarm6_realsense_calibration" />
     </include>
 
     <!-- 3. 启动白板标定工具 (calibrate_board.py) -->
@@ -39,12 +54,21 @@
         
         <param name="config_path" value="$(arg config_path)" />
 
-        <param name="pick_surface_samples" value="$(arg pick_surface_samples)" />
         <param name="board_mode" value="$(arg board_mode)" />
         <param name="height_interpolation" value="$(arg height_interpolation)" />
         <param name="place_z_margin" value="$(arg place_z_margin)" />
 
+        <!-- 深度采板面参数 -->
+        <param name="board_capture_frames" value="$(arg board_capture_frames)" />
+        <param name="board_roi" value="$(arg board_roi)" />
+        <param name="board_roi_force_interactive" value="$(arg board_roi_force_interactive)" />
+        <rosparam param="board_roi_z" subst_value="true">$(arg board_roi_z)</rosparam>
+        <param name="board_ransac_thresh_m" value="$(arg board_ransac_thresh_m)" />
+        <param name="board_min_inliers_frac" value="$(arg board_min_inliers_frac)" />
+        <param name="board_verify_scale" value="$(arg board_verify_scale)" />
+        <param name="camera_frame" value="camera_color_optical_frame" />
+        <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw" />
+
         <param name="block_samples" value="3" />
-        <param name="board_surface_samples" value="5" />
     </node>
 </launch>
