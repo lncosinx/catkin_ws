@@ -357,6 +357,8 @@ private:
 
         pnh_.param("tcp_pick_offset_x", tcp_pick_offset_x_, tcp_pick_offset_x_);
         pnh_.param("tcp_pick_offset_y", tcp_pick_offset_y_, tcp_pick_offset_y_);
+        // 波纹管补偿：优先用标定写入的 /tetris/TCP_PICK_OFFSET_Z，launch 同名私有参数可覆盖。
+        nh_.getParam("/tetris/TCP_PICK_OFFSET_Z", tcp_pick_offset_z_);
         pnh_.param("tcp_pick_offset_z", tcp_pick_offset_z_, tcp_pick_offset_z_);
 
         // 推荐在 launch 里用角度制 pick_yaw_offset_deg；保留 rad 参数兼容旧配置。
@@ -370,6 +372,8 @@ private:
 
         pnh_.param("tcp_place_offset_x", tcp_place_offset_x_, tcp_place_offset_x_);
         pnh_.param("tcp_place_offset_y", tcp_place_offset_y_, tcp_place_offset_y_);
+        // 波纹管补偿：优先用标定写入的 /tetris/TCP_PLACE_OFFSET_Z，launch 同名私有参数可覆盖。
+        nh_.getParam("/tetris/TCP_PLACE_OFFSET_Z", tcp_place_offset_z_);
         pnh_.param("tcp_place_offset_z", tcp_place_offset_z_, tcp_place_offset_z_);
         pnh_.param("place_release_z_margin", place_release_z_margin_, place_release_z_margin_);
 
