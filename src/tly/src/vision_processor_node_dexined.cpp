@@ -176,12 +176,26 @@ public:
 
     void update(const Detection &det)
     {
-        shape_id = det.shape_id;
-        name = det.name;
         if (history.size() >= history_len)
             history.pop_front();
         history.push_back(det);
         missed = 0;
+
+        // 形状多帧【多数投票】：某块偶尔单帧闪成别的形状、或被切两半给出错形状，
+        // 只要多数帧是对的，输出形状就保持正确稳定（不再跟着单帧抖）。
+        int counts[7] = {0, 0, 0, 0, 0, 0, 0};
+        for (auto &d : history)
+            if (d.shape_id >= 0 && d.shape_id < 7)
+                counts[d.shape_id]++;
+        int best = det.shape_id, bestc = -1;
+        for (int s = 0; s < 7; ++s)
+            if (counts[s] > bestc)
+            {
+                bestc = counts[s];
+                best = s;
+            }
+        shape_id = best;
+        name = SHAPE_NAMES.count(best) ? SHAPE_NAMES.at(best) : det.name;
     }
 
     void mark_missed() { missed++; }
@@ -706,6 +720,7 @@ private:
     string threshold_mode;
     int manual_dark_threshold, blur_kernel, close_kernel, open_kernel;
     double min_area, max_area, min_template_iou, min_fill, max_fill;
+    double poly_approx_eps_ratio; // 匹配前轮廓多边形近似的 eps 比例(占周长)，0=不近似
     bool use_lightboard_mask;
     double lightboard_min_area_ratio;
     int lightboard_close_kernel;
@@ -723,6 +738,13 @@ private:
     bool use_dexined_;
     string dexined_model_path_;
     double dexined_thresh_;
+    double nms_center_dist_px_; // 同帧 NMS：两检测质心距(全分辨率 px)小于此 → 视为同块，留高分
+    double color_edge_thresh_;  // Lab a/b 色度梯度的"颜色边界"阈值(0-255)，切异色贴碰块
+    int color_edge_min_area_;   // 颜色边连通域最小面积：滤掉掉漆/划痕的零碎小边
+    bool use_dexined_for_split_; // true=或上 DexiNed 强边切同色贴碰块；false=纯颜色(最稳)
+    double temporal_alpha_;      // 输入帧时间平均(EMA)系数，0=关；静止场景抑噪/抗背光闪烁
+    Mat avg_frame_;              // EMA 累积帧(CV_32FC3)
+    bool avg_init_ = false;
     cv::dnn::Net dexined_net_;
 
     string pick_point_mode;
@@ -799,6 +821,12 @@ public:
         pnh_.param("min_area", min_area, 900.0);
         pnh_.param("max_area", max_area, 50000.0);
         pnh_.param("min_template_iou", min_template_iou, 0.42);
+        pnh_.param("poly_approx_eps_ratio", poly_approx_eps_ratio, 0.02);
+        pnh_.param("nms_center_dist_px", nms_center_dist_px_, 35.0);
+        pnh_.param("color_edge_thresh", color_edge_thresh_, 20.0);
+        pnh_.param("color_edge_min_area", color_edge_min_area_, 40);
+        pnh_.param("use_dexined_for_split", use_dexined_for_split_, true);
+        pnh_.param("temporal_alpha", temporal_alpha_, 0.3);
         pnh_.param("max_contour_fill_ratio", max_fill, 0.98);
         pnh_.param("min_contour_fill_ratio", min_fill, 0.18);
 
@@ -1268,29 +1296,72 @@ public:
                 normalize(edge_map, edge_map, 0, 255, NORM_MINMAX);
                 edge_map.convertTo(edges_roi, CV_8UC1);
 
-                // 二值化与闭运算连接断点
-                Mat bin_edges;
-                threshold(edges_roi, bin_edges, dexined_thresh_, 255, THRESH_BINARY);
-                morphologyEx(bin_edges, bin_edges, MORPH_CLOSE, getStructuringElement(MORPH_RECT, Size(5, 5)));
-
-                // 寻找外部轮廓并填充为实心前景
-                vector<vector<Point>> edge_cnts;
-                findContours(bin_edges, edge_cnts, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
-                mask_roi = Mat::zeros(roi.size(), CV_8UC1);
-
-                for (const auto &c : edge_cnts)
+                // 块前景：暗块(灰度OTSU) ∪ 彩色块(HSV高饱和)，兼顾黑块与彩色块。
+                Mat fg;
+                threshold(gray, fg, 0, 255, THRESH_BINARY_INV | THRESH_OTSU);
+                if (use_saturation_foreground)
                 {
-                    if (contourArea(c) > min_area / (scale * scale))
+                    Mat hsv, sat_mask, val_mask, sat_fg;
+                    cvtColor(roi, hsv, COLOR_BGR2HSV);
+                    vector<Mat> hsv_ch;
+                    split(hsv, hsv_ch);
+                    threshold(hsv_ch[1], sat_mask, saturation_min, 255, THRESH_BINARY);
+                    threshold(hsv_ch[2], val_mask, saturation_value_min, 255, THRESH_BINARY);
+                    bitwise_and(sat_mask, val_mask, sat_fg);
+                    morphologyEx(sat_fg, sat_fg, MORPH_OPEN, getStructuringElement(MORPH_RECT, Size(3, 3)));
+                    bitwise_or(fg, sat_fg, fg);
+                }
+
+                // 核心（彩色版）：用 Lab 色度(a,b)梯度作“颜色边界”切割线，替代逐帧抖动、
+                // 会被块内眩光过切的 DexiNed 边缘。块内均匀色→a/b 无梯度→不内部过切；
+                // 眩光只改亮度 L→不动 a/b→对眩光免疫；异色块边界色度突变→强梯度→切开。
+                // 同色贴碰块仍会并(少数，后续可在同色区内再用 DexiNed 边缘切)。
+                Mat lab;
+                cvtColor(roi, lab, COLOR_BGR2Lab);
+                vector<Mat> lab_ch;
+                split(lab, lab_ch);
+                Mat k3 = getStructuringElement(MORPH_RECT, Size(3, 3));
+                Mat ga, gb, color_edge;
+                morphologyEx(lab_ch[1], ga, MORPH_GRADIENT, k3);
+                morphologyEx(lab_ch[2], gb, MORPH_GRADIENT, k3);
+                max(ga, gb, color_edge);
+                threshold(color_edge, color_edge, color_edge_thresh_, 255, THRESH_BINARY);
+
+                // 混合：或上 DexiNed 几何强边，专门切【同色】贴碰块（颜色无边界处）。
+                // 用高阈值只取强边滤掉眩光；大部分块仍靠稳定颜色分开，DexiNed 只补同色残活。
+                if (use_dexined_for_split_)
+                {
+                    Mat dex_bin; // 此刻 edges_roi 仍是 DexiNed 归一化边图（末尾才被 color_edge 覆盖）
+                    threshold(edges_roi, dex_bin, dexined_thresh_, 255, THRESH_BINARY);
+                    bitwise_or(color_edge, dex_bin, color_edge);
+                }
+
+                // 去掉“掉漆/划痕”等块内小斑点产生的零碎颜色边：真边界是成片连续的长线，
+                // 掉漆是孤立小斑点 → 按连通域面积一筛即分开。这样阈值能压低分开贴碰块，
+                // 又不会被块内掉漆切碎。
+                if (color_edge_min_area_ > 0)
+                {
+                    Mat ce_lbl, ce_stats, ce_cent;
+                    int ne = connectedComponentsWithStats(color_edge, ce_lbl, ce_stats, ce_cent, 8, CV_32S);
+                    vector<uchar> keep(ne, 0);
+                    for (int i = 1; i < ne; ++i)
+                        keep[i] = (ce_stats.at<int>(i, CC_STAT_AREA) >= color_edge_min_area_) ? 255 : 0;
+                    for (int y = 0; y < ce_lbl.rows; ++y)
                     {
-                        vector<vector<Point>> c_wrap = {c};
-                        drawContours(mask_roi, c_wrap, 0, Scalar(255), FILLED);
+                        const int *lr = ce_lbl.ptr<int>(y);
+                        uchar *cr = color_edge.ptr<uchar>(y);
+                        for (int x = 0; x < ce_lbl.cols; ++x)
+                            cr[x] = keep[lr[x]];
                     }
                 }
 
-                if (close_kernel > 1)
-                    morphologyEx(mask_roi, mask_roi, MORPH_CLOSE, Mat::ones(close_kernel, close_kernel, CV_8UC1));
+                dilate(color_edge, color_edge, k3); // 加粗确保切透 findContours 8连通
+
+                subtract(fg, color_edge, mask_roi);
                 if (open_kernel > 1)
                     morphologyEx(mask_roi, mask_roi, MORPH_OPEN, Mat::ones(open_kernel, open_kernel, CV_8UC1));
+
+                edges_roi = color_edge; // debug_edges 显示颜色边界（替代原 DexiNed 边）
             }
             catch (const cv::Exception &e)
             {
@@ -1400,12 +1471,32 @@ public:
         }
 
         double stamp = msg->header.stamp.toSec();
+
+        // 时间平均(EMA)：静止料堆下抑制传感器噪声/背光闪烁带来的逐帧抖动，分割更稳。
+        // 块在动时会有拖影(但动着本就不稳)；扫描阶段静止，正好用。
+        Mat proc_frame;
+        if (temporal_alpha_ > 0.0 && temporal_alpha_ < 1.0)
+        {
+            Mat f32;
+            frame.convertTo(f32, CV_32FC3);
+            if (!avg_init_ || avg_frame_.size() != f32.size())
+            {
+                avg_frame_ = f32.clone();
+                avg_init_ = true;
+            }
+            else
+                addWeighted(avg_frame_, 1.0 - temporal_alpha_, f32, temporal_alpha_, 0.0, avg_frame_);
+            avg_frame_.convertTo(proc_frame, CV_8UC3);
+        }
+        else
+            proc_frame = frame;
+
         Mat small_frame, fg_mask, edges_mask;
         double scale;
         PreprocessDebugImages preprocess_dbg;
 
         // 1. CPU/GPU 预处理 (强制启用 CUDA 的 DexiNed 边缘提取 & 掩码生成)
-        process_foreground(frame, small_frame, fg_mask, edges_mask, scale, publish_preprocess_debug ? &preprocess_dbg : nullptr);
+        process_foreground(proc_frame, small_frame, fg_mask, edges_mask, scale, publish_preprocess_debug ? &preprocess_dbg : nullptr);
 
         // 2. 轮廓提取与分类
         double inv_scale = 1.0 / scale;
@@ -1423,8 +1514,12 @@ public:
             if (fill < min_fill || fill > max_fill || bb.width < 10 || bb.height < 10)
                 continue;
 
+            // 匹配前用 approxPolyDP 把分水岭波纹边拉直再光栅化（只影响分类，不动几何）。
             Mat c_mask = Mat::zeros(fg_mask.size(), CV_8UC1);
-            vector<vector<Point>> tmp_cnt = {cnt};
+            vector<Point> cnt_poly;
+            if (poly_approx_eps_ratio > 0.0)
+                approxPolyDP(cnt, cnt_poly, poly_approx_eps_ratio * arcLength(cnt, true), true);
+            vector<vector<Point>> tmp_cnt = {cnt_poly.size() >= 3 ? cnt_poly : cnt};
             drawContours(c_mask, tmp_cnt, 0, Scalar(255), FILLED);
             Mat norm = TemplateBank::normalize_binary_mask(c_mask(bb), template_size);
 
@@ -1479,6 +1574,33 @@ public:
             d.score = iou;
             d.stamp = stamp;
             detections.push_back(d);
+        }
+
+        // 2.5 同帧 NMS：分水岭过切 + 无去重会让一个块出多个框。按分数降序贪心，
+        //     新检测若质心离已保留的某个太近，判为同块、抑制掉。
+        if (nms_center_dist_px_ > 0.0 && detections.size() > 1)
+        {
+            std::sort(detections.begin(), detections.end(),
+                      [](const Detection &a, const Detection &b) { return a.score > b.score; });
+            double gate2 = nms_center_dist_px_ * nms_center_dist_px_;
+            vector<Detection> kept;
+            for (const auto &d : detections)
+            {
+                bool dup = false;
+                for (const auto &k : kept)
+                {
+                    double dx = d.geom_px.x - k.geom_px.x;
+                    double dy = d.geom_px.y - k.geom_px.y;
+                    if (dx * dx + dy * dy < gate2)
+                    {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup)
+                    kept.push_back(d);
+            }
+            detections.swap(kept);
         }
 
         // 3. TF 坐标转换优化
