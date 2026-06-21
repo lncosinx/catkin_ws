@@ -7,8 +7,12 @@ pick_affine_calibration_tool.py (Manual Magnifier + Homography)
 彻底抛弃视觉节点的自动识别（因为方块物理中心难以肉眼对齐），改为在画面中手动点击标定纸上的 9 个黑点。
 底层的数学模型采用单应性矩阵 (Homography)，完美消除手眼标定的物理残差和相机倾斜透视畸变。
 
+坐标系：已全量 base 化，不再有 table_frame TF。采点时读 base<-eef，再用 config 里的
+BOARD_POSE_BASE（board_frame 在 base 的常量位姿，由 calibrate_board 派生）换算到 board 系，
+拟合 pixel→board-XY 的单应性。⚠️ 每次 calibrate_board 重定坐标系后，必须重跑本工具。
+
 输出写入 tetris_config.yaml:
-  tetris/PICK_HOMOGRAPHY
+  tetris/PICK_HOMOGRAPHY  (pixel -> board-XY)
 """
 
 import os
@@ -20,6 +24,7 @@ import cv2
 
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
+from tf.transformations import euler_matrix
 
 DEFAULT_CONFIG_PATH = "/root/catkin_ws/src/tly/config/tetris_config.yaml"
 
@@ -28,7 +33,7 @@ class PickAffineCalibrator:
         rospy.init_node("pick_affine_calibrator", anonymous=True)
 
         self.config_path = rospy.get_param("~config_path", DEFAULT_CONFIG_PATH)
-        self.table_frame = rospy.get_param("~table_frame", "table_frame")
+        self.base_frame = rospy.get_param("~base_frame", "link_base")
         self.eef_frame = rospy.get_param("~eef_frame", "link_tcp")
         self.camera_frame = rospy.get_param("~camera_frame", "camera_color_optical_frame")
         self.image_topic = rospy.get_param("~image_topic", "/camera/color/image_rect_color")
@@ -36,6 +41,9 @@ class PickAffineCalibrator:
 
         if self.num_points < 4:
             self.num_points = 9
+
+        # board_frame 在 base 的常量位姿（由 calibrate_board 派生）。base->board: R^T (p-P)。
+        self.board_R, self.board_P = self.load_board_pose()
 
         self.bridge = CvBridge()
         self.latest_image = None
@@ -55,12 +63,29 @@ class PickAffineCalibrator:
         except Exception:
             pass
 
+    def load_board_pose(self):
+        """从 config 读取 BOARD_POSE_BASE（board_frame 在 base 的位姿）。返回 (R 3x3, P 3)。"""
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                t = (yaml.safe_load(f) or {}).get("tetris", {})
+            bp = t.get("BOARD_POSE_BASE")
+            if not bp:
+                raise RuntimeError("缺少 tetris/BOARD_POSE_BASE，请先运行 calibrate_board.py")
+            P = np.asarray(bp["origin"], dtype=np.float64)
+            r = [float(v) for v in bp["rpy"]]
+            R = euler_matrix(r[0], r[1], r[2], axes="sxyz")[:3, :3]
+            rospy.loginfo("已加载 board_frame: origin=%s rpy=%s", P.tolist(), r)
+            return R, P
+        except Exception as e:
+            rospy.logerr("加载 BOARD_POSE_BASE 失败: %s", e)
+            raise
+
     def wait_required_tf(self):
-        rospy.loginfo("等待必要 TF: %s <- %s", self.table_frame, self.eef_frame)
+        rospy.loginfo("等待必要 TF: %s <- %s", self.base_frame, self.eef_frame)
         deadline = rospy.Time.now() + rospy.Duration(10.0)
         rate = rospy.Rate(10)
         while not rospy.is_shutdown() and rospy.Time.now() < deadline:
-            if self.tf_buffer.can_transform(self.table_frame, self.eef_frame, rospy.Time(0), rospy.Duration(0.2)):
+            if self.tf_buffer.can_transform(self.base_frame, self.eef_frame, rospy.Time(0), rospy.Duration(0.2)):
                 return True
             rate.sleep()
         return False
@@ -155,22 +180,24 @@ class PickAffineCalibrator:
         cv2.destroyAllWindows()
         return True
 
-    def get_eef_table_point(self):
+    def get_eef_board_point(self):
+        """读 base<-eef，再用常量 board 位姿换算到 board 系。返回 board 系 [x,y,z]。"""
         try:
-            trans = self.tf_buffer.lookup_transform(self.table_frame, self.eef_frame, rospy.Time(0), rospy.Duration(3.0))
-            return np.array([
+            trans = self.tf_buffer.lookup_transform(self.base_frame, self.eef_frame, rospy.Time(0), rospy.Duration(3.0))
+            p_base = np.array([
                 trans.transform.translation.x,
                 trans.transform.translation.y,
                 trans.transform.translation.z,
             ], dtype=np.float64)
+            return self.board_R.T.dot(p_base - self.board_P)
         except Exception as e:
             rospy.logerr("获取 TF 失败: %s", e)
             return None
 
     def fit_homography(self, rows):
-        """核心：计算单应性透视变换矩阵"""
+        """核心：计算单应性透视变换矩阵 (pixel -> board-XY)"""
         src_pts = np.array([[r["u"], r["v"]] for r in rows], dtype=np.float32)
-        dst_pts = np.array([[r["actual_table"][0], r["actual_table"][1]] for r in rows], dtype=np.float32)
+        dst_pts = np.array([[r["actual_board"][0], r["actual_board"][1]] for r in rows], dtype=np.float32)
 
         H, _ = cv2.findHomography(src_pts, dst_pts)
 
@@ -249,13 +276,13 @@ class PickAffineCalibrator:
                 print(f"  ↩️ 已撤销！退回上一个点 P{self.manual_points[i]['calib_id']} 重新记录。")
                 continue
 
-            actual_table = self.get_eef_table_point()
-            if actual_table is None:
+            actual_board = self.get_eef_board_point()
+            if actual_board is None:
                 continue
-                
-            print("  ✅ 已记录真实坐标: x={:.6f}, y={:.6f}".format(actual_table[0], actual_table[1]))
+
+            print("  ✅ 已记录 board 系坐标: x={:.6f}, y={:.6f}".format(actual_board[0], actual_board[1]))
             rows.append({
-                "id": cid, "u": u, "v": v, "actual_table": actual_table,
+                "id": cid, "u": u, "v": v, "actual_board": actual_board,
             })
             i += 1
 

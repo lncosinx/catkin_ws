@@ -34,7 +34,6 @@
 
     <!-- 3. 标定/配置 + table_frame -->
     <rosparam file="$(find tly)/config/tetris_config.yaml" command="load" />
-    <node pkg="tly" type="table_tf_broadcaster.py" name="table_tf_broadcaster" output="screen" />
 
     <!-- 4. 相机 + image_proc + 视觉节点（复用 test_vision.launch） -->
     <include file="$(find tly)/launch/test_vision.launch">
@@ -53,7 +52,6 @@
     <!-- 6. 路径节点（被测对象，发布 /motion_cmds） -->
     <node pkg="tly" type="path_planner_node" name="path_planner_node" output="screen"
           launch-prefix="bash -c 'sleep 4; exec $0 $@'">
-        <param name="table_frame" value="table_frame" />
         <param name="base_frame" value="link_base" />
         <param name="camera_frame" value="camera_color_optical_frame" />
         <param name="camera_info_topic" value="/camera/color/camera_info" />

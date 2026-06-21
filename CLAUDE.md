@@ -1,169 +1,166 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+本文件为 Claude Code (claude.ai/code) 在本仓库中工作时提供指引。
 
-## Project overview
+## Claude 交互与语言约定（最高优先级）
 
-ROS 1 (Noetic) catkin workspace for an xArm6 robotic arm that uses a RealSense
-camera to identify black polyomino ("Tetris") blocks lying on a backlit board,
-then picks them with a vacuum suction tool and places them into a fixed 14x10
-grid to maximize the number of blocks placed (an exact-cover packing problem).
+针对 Claude 内部 Agent 在处理多语言上下文时可能产生的“跨语言幻觉漂移” Bug，特制定以下硬性交互约束：
 
-All active development happens in `src/tly`. Everything else under `src/`
-(`xarm_ros`, `realsense-ros`, `vision_opencv`, `easy_handeye`) is a vendored
-third-party dependency — `.gitignore` excludes `src/xarm_ros`,
-`src/realsense-ros`, `src/easy_handeye`, `OpenCV_Source/`, `build/`, `devel/`
-from this repo's history. Don't expect to need to modify them; treat them as
-installed packages. `docs/` is stale and out of date — don't rely on it.
+1. 回复语言限制：Claude 在与用户交互、生成命令行输出、输出解释或撰写日志时，必须且只能使用简体中文（Simplified Chinese）或英文（English）。
+2. 绝对禁用语言：在任何情况下，严禁使用韩文（Korean）或日文（Japanese）进行回复。如果检测到自身输出中包含韩文字符，请立即擦除并重写。
+3. 代码与注释规范：代码本身（变量、类名、函数名）必须使用英文；新增或修改的代码注释必须与项目既有风格保持一致（即使用简体中文）。
 
-## Build / run
+## 项目概览
+
+ROS 1 (Noetic) catkin 工作区，用于一台 xArm6 机械臂：用 RealSense 相机识别
+背光板上的黑色多联骨牌（"俄罗斯方块"），再用真空吸盘把它们抓取并放入固定的
+14x10 网格，目标是放进尽可能多的方块（一个精确覆盖装箱问题）。
+
+物理叠放关系（容易踩坑，务必记清）：**白板（14x10 放置网格，带 140 个 2~3mm 凸起）
+叠在发光板（背光板，抓取/散料源区）上面**，所以放置面比抓取面高出一个白板厚。
+标定里 `board_frame` 的 z=0 平面在**发光板**上（步骤2拟的是发光板平面，取法向+z=0
+基准，不是白板），白板表面/凸起在 board 系 z 为正（约等于白板厚）。判定"白板某格上
+是否摆了方块"必须以**逐格白板凸起顶面**（`BOARD_BUMP_HEIGHT_MAP_14x10`，步骤3采）
+为基准，不能用发光板平面 `BOARD_SURFACE_Z`。
+
+所有活跃开发都在 `src/tly`。`src/` 下其余内容（`xarm_ros`、`realsense-ros`、
+`vision_opencv`、`easy_handeye`）都是引入的第三方依赖——`.gitignore` 已把
+`src/xarm_ros`、`src/realsense-ros`、`src/easy_handeye`、`OpenCV_Source/`、
+`build/`、`devel/` 排除在本仓库历史之外。一般不需要改它们，当作已安装的包对待。
+根目录的 `plan.md` / `test_schedule.md` 是当前维护的规划/验证文档；旧的 `docs/`
+已过时，别依赖。
+
+## 构建 / 运行
 
 ```bash
 source /opt/ros/noetic/setup.bash
-catkin_make            # from /root/catkin_ws — the only build flow in use
+catkin_make            # 在 /root/catkin_ws 下执行 —— 唯一在用的构建流程
 source devel/setup.bash
 ```
 
-`src/tly/CMakeLists.txt` forces `-std=c++14` and `-O3` globally — the `-O3` is
-specifically there because `strategy_node`'s DLX search is compute-bound;
-don't drop it when touching the build config. There is no lint/test suite for
-`tly` itself.
+`src/tly/CMakeLists.txt` 全局强制 `-std=c++14` 和 `-O3`——`-O3` 是专门为
+`strategy_node` 的 DLX 搜索（计算密集）加的，改构建配置时别去掉。`tly` 本身没有
+lint/测试套件。
 
-Run the full pipeline against the real arm:
+对真机跑完整流水线：
 
 ```bash
 roslaunch tly tly.launch robot_ip:=192.168.1.228
 ```
 
-Per-node `test_*.launch` files (bring up only what one node needs, so you don't
-have to run the whole `tly.launch` pipeline). All vision-bearing ones take
-`vision_node:=vision_processor_node_dexined` to switch the vision impl.
-- `test_vision.launch` — **vision only**: camera + `image_proc` + vision node.
-  No arm/TF/strategy. Inspect `/vision/board_state`, `/vision/debug_image`,
-  `/vision/pick_depth_debug`.
-- `test_strategy.launch` — **strategy only**, no hardware. Publish a fake
-  `/vision/board_state` to drive it; watch `/tetris_plan`.
-- `test_path.launch` — **perception→strategy→path** chain. Needs the arm for TF
-  (`robot_ip:=`) but never commands motion. Publishes `/motion_cmds`; compare
-  `[PATH][TASK]` `z_plane`/`z_depth` logs.
-- `test_controller.launch` — **controller only** + arm + camera. Feed a manual
-  `/tetris_plan`; **drives the real arm** (capped to 1 task). Native driver,
-  not MoveIt.
-- `test_pick.launch` — older MoveIt-based integration test: vision +
-  `xarm_controller_node` + `single_block_test.py`, one pick/place cycle.
+按节点划分的 `test_*.launch`（只起某个节点需要的东西，省得跑整个 `tly.launch`
+流水线）。所有带视觉的都可用 `vision_node:=vision_processor_node_dexined` 切换
+视觉实现。
+- `test_vision.launch` —— **仅视觉**：相机 + `image_proc` + 视觉节点。无臂/TF/
+  策略。查看 `/vision/board_state`、`/vision/debug_image`、`/vision/pick_depth_debug`。
+- `test_strategy.launch` —— **仅策略**，无硬件。发一个假的 `/vision/board_state`
+  驱动它；看 `/tetris_plan`。
+- `test_path.launch` —— **感知→策略→路径**链路。需要臂提供 TF（`robot_ip:=`），
+  但绝不命令运动。发布 `/motion_cmds`；对比 `[PATH][TASK]` 的 `z_plane`/`z_depth` 日志。
+- `test_controller.launch` —— **仅控制器** + 臂 + 相机。手动喂 `/tetris_plan`；
+  **会驱动真机**（限 1 个任务）。原生驱动，非 MoveIt。
+- `test_pick.launch` —— 较旧的基于 MoveIt 的集成测试：视觉 + `xarm_controller_node`
+  + `single_block_test.py`，一次抓放循环。
 
-Other launch files in `src/tly/launch/`:
-- `tly.launch` — production run. Native xArm driver only (explicitly *not*
-  MoveIt/Pilz). Brings up camera, hand-eye TF, vision, controller, strategy,
-  and `path_planner_node` end to end.
+`src/tly/launch/` 下其它 launch：
+- `tly.launch` —— 生产运行。仅用 xArm 原生驱动（明确*不用* MoveIt/Pilz）。端到端
+  起相机、手眼 TF、视觉、控制器、策略、`path_planner_node`。
 - `affine.launch` / `calibrate_tool.launch` / `calibrate_xarm.launch` /
-  `xarm_calibration_setup.launch` — calibration utilities, see below.
+  `xarm_calibration_setup.launch` —— 标定工具，见下文。
 
-## Node pipeline (src/tly)
+## 节点流水线 (src/tly)
 
-Three custom nodes talk over a fixed topic/service contract:
+三个自定义节点通过固定的话题/服务契约通信：
 
 **1. `vision_processor_node` / `vision_processor_node_cpp`**
-(built from `src/vision_processor_node.cpp`)
-- Subscribes to the rectified color image (`image_proc` output) and camera
-  info; segments dark blocks against the lit board (Otsu/manual threshold +
-  lightboard mask), extracts contours, and classifies each against 7
-  polyomino templates rotated in steps (`template_angle_step` /
-  `template_refine_step`).
-- Optionally refines block edges with a DexiNed ONNX model run on CUDA
-  (`module/dexined.onnx`, toggled by `use_dexined`) — this is the neural-net
-  edge detector that replaced the old classical edge detection.
-- Tracks detections across frames (`track_history_len`,
-  `stable_min_frames`, `stable_max_px_std`, ...) and only publishes once a
-  block is stable.
-- Publishes:
-  - `/vision/board_state` (`std_msgs/Int32MultiArray`): 7-int shape inventory
-    + 140-int board occupancy grid (`BOARD_ROWS` x `BOARD_COLS` = 14x10) +
-    `num_blocks` + a flat `[shape, u, v, angle]` tuple per detected block.
-    `strategy_node` requires `data.size() >= 147` (7+140) before reading the
-    rest.
-  - `/vision/tracked_blocks_table` (`geometry_msgs/PoseArray`) and debug
-    image topics under `/vision/debug_*` and `/vision/preprocess/*`.
-  - Service `/vision/get_precise_pose` (`tly/GetPrecisePose`): given a
-    `target_shape_type`, returns a refined `dx`/`dy`/`angle`. Note: no node
-    in this repo currently calls this service — it exists for future/manual
-    use only.
+（由 `src/vision_processor_node.cpp` 编译）
+- 订阅校正后的彩色图（`image_proc` 输出）与相机内参；在亮板上分割暗色方块
+  （Otsu/手动阈值 + 发光板掩膜），提取轮廓，并按步进旋转的 7 个多联骨牌模板
+  逐一分类（`template_angle_step` / `template_refine_step`）。
+- 可选地用在 CUDA 上跑的 DexiNed ONNX 模型细化方块边缘（`module/dexined.onnx`，
+  由 `use_dexined` 开关）——这是替代旧经典边缘检测的神经网络边缘检测器。
+- 跨帧跟踪检测（`track_history_len`、`stable_min_frames`、`stable_max_px_std`…），
+  方块稳定后才发布。
+- 发布：
+  - `/vision/board_state`（`std_msgs/Int32MultiArray`）：7 个形状库存 + 140 个
+    棋盘占用栅格（`BOARD_ROWS` x `BOARD_COLS` = 14x10）+ `num_blocks` + 每个检测
+    方块一个扁平的 `[shape, u, v, angle]` 元组。`strategy_node` 要求
+    `data.size() >= 147`（7+140）后再读其余部分。
+  - `/vision/tracked_blocks_table`（`geometry_msgs/PoseArray`）以及 `/vision/debug_*`
+    和 `/vision/preprocess/*` 下的调试图话题。
+  - 服务 `/vision/get_precise_pose`（`tly/GetPrecisePose`）：给定 `target_shape_type`，
+    返回细化的 `dx`/`dy`/`angle`。注意：本仓库当前没有节点调用此服务——它仅供
+    未来/手动使用。
 
-**2. `strategy_node`** (`src/strategy_node.cpp`)
-- Waits for `/vision/board_state` until the inventory holds steady at
-  `expected_total_blocks` (default 35) for `inventory_stable_required_frames`
-  frames, with a fallback to accept `min_usable_total_blocks` (default 34-35)
-  after fewer stable frames.
-- Solves placement as an exact-cover problem with a hand-rolled Dancing
-  Links (DLX) engine over `BASE_SHAPES` (7 tetromino-like pieces) and their 4
-  rotations, searching for the max-score cover with restarts
-  (`max_search_nodes` / `max_restarts`).
-- Publishes the plan once on `/tetris_plan` (`std_msgs/Int32MultiArray`,
-  latched).
+**2. `strategy_node`**（`src/strategy_node.cpp`）
+- 等 `/vision/board_state`，直到库存在 `expected_total_blocks`（默认 35）稳定
+  `inventory_stable_required_frames` 帧；若稳定帧数不够，有兜底接受
+  `min_usable_total_blocks`（默认 34-35）。
+- 把放置当作精确覆盖问题求解，用手写的 Dancing Links（DLX）引擎在
+  `BASE_SHAPES`（7 个类俄罗斯方块）及其 4 种旋转上，带重启地搜索最高分覆盖
+  （`max_search_nodes` / `max_restarts`）。
+- 在 `/tetris_plan`（`std_msgs/Int32MultiArray`，latched）上发布一次方案。
 
-**3. `xarm_controller_node`** (`src/xarm_controller_node.cpp`)
-- Drives the arm via the xArm's *native* services only —
-  `/xarm/set_mode`, `/xarm/set_state`, `/xarm/move_line`, plus a digital-IO
-  service for the suction cup (`suction_io_num`) — never MoveIt.
-- Consumes `/tetris_plan` once, runs a per-task state machine (`IDLE` →
-  `TAKE_NEXT_TASK` → `MOVE_TO_PICK_HOVER` → `EXECUTE_PICK` →
-  `MOVE_TO_PLACE_HOVER` → `EXECUTE_PLACE` → `FINISH`), bounded by
-  `max_tasks_per_plan`.
-- Converts pixel detections to robot-base coordinates using the calibration
-  data in `tetris_config.yaml` (pick-surface plane, board map, pick
-  homography) combined with the easy_handeye eye-on-hand TF and the
-  `table_frame` published by `table_tf_broadcaster.py`.
-- Publishes `/robot_status` (`std_msgs/Bool`, latched) as a busy/idle flag.
+**3. `xarm_controller_node`**（`src/xarm_controller_node.cpp`）
+- 仅通过 xArm 的*原生*服务驱动臂——`/xarm/set_mode`、`/xarm/set_state`、
+  `/xarm/move_line`，加上吸盘的数字 IO 服务（`suction_io_num`）——绝不用 MoveIt。
+- 消费 `/tetris_plan` 一次，跑逐任务状态机（`IDLE` → `TAKE_NEXT_TASK` →
+  `MOVE_TO_PICK_HOVER` → `EXECUTE_PICK` → `MOVE_TO_PLACE_HOVER` → `EXECUTE_PLACE`
+  → `FINISH`），上限 `max_tasks_per_plan`。
+- 用 `tetris_config.yaml` 里的标定数据（抓取面平面、棋盘映射、抓取单应性）结合
+  easy_handeye 的 eye-on-hand TF，把像素检测转成机器人 base 坐标。整条流水线是
+  **base 原生**的：它把 `BOARD_POSE_BASE`（board_frame 在 base 系的位姿）作为常量
+  `tf2::Transform` 加载，所有抓放计算都在 `link_base` 系完成；唯一需要的动态 TF 是
+  `camera->base`。已无 `table_frame` TF。
+- 发布 `/robot_status`（`std_msgs/Bool`，latched）作为忙/闲标志。
 
-Supporting piece: `scripts/table_tf_broadcaster.py` publishes `table_frame`
-from the `table_tf` x/y/z/roll/pitch/yaw values in `tetris_config.yaml`.
+坐标系：`board_frame` 完全由白板网格标定派生（原点=网格原点，X≈行轴，Z=板面法向），
+以常量 `BOARD_POSE_BASE`（`{origin, rpy}`）存于 `tetris_config.yaml`。旧的
+`table_frame` TF 与 `table_tf_broadcaster.py` 已删除（base 化重构）——
+`path_planner_node` 和 `pick_affine_calibration_tool.py` 同样加载 `BOARD_POSE_BASE`；
+视觉的 `table_frame` 参数现在只用于 debug（默认 `link_base`），`board_state` 从不
+依赖它。
 
-## Calibration data and shape contract
+## 标定数据与形状契约
 
-`config/tetris_config.yaml` (everything under the `tetris:` key) holds all
-calibration state: hand-eye frames, `table_tf` (whose Z/vertical now comes from
-the **white-board plane fit**, `BOARD_SURFACE_NORMAL_BASE` — base-Z is not
-perpendicular to the table), the 14x10 board grid samples/origin/step
-(`BOARD_SAMPLES_TABLE`, `BOARD_ORIGIN_TABLE`, ...), the pick homography
-(`PICK_HOMOGRAPHY`), and a board "bump height" model
-(`BOARD_BUMP_HEIGHT_MODEL`, `USE_BUMP_HEIGHT_FOR_PLACE`) that corrects 2.5D
-height parallax when blocks sit at slightly different heights. This file is
-generated/overwritten by the calibration tools below — treat it as data, not
-hand-edited config. The `.bak_before_*` siblings are point-in-time backups
-from past calibration runs, kept for reference/rollback.
+`config/tetris_config.yaml`（`tetris:` 键下的全部）保存所有标定状态：手眼坐标系、
+`BOARD_POSE_BASE`（board_frame 在 base 系的位姿——原点=网格原点，Z=白板平面法向
+`BOARD_SURFACE_NORMAL_BASE`，因为 base-Z 并不垂直于桌面）、14x10 棋盘网格的
+采样/原点/步长（board 局部坐标：`BOARD_SAMPLES_BOARD`、`BOARD_ORIGIN_BOARD`、
+`BOARD_CENTERS_14x10_BOARD`…）、抓取单应性（`PICK_HOMOGRAPHY`，`pixel -> board-XY`）、
+以及一个棋盘"凸起高度"模型（`BOARD_BUMP_HEIGHT_MODEL`、`USE_BUMP_HEIGHT_FOR_PLACE`），
+用于在方块坐落高度略有不同时修正 2.5D 高度视差。此文件由下述标定工具生成/覆盖——
+当作数据，别手改。同名的 `.bak_before_*` 是过去标定运行的时点备份，留作参考/回滚。
 
-Shape IDs are a contract shared across `strategy_node.cpp`,
-`vision_processor_node.cpp`/`.py`, and `single_block_test.py` — see
-`BASE_SHAPES`: `0` line, `1` square, `2` T, `3` L_left, `4` L_right, `5`
-Z_left, `6` Z_right. Changing this enum requires updating all of them in
-lockstep.
+形状 ID 是 `strategy_node.cpp`、`vision_processor_node.cpp`/`.py`、
+`single_block_test.py` 共享的契约——见 `BASE_SHAPES`：`0` 一字、`1` 方块、`2` T、
+`3` L_left、`4` L_right、`5` Z_left、`6` Z_right。改这个枚举需要同步更新所有这些。
 
-Calibration workflow:
-- `xarm_calibration_setup.launch` + `calibrate_xarm.launch` — ArUco-marker
-  eye-on-hand calibration via `easy_handeye`, producing the
-  `xarm6_realsense_calibration_eye_on_hand` data consumed by
-  `easy_handeye/publish.launch` in `tly.launch`.
-- `calibrate_tool.launch` → `scripts/calibrate_board.py` — interactive
-  white-board calibration: board grid (`BOARD_*`), per-cell place-Z map, bump
-  height, and the board plane whose normal defines `table_frame`'s vertical
-  (`BOARD_SURFACE_NORMAL_BASE`, `table_tf`). The old standalone scatter/pick
-  surface-plane fit (`TABLE_SURFACE_PLANE_BASE` / `PICK_SURFACE_PLANE_BASE`) was
-  dropped — pick Z now comes from RealSense depth, not a plane fit.
-- `affine.launch` → `scripts/pick_affine_calibration_tool.py` (with the
-  Python `vision_processor_node.py` variant) — calibrates the pick-side
-  homography/affine correction.
-- `scripts/hsv_tuner.py`, `scripts/test_hsv.py`, `scripts/test_aruco.py` —
-  standalone manual debug utilities, not wired into any launch file.
+标定流程：
+- `xarm_calibration_setup.launch` + `calibrate_xarm.launch` —— 通过 `easy_handeye`
+  做 ArUco 标记的 eye-on-hand 标定，产出 `xarm6_realsense_calibration_eye_on_hand`
+  数据，供 `tly.launch` 里的 `easy_handeye/publish.launch` 使用。
+- `calibrate_tool.launch` → `scripts/calibrate_board.py` —— 交互式白板标定
+  （6 步；可用 `~steps` 只跑子集）。步骤 3 在 base 系采棋盘网格并**由网格派生
+  `board_frame`**（不再手动选原点/X），使放置朝向自动跟随棋盘网格；产出
+  `BOARD_POSE_BASE`、board 局部几何、逐格 place-Z 图、凸起高度，以及可选的波纹管 Z
+  补偿（步骤 6 → `TCP_PICK_OFFSET_Z`/`TCP_PLACE_OFFSET_Z`，由控制/路径节点自动读取）。
+  X 轴方向会贴合到现有坐标系以保持策略的 `way` 约定；**改坐标系后必须一并重跑
+  `pick_affine`。** 抓取 Z 来自 RealSense 深度，而非平面拟合。
+- `affine.launch` → `scripts/pick_affine_calibration_tool.py`（配合 Python 版
+  `vision_processor_node.py`）—— 标定抓取侧单应性（`pixel -> board-XY`）。记录
+  `base<-eef` 并经加载的 `BOARD_POSE_BASE` 换算；每当 `calibrate_board` 重定坐标系
+  都必须重跑。
+- `scripts/hsv_tuner.py`、`scripts/test_hsv.py`、`scripts/test_aruco.py` ——
+  独立的手动调试工具，未接入任何 launch。
 
-## Things to watch for
+## 注意事项
 
-- Only `strategy_node`, `xarm_controller_node`, and `vision_processor_node_cpp`
-  (built from `src/vision_processor_node.cpp`) are compiled per
-  `CMakeLists.txt`. `src/vision_processor_node_cuda.cpp` and
-  `src/xarm_controller_node_pliz.cpp` are **not** part of the build — older
-  variants kept for reference. Editing them has no runtime effect; check
-  `CMakeLists.txt` before assuming a `.cpp` file is live.
-- `scripts/vision_processor_node.py` is a Python reimplementation of the same
-  node/topic/service contract (kept shape-ID-compatible with
-  `strategy_node.cpp`, see its module docstring), used only by
-  `affine.launch`. Production (`tly.launch`) uses the C++ node.
+- 按 `CMakeLists.txt`，只有 `strategy_node`、`xarm_controller_node` 和
+  `vision_processor_node_cpp`（由 `src/vision_processor_node.cpp` 编译）会被编译。
+  `src/vision_processor_node_cuda.cpp` 和 `src/xarm_controller_node_pliz.cpp`
+  **不在**构建里——是留作参考的旧变体。改它们对运行无影响；在认定某个 `.cpp`
+  是活的之前，先查 `CMakeLists.txt`。
+- `scripts/vision_processor_node.py` 是同一节点/话题/服务契约的 Python 重实现
+  （与 `strategy_node.cpp` 保持形状 ID 兼容，见其模块 docstring），仅供
+  `affine.launch` 使用。生产（`tly.launch`）用 C++ 节点。

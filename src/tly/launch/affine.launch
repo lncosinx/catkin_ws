@@ -31,7 +31,6 @@
     <rosparam file="$(find tly)/config/tetris_config.yaml" command="load" />
 
     <!-- 5. 发布 table_frame -->
-    <node pkg="tly" type="table_tf_broadcaster.py" name="table_tf_broadcaster" output="screen" />
 
     <!-- 6. 生成 rectified color image -->
     <node pkg="image_proc" type="image_proc" name="image_proc" ns="/camera/color" output="screen" />
@@ -42,7 +41,6 @@
         <param name="image_topic" value="/camera/color/image_rect_color" />
         <param name="camera_info_topic" value="/camera/color/camera_info" />
         <param name="assume_image_rectified" value="true" />
-        <param name="table_frame" value="table_frame" />
 
         <param name="pick_point_mode" value="centroid" />
 

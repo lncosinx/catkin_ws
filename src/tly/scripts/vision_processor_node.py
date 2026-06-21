@@ -319,7 +319,8 @@ class ShapeTemplateVisionNode(object):
         self.image_topic = rospy.get_param("~image_topic", "/camera/color/image_rect_color")
         self.camera_info_topic = rospy.get_param("~camera_info_topic", "/camera/color/camera_info")
         self.assume_image_rectified = bool(rospy.get_param("~assume_image_rectified", True))
-        self.table_frame = rospy.get_param("~table_frame", "table_frame")
+        # table_frame 已废弃（全量 base 化）。仅 debug 用，默认 link_base；board_state 不依赖此 TF。
+        self.table_frame = rospy.get_param("~table_frame", "link_base")
         self.camera_frame_override = rospy.get_param("~camera_frame", "")
         self.target_plane_z = rospy.get_param("~target_plane_z", rospy.get_param("/tetris/PICK_Z", 0.0))
         self.hover_z = rospy.get_param("~hover_z", rospy.get_param("/tetris/HOVER_Z", 0.10))

@@ -23,7 +23,7 @@ xArm6 俄罗斯方块抓取项目的代码重构方案。目标是把现有「�
 | `src/xarm_controller_node_pliz.cpp` | Pilz/PTP 版，不参与编译 | **删除**（PTP 路径让波纹管吸嘴螺旋、方块受重力旋转） |
 | `scripts/calibration_tool.py` | 同时做①桌面/吸取面平面拟合 ②白板格心+放置 Z | **拆分**：丢弃①，保留②为「白板标定」 |
 | `scripts/pick_affine_calibration_tool.py` | 单应性矩阵标定 | 保留为「单应性标定」 |
-| `scripts/table_tf_broadcaster.py` | 发布 `table_frame` | 视「待定决策 D1」决定保留/删除 |
+| `scripts/table_tf_broadcaster.py` | 发布 `table_frame` | **已删除**（2026-06-20 全量 base 化：board_frame 改存常量 `BOARD_POSE_BASE`，节点直接在 base 系算） |
 | `srv/GetPrecisePose.srv` + `handle_precise` | 无人调用的历史遗留服务 | **删除** |
 
 关键事实（来自现有代码，重构时要继承/搬运）：
@@ -32,8 +32,9 @@ xArm6 俄罗斯方块抓取项目的代码重构方案。目标是把现有「�
   用 `PICK_SURFACE_PLANE_BASE`（平面拟合）做射线求交得到 Z，再用
   `pixelToPickPointTable` 做 2.5D 视差压缩 + 单应性求 XY。**没有任何节点读取
   RealSense 深度**（`/camera/aligned_depth_to_color/*` 当前未被订阅）。
-- **放置点**：`bilinearBoardCenter` 用 `BOARD_CENTERS_14x10_TABLE` 双线性插值
-  得到 XY，Z 来自 `PLACE_Z_MAP_14x10` / `BOARD_BUMP_HEIGHT_MODEL`。
+- **放置点**：`bilinearBoardCenter` 用 `BOARD_CENTERS_14x10_BOARD`（board 系，
+  2026-06-20 起由 `_TABLE` 改名）双线性插值得到 XY，Z 来自 `PLACE_Z_MAP_14x10` /
+  `BOARD_BUMP_HEIGHT_MODEL`。
 - **顺序规划现状**：`strategy_node.cpp` 已经建了「上下相邻块」的有向图并做拓扑
   排序 + 优先队列（按最低行、最左列），这正是「跨行连接」约束的雏形。
 - **打分现状**：满行 +10，满行且 `unique_colors>=4` 再 +10——「每行四种不同
@@ -111,13 +112,20 @@ xArm6 俄罗斯方块抓取项目的代码重构方案。目标是把现有「�
 > 多帧×几千像素治随机噪声，走位差分治系统偏置。详见 §2 动作项。）
 > `table_frame` 以何种形式存在（继续发 TF，还是只存一个法向量在 base 系里用）
 > 属实现细节，二者等价；单应性与白板格心相应统一到所选参考系。
+>
+> **（2026-06-20 终稿）全量 base 化**：取消 `table_frame` TF 与
+> `table_tf_broadcaster.py`；board_frame 改为**完全由白板网格派生**（原点=网格原点、
+> X≈行轴、Z=板面法向），以常量 `BOARD_POSE_BASE`(`{origin, rpy}`) 写入 config，
+> 控制/路径/单应性节点直接在 base 系用它换算（唯一动态 TF 是 camera→base）。
+> 单应性改为 `pixel → board-XY`；放置 yaw=`-way·90°`，X 轴方向对齐到现有系最近的网格轴
+> 以保 strategy `way` 约定。**改坐标系后必须重跑 `calibrate_board` + `pick_affine`。**
 
 动作项：
 - [x] 把 `calibration_tool.py` 拆成 `calibrate_board.py`（只做白板：格心 +
       `PLACE_Z_MAP` + `BUMP_HEIGHT` + 板面平面）。
 - [x] **板面平面改由单帧对齐深度采集**（替代触点采集）：静止机位多帧逐像素中值
       + ROI（交互框选 / 参数 / 持久化复用）+ 深度范围门 + RANSAC 主平面 → 法向
-      (base，定 table_frame 竖直) 与放置面 Z（同一物理白板，转 table 系）。
+      (base，定 board_frame 竖直/Z) 与放置面 Z（同一物理白板，转 board 系）。
 - [x] 新增**走位差分验证 / 尺度**步：手动挪一小段二次采集，差分估深度尺度、两次
       法向一致性、base-Z↔法向夹角（差分抵消常值偏置）；结果存 `BOARD_DEPTH_VERIFY`。
 - [ ] 板面法向 → 抓取/放置的工具姿态（垂直板面，而非 base-Z）。**随路径/控制做。**
@@ -296,8 +304,9 @@ xArm6 俄罗斯方块抓取项目的代码重构方案。目标是把现有「�
 - **D1 竖直参考**：实测 base-Z **不**垂直于桌面（沿 base-X/Y 平移会下沉，且
   X、Y 偏差不同 → base 平面相对桌面有倾斜）。**不删除「板面对齐的竖直参考」**，
   但**取消独立的桌面坐标系标定**：板面法向改由**白板标定**的平面拟合得到，用于
-  抓取下压与放置的竖直方向/工具姿态。`table_frame` 以 TF 还是法向量形式存在为
-  实现细节。详见 §2。
+  抓取下压与放置的竖直方向/工具姿态。**（2026-06-20 终稿）**坐标系全量 base 化：
+  删 `table_frame` TF/broadcaster，board_frame 由白板网格派生、以常量
+  `BOARD_POSE_BASE` 存 config，节点在 base 系直接换算。详见 §2。
 - **D2 深度 Z 用法 + 输出消息**：**两种解算都做、参数切换**
   （`pick_xy_source = homography | depth`）以提升鲁棒性；输出采用**方案 B**
   （新增带 Z 的抓取位姿消息），`board_state` 仅留库存/栅格。详见 §3。
@@ -320,7 +329,12 @@ xArm6 俄罗斯方块抓取项目的代码重构方案。目标是把现有「�
   rect→raw 修正），log + `/vision/pick_depth_debug` 调试话题。⚠️ 数值待真机验证。
 - [x] **4 标定缩减**：`calibration_tool.py` → `calibrate_board.py`；板面法向 + 放置面 Z
   改由**单帧对齐深度 + ROI + RANSAC**（替代触点），新增走位差分验证/尺度步；法向定
-  table_frame 竖直（D1）。⚠️ 需真机重跑标定验证（命令见 [test_schedule.md](test_schedule.md) 第 3 项）。
+  board_frame 竖直（D1）。⚠️ 需真机重跑标定验证（命令见 [test_schedule.md](test_schedule.md) 第 3 项）。
+- [x] **6 全量 base 化（2026-06-20）**：删 `table_frame` TF/broadcaster；board_frame 由
+  网格派生存常量 `BOARD_POSE_BASE`；controller/path 加载常量在 base 系算（唯一动态 TF
+  camera→base）；`calibrate_board` step3 采网格派生坐标系（去手动原点/X），`pick_affine`
+  改 `pixel→board-XY`。编译 + 变换数值等价已过；⚠️ **clean cut：必须重跑
+  `calibrate_board`+`pick_affine`，并上机核对放置朝向**（X 轴自动对齐未经硬件验证）。
 - [~] **5 路径模块（5a 已做，5b 待真机）**：
   - [x] **5a** 新建 `path_planner_node`（附加式）：坐标解算 + 深度 Z，发布
     `/motion_cmds`；控制器未动、仍吃 `/tetris_plan`。⚠️ `/motion_cmds` 待真机对照。
@@ -381,9 +395,10 @@ xArm6 俄罗斯方块抓取项目的代码重构方案。目标是把现有「�
   `calibrate_board.py`）。首次交互框选 ROI（空板、看白板平坦区），确认：拟合内点率/
   残差(mm级)合理、走位验证 `深度尺度比≈1` / `两次法向夹角≈0` / `base-Z↔法向夹角`
   (实测倾斜值)、新键 `BOARD_SURFACE_NORMAL_BASE` / `BOARD_SURFACE_PLANE` /
-  `BOARD_DEPTH_ROI` / `BOARD_DEPTH_VERIFY` 及 `table_tf` / `BOARD_CENTERS` /
-  `PLACE_Z_MAP` 合理。注意：重跑整文件重写 `tetris_config.yaml`，旧
-  `PICK_SURFACE_PLANE_BASE` 消失、旧控制器抓取 Z 回退 flat `PICK_Z`（与迁移方向一致）。
+  `BOARD_DEPTH_ROI` / `BOARD_DEPTH_VERIFY` 及 `BOARD_POSE_BASE` /
+  `BOARD_CENTERS_14x10_BOARD` / `PLACE_Z_MAP` 合理（2026-06-20 全量 base 化后
+  坐标键由 `table_tf`/`*_TABLE` 改名）。然后**重跑 `affine.launch`** 重标单应性
+  (`pixel→board-XY`)，并用 `test_controller.launch`(限1任务)核对放置朝向。
 - [ ] **路径节点 5a**：`roslaunch tly test_path.launch`（机械臂只供 TF、不运动），
   `rostopic echo /motion_cmds`；对照 `[PATH][TASK]` 与 `[CTRL][TASK]` 日志——XY 应
   与控制器一致，`z_depth` vs `z_plane` 看深度相对平面的差异。**这是 5b 切换前的前置验证。**

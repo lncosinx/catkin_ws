@@ -12,6 +12,7 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Transform.h>
 
 #include <geometry_msgs/Pose.h>
 #include <geometry_msgs/PoseStamped.h>
@@ -162,10 +163,14 @@ private:
     std::string status_topic_ = "/robot_status";
     std::string io_service_ = "/xarm/set_controller_dout";
     std::string camera_info_topic_ = "/camera/color/camera_info";
-    std::string table_frame_ = "table_frame";
     std::string base_frame_ = "link_base";
     std::string camera_frame_ = "camera_color_optical_frame";
     std::string eef_frame_ = "link_tcp";
+
+    // board_frame 在 base 的常量位姿（由 /tetris/BOARD_POSE_BASE 派生），取代旧 table_frame TF。
+    bool board_pose_loaded_ = false;
+    tf2::Transform board_to_base_;   // board_frame -> base
+    tf2::Transform base_to_board_;   // 逆
 
     double control_period_ = 0.05;
     bool xarm_wait_for_finish_ = true;
@@ -329,7 +334,6 @@ private:
         pnh_.param("status_topic", status_topic_, status_topic_);
         pnh_.param("io_service", io_service_, io_service_);
         pnh_.param("camera_info_topic", camera_info_topic_, camera_info_topic_);
-        pnh_.param("table_frame", table_frame_, table_frame_);
         pnh_.param("base_frame", base_frame_, base_frame_);
         pnh_.param("camera_frame", camera_frame_, camera_frame_);
         pnh_.param("eef_frame", eef_frame_, eef_frame_);
@@ -414,16 +418,44 @@ private:
         nh_.param("/tetris/PLACE_Z", PLACE_Z_, PLACE_Z_);
         nh_.param("/tetris/HOVER_Z", HOVER_Z_, HOVER_Z_);
 
+        board_pose_loaded_ = loadBoardPose();
         board_centers_loaded_ = loadBoardCenters14x10();
         place_z_map_loaded_ = loadPlaceZMap14x10();
         pick_plane_loaded_ = loadPickPlaneIfAvailable();
         pick_homography_loaded_ = loadPickHomographyIfAvailable();
 
-        ROS_INFO("[CTRL] calib: board=%s zmap=%s pick_plane=%s pick_homography=%s",
+        ROS_INFO("[CTRL] calib: board_pose=%s board=%s zmap=%s pick_plane=%s pick_homography=%s",
+                 board_pose_loaded_ ? "loaded" : "MISSING",
                  board_centers_loaded_ ? "loaded" : "MISSING",
                  place_z_map_loaded_ ? "loaded" : "MISSING",
                  pick_plane_loaded_ ? "loaded" : "flat_PICK_Z",
                  pick_homography_loaded_ ? "loaded" : "off");
+    }
+
+    bool loadBoardPose()
+    {
+        XmlRpc::XmlRpcValue bp;
+        if (!nh_.getParam("/tetris/BOARD_POSE_BASE", bp) ||
+            bp.getType() != XmlRpc::XmlRpcValue::TypeStruct ||
+            !bp.hasMember("origin") || !bp.hasMember("rpy"))
+        {
+            ROS_ERROR("[CTRL] /tetris/BOARD_POSE_BASE not found; run calibrate_board first.");
+            return false;
+        }
+        tf2::Vector3 origin, rpy;
+        if (!readVector3List(bp["origin"], origin) || !readVector3List(bp["rpy"], rpy))
+        {
+            ROS_ERROR("[CTRL] Invalid BOARD_POSE_BASE.");
+            return false;
+        }
+        tf2::Quaternion q;
+        q.setRPY(rpy.x(), rpy.y(), rpy.z());
+        board_to_base_.setRotation(q);
+        board_to_base_.setOrigin(origin);
+        base_to_board_ = board_to_base_.inverse();
+        ROS_INFO("[CTRL] BOARD_POSE_BASE loaded: origin=(%.4f,%.4f,%.4f) rpy=(%.4f,%.4f,%.4f)",
+                 origin.x(), origin.y(), origin.z(), rpy.x(), rpy.y(), rpy.z());
+        return true;
     }
 
     static double unwrapAngle(double current, double target)
@@ -442,10 +474,10 @@ private:
             return false;
 
         XmlRpc::XmlRpcValue centers;
-        if (!nh_.getParam("/tetris/BOARD_CENTERS_14x10_TABLE", centers) ||
+        if (!nh_.getParam("/tetris/BOARD_CENTERS_14x10_BOARD", centers) ||
             centers.getType() != XmlRpc::XmlRpcValue::TypeArray || centers.size() <= 0)
         {
-            ROS_WARN("[CTRL] /tetris/BOARD_CENTERS_14x10_TABLE not found.");
+            ROS_WARN("[CTRL] /tetris/BOARD_CENTERS_14x10_BOARD not found.");
             return false;
         }
 
@@ -597,14 +629,27 @@ private:
 
     bool getObservationTransforms()
     {
+        if (!board_pose_loaded_)
+        {
+            ROS_ERROR_THROTTLE(2.0, "[CTRL] BOARD_POSE_BASE not loaded; cannot compute observations.");
+            return false;
+        }
         try
         {
-            observation_cam_to_table_ = tf_buffer_.lookupTransform(table_frame_, camera_frame_, ros::Time(0), ros::Duration(1.0));
-            if (use_true_pick_plane_ && pick_plane_loaded_)
+            // 唯一动态 TF：相机随臂动。其余用常量 board 位姿合成（base 化，不再查 table_frame）。
+            observation_cam_to_base_ = tf_buffer_.lookupTransform(base_frame_, camera_frame_, ros::Time(0), ros::Duration(1.0));
+            tf2::Transform cam_to_base;
             {
-                observation_cam_to_base_ = tf_buffer_.lookupTransform(base_frame_, camera_frame_, ros::Time(0), ros::Duration(1.0));
-                observation_base_to_table_ = tf_buffer_.lookupTransform(table_frame_, base_frame_, ros::Time(0), ros::Duration(1.0));
+                tf2::Quaternion q;
+                tf2::fromMsg(observation_cam_to_base_.transform.rotation, q);
+                cam_to_base.setRotation(q);
+                const auto &tr = observation_cam_to_base_.transform.translation;
+                cam_to_base.setOrigin(tf2::Vector3(tr.x, tr.y, tr.z));
             }
+            // board<-cam = (board<-base) * (base<-cam)；board<-base = base_to_board_(常量)。
+            tf2::Transform cam_to_board = base_to_board_ * cam_to_base;
+            observation_cam_to_table_.transform = tf2::toMsg(cam_to_board);
+            observation_base_to_table_.transform = tf2::toMsg(base_to_board_);
             return true;
         }
         catch (const tf2::TransformException &ex)
@@ -999,7 +1044,7 @@ private:
 
         if (require_board_map_ && !board_centers_loaded_)
         {
-            ROS_ERROR("[CTRL] Refuse plan: required BOARD_CENTERS_14x10_TABLE missing.");
+            ROS_ERROR("[CTRL] Refuse plan: required BOARD_CENTERS_14x10_BOARD missing.");
             return;
         }
         if (require_place_z_map_ && !place_z_map_loaded_)
@@ -1095,29 +1140,27 @@ private:
 
     bool poseTableToNativeBase(const geometry_msgs::Pose &target_table, std::vector<float> &pose_mm_rad) const
     {
-        geometry_msgs::PoseStamped ps_table, ps_base;
-        ps_table.header.frame_id = table_frame_;
-        ps_table.header.stamp = ros::Time(0);
-        ps_table.pose = target_table;
-        try
+        // board pose -> base native：用常量 board_to_base_，不走 TF。
+        if (!board_pose_loaded_)
         {
-            tf_buffer_.transform(ps_table, ps_base, base_frame_, ros::Duration(1.0));
-        }
-        catch (const tf2::TransformException &ex)
-        {
-            ROS_ERROR("[CTRL] table->base transform failed: %s", ex.what());
+            ROS_ERROR("[CTRL] BOARD_POSE_BASE not loaded; cannot convert pose.");
             return false;
         }
-
+        tf2::Transform t_board;
         tf2::Quaternion q;
-        tf2::fromMsg(ps_base.pose.orientation, q);
+        tf2::fromMsg(target_table.orientation, q);
+        t_board.setRotation(q);
+        t_board.setOrigin(tf2::Vector3(target_table.position.x, target_table.position.y, target_table.position.z));
+
+        tf2::Transform t_base = board_to_base_ * t_board;
+        tf2::Vector3 pos = t_base.getOrigin();
         double r = 0.0, p = 0.0, y = 0.0;
-        tf2::Matrix3x3(q).getRPY(r, p, y);
+        tf2::Matrix3x3(t_base.getRotation()).getRPY(r, p, y);
 
         pose_mm_rad = {
-            static_cast<float>(ps_base.pose.position.x * 1000.0),
-            static_cast<float>(ps_base.pose.position.y * 1000.0),
-            static_cast<float>(ps_base.pose.position.z * 1000.0),
+            static_cast<float>(pos.x() * 1000.0),
+            static_cast<float>(pos.y() * 1000.0),
+            static_cast<float>(pos.z() * 1000.0),
             static_cast<float>(r),
             static_cast<float>(p),
             static_cast<float>(normalizeAngleRad(y))};

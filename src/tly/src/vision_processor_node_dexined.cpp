@@ -785,7 +785,9 @@ public:
         pnh_.param("image_topic", image_topic, string("/camera/color/image_rect_color"));
         pnh_.param("camera_info_topic", camera_info_topic, string("/camera/color/camera_info"));
         pnh_.param("assume_image_rectified", assume_rectified, true);
-        pnh_.param("table_frame", table_frame, string("table_frame"));
+        // table_frame 已废弃（全量 base 化）。仅用于 debug 投影/PoseArray，默认 link_base；
+        // board_state 契约只用像素+图像角，不依赖此 TF。
+        pnh_.param("table_frame", table_frame, string("link_base"));
         pnh_.param("camera_frame", camera_frame_override, string(""));
 
         nh_.param("/tetris/PICK_Z", target_plane_z, 0.0);

@@ -19,6 +19,7 @@
 | 3 | 板面标定（**深度重构**） | §9-4 / §11 | ⏳ 待真机重跑 | 臂+相机 |
 | 4 | 路径节点 5a（`/motion_cmds`） | §9-5a / §11 | ⏳ 待真机对照 | 臂(仅TF)+相机 |
 | 5 | 进阶模式真机 | §9-6 / §11 | ⏳ 待真机 | 相机 |
+| 6 | **全量 base 化**（删 table_frame，board_frame 由网格派生存 `BOARD_POSE_BASE`） | §9-6 | ⏳ **必须重标 + 上机核对朝向**（编译/数值已过） | 臂+相机 |
 
 ---
 
@@ -113,11 +114,17 @@ roslaunch tly calibrate_tool.launch robot_ip:=192.168.1.228 board_roi:="u0,v0,w,
    - `两次法向夹角 ≈ 0°`（大 → TF 或深度不自洽）。
    - `base-Z 与板面法向夹角` 应是个**明显非零**的小角（正是 plan.md §2/§10 实测的倾斜，
      记下这个实测值）。
-4. **放置面 Z**：日志 `放置面 z(table) 中值` + `残差 std`（mm 级）。
+4. **放置面 Z**：日志 `放置面 z(board) 中值` + `残差 std`（mm 级）。
 5. **输出核对**：`tetris_config.yaml` 新键 `BOARD_SURFACE_NORMAL_BASE`、`BOARD_SURFACE_PLANE`、
    `BOARD_DEPTH_ROI`、`BOARD_DEPTH_VERIFY` 合理；若有 `.bak` 旧触点标定，法向应与旧值接近。
 6. **回归依赖**：重跑会整文件重写 `tetris_config.yaml`，旧 `PICK_SURFACE_PLANE_BASE`
    消失属预期（plan.md §11）；之后跑第 4 项确认 `/motion_cmds` 仍正常。
+
+> ⚠️ **2026-06-20 全量 base 化后流程已变**（见下方第 6 项）：`calibrate_board.py` 改为
+> **6 步**，旧手动「Step 3 原点/X」已删——**步骤 3 改为采白板网格并由网格派生
+> `board_frame`**；输出键由 `table_tf`/`*_TABLE` 改为 `BOARD_POSE_BASE`/`*_BOARD`/
+> `BOARD_CENTERS_14x10_BOARD`。可用 `~steps` 跑子集（如 `_steps:=6` 只标波纹管）。
+> **标定坐标系变了 → 必须接着重跑 `affine.launch`（第 6 项）。**
 
 ---
 
@@ -151,6 +158,45 @@ rostopic echo /tetris_plan
 （[test_strategy.launch](src/tly/launch/test_strategy.launch) L29 / [tly.launch](src/tly/launch/tly.launch) L271）。
 **判据**：`/tetris_plan` 的放置**第 i 步形状 == 序列第 i 个**；首块落**最底行**；
 每步连接/下方支撑合法；`[ADVANCED]` 日志 `placed/score` 与离线一致。
+
+---
+
+## 6. 全量 base 化（删 table_frame）★ 重点 / 必做
+
+2026-06-20 改动：删 `table_frame` TF + `table_tf_broadcaster.py`；`board_frame` 完全由白板
+网格派生（原点=网格原点、X≈行轴、Z=板面法向），以常量 `BOARD_POSE_BASE`(`{origin,rpy}`)
+写入 config；[xarm_controller_node.cpp](src/tly/src/xarm_controller_node.cpp) /
+[path_planner_node.cpp](src/tly/src/path_planner_node.cpp) 加载常量在 base 系算（唯一动态
+TF camera→base）；[pick_affine_calibration_tool.py](src/tly/scripts/pick_affine_calibration_tool.py)
+改 `pixel→board-XY`；视觉 `table_frame` 降级为 debug（默认 `link_base`）。
+
+**这是 clean cut：旧标定失效。** `git` 改 C++ 后需 `catkin_make`（已编过）。
+
+```bash
+# 1) 重标坐标系/网格/放置面（6 步；首次必须含 step 2,3）
+roslaunch tly calibrate_tool.launch robot_ip:=192.168.1.228
+# 2) 重标单应性（pixel→board-XY，依赖上一步写的 BOARD_POSE_BASE）
+roslaunch tly affine.launch robot_ip:=192.168.1.228
+# 3) 限 1 个任务，慢速核对【放置朝向】
+roslaunch tly test_controller.launch robot_ip:=192.168.1.228
+```
+
+**判据**：
+1. **配置键**：`tetris_config.yaml` 出现 `BOARD_POSE_BASE`(origin+rpy)、`BOARD_ORIGIN_BOARD`/
+   `BOARD_ROW_STEP_BOARD`/`BOARD_COL_STEP_BOARD`、`BOARD_CENTERS_14x10_BOARD`、
+   `BOARD_SAMPLES_BOARD`；`PICK_HOMOGRAPHY.model` 为 `pixel→board-XY`。
+2. **节点加载**：controller/path 启动日志 `calib: board_pose=loaded board=loaded …`；
+   无 `BOARD_POSE_BASE not found` 报错；运行中无 `table_frame` 相关 TF 报错。
+3. **X 轴对齐（关键风险）**：calibrate_board step 3 日志应打印「X 轴方向已对齐到与现有
+   坐标系最接近的网格轴」。若是**首次无参考**会警告默认 +行轴——此时务必在第 3 步上机看
+   方块**落格后的朝向**是否与目标格一致（错则 90°/180° 偏，回查 `derive_board_frame` 的 X 选取）。
+4. **放置位姿**：`test_controller`（`max_tasks_per_plan=1`）单块慢跑，吸盘垂直板面、落点
+   XY 对准格心、朝向正确、Z 不过压（波纹管补偿 `TCP_*_OFFSET_Z` 已由 config 自动读）。
+5. **回归**：第 4 项 `/motion_cmds` 仍正常（path 与 controller XY 一致）；第 1/2 项视觉
+   `board_state` 不受影响（它本就只用像素+图像角，不依赖 `table_frame`）。
+
+> 离线已验证：`catkin_make` 全绿；`board_to_base · pose` 与旧 table-frame TF 变换数值
+> 等价（误差 ~1e-16），tf2 `setRPY/getRPY` 与 calibrate_board 的 `euler_matrix('sxyz')` 一致。
 
 ---
 

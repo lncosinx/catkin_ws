@@ -56,10 +56,7 @@
          ========================= -->
     <rosparam file="$(find tly)/config/tetris_config.yaml" command="load" />
 
-    <!-- =========================
-         5. table_frame publisher
-         ========================= -->
-    <node pkg="tly" type="table_tf_broadcaster.py" name="table_tf_broadcaster" output="screen" />
+    <!-- 5. （已移除 table_frame publisher：全量 base 化，board_frame 由 BOARD_POSE_BASE 常量加载）-->
 
     <!-- =========================
          6. Generate /camera/color/image_rect_color
@@ -76,7 +73,6 @@
         <param name="image_topic" value="/camera/color/image_rect_color" />
         <param name="camera_info_topic" value="/camera/color/camera_info" />
         <param name="assume_image_rectified" value="true" />
-        <param name="table_frame" value="table_frame" />
         
         <!-- 角度与姿态偏置 -->
         <param name="publish_angle_in_table_frame" value="false" />
@@ -145,7 +141,6 @@
 
     <!-- Frames -->
     <param name="eef_frame" value="link_tcp" />
-    <param name="table_frame" value="table_frame" />
     <param name="base_frame" value="link_base" />
     <param name="camera_frame" value="camera_color_optical_frame" />
     <param name="camera_info_topic" value="/camera/color/camera_info" />
@@ -221,7 +216,6 @@
     <node pkg="tly" type="path_planner_node" name="path_planner_node" output="screen"
           launch-prefix="bash -c 'sleep 4; exec $0 $@'">
         <!-- Frames -->
-        <param name="table_frame" value="table_frame" />
         <param name="base_frame" value="link_base" />
         <param name="camera_frame" value="camera_color_optical_frame" />
         <param name="camera_info_topic" value="/camera/color/camera_info" />

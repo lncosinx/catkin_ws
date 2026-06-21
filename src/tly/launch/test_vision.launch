@@ -11,7 +11,7 @@
     <arg name="color_edge_min_area" default="40" /><!-- 颜色边最小连通面积:滤掉掉漆零碎边,掉漆还切就调大 -->
     <arg name="use_dexined_for_split" default="true" /><!-- 或上DexiNed强边切同色贴碰块;不稳就设false纯颜色 -->
     <arg name="temporal_alpha" default="0.3" /><!-- 输入帧EMA时间平均系数,0=关;静止料堆抑噪/抗闪,越小越稳(更滞后) -->
-    <arg name="min_template_iou" default="0.40" /><!-- 收回正常值:挡掉粘连大blob/边缘错配(之前0.25是放块的临时档) -->
+    <arg name="min_template_iou" default="0.80" /><!-- 收回正常值:挡掉粘连大blob/边缘错配(之前0.25是放块的临时档) -->
 
     <!-- 1. RealSense 相机（带对齐深度，供抓取点 Z 采样） -->
     <include file="$(find realsense2_camera)/launch/rs_camera.launch">
@@ -31,7 +31,6 @@
         <param name="image_topic" value="/camera/color/image_raw" />
         <param name="camera_info_topic" value="/camera/color/camera_info" />
         <param name="assume_image_rectified" value="true" />
-        <param name="table_frame" value="table_frame" />
 
         <!-- 角度与姿态偏置 -->
         <param name="publish_angle_in_table_frame" value="false" />

@@ -55,7 +55,6 @@ include_directories(
 # 安装 Python 脚本
 catkin_install_python(PROGRAMS
   scripts/vision_processor_node.py
-  scripts/table_tf_broadcaster.py
   scripts/single_block_test.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

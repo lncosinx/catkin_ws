@@ -5,10 +5,16 @@
     <arg name="board_capture_frames" default="50" />
     <arg name="board_roi" default="" />
     <arg name="board_roi_force_interactive" default="false" />
+    <!-- ROI 框选底图：true=彩色图(深度已对齐到彩色,坐标通用,更易看清板面)，false=深度伪彩 -->
+    <arg name="board_roi_use_color" default="true" />
     <arg name="board_roi_z" default="[0.10, 1.50]" />
     <arg name="board_ransac_thresh_m" default="0.004" />
     <arg name="board_min_inliers_frac" default="0.3" /><!-- 主平面最小占比安全闸；宁可调小 ROI 也别轻易降 -->
     <arg name="board_verify_scale" default="true" />
+
+    <!-- 触点↔深度 Z 偏置自检：true=只触几点空发光板、与步骤2深度平面比偏移、存 DEPTH_TOUCH_Z_OFFSET 后退出 -->
+    <arg name="depth_offset_check" default="false" />
+    <arg name="check_points" default="5" />
 
     <!-- 白板标定模式：A=9点，B=25点，C=140点。白板翘曲明显建议 C -->
     <arg name="board_mode" default="B" />
@@ -18,6 +24,19 @@
 
     <!-- 放置高度额外余量，单位 m；默认 0，需要防刮蹭时可设 0.001 -->
     <arg name="place_z_margin" default="0.001" />
+
+    <!-- 步骤5放置Z：分批摆方块按格心采深度方块顶面。基准=逐格白板凸起顶面(步骤3)。
+         有方块 ⟺ 顶面高出该格凸起 [cover_min_m, top_z_span_m]（绝对窗口，不依赖方块厚）；
+         top_z_span_m 上限只为排除飞点/叠放；win_half=格心采样半窗(px) -->
+    <arg name="place_cover_min_m" default="0.005" />
+    <arg name="place_top_z_span_m" default="0.040" />
+    <arg name="place_sample_win_half" default="2" />
+    <arg name="place_sample_min_valid" default="5" />
+    <!-- true=步骤5先采空白板深度作逐格基准(纯深度对深度,免疫触点零点偏差)；false=用步骤3触点凸起 -->
+    <arg name="place_empty_baseline" default="true" />
+    <!-- 每批采完弹彩色覆盖调试图(绿=新增/青=既有/红=未覆盖)并存盘；false=纯文本进度 -->
+    <arg name="place_show_overlay" default="true" />
+    <arg name="place_overlay_save_dir" default="/tmp" />
 
     <arg name="config_path" default="$(find tly)/config/tetris_config.yaml" />
 
@@ -54,20 +73,34 @@
         
         <param name="config_path" value="$(arg config_path)" />
 
+        <param name="depth_offset_check" value="$(arg depth_offset_check)" />
+        <param name="check_points" value="$(arg check_points)" />
+
         <param name="board_mode" value="$(arg board_mode)" />
         <param name="height_interpolation" value="$(arg height_interpolation)" />
         <param name="place_z_margin" value="$(arg place_z_margin)" />
+
+        <!-- 步骤5放置Z（方块顶面深度）参数 -->
+        <param name="place_cover_min_m" value="$(arg place_cover_min_m)" />
+        <param name="place_top_z_span_m" value="$(arg place_top_z_span_m)" />
+        <param name="place_sample_win_half" value="$(arg place_sample_win_half)" />
+        <param name="place_sample_min_valid" value="$(arg place_sample_min_valid)" />
+        <param name="place_empty_baseline" value="$(arg place_empty_baseline)" />
+        <param name="place_show_overlay" value="$(arg place_show_overlay)" />
+        <param name="place_overlay_save_dir" value="$(arg place_overlay_save_dir)" />
 
         <!-- 深度采板面参数 -->
         <param name="board_capture_frames" value="$(arg board_capture_frames)" />
         <param name="board_roi" value="$(arg board_roi)" />
         <param name="board_roi_force_interactive" value="$(arg board_roi_force_interactive)" />
+        <param name="board_roi_use_color" value="$(arg board_roi_use_color)" />
         <rosparam param="board_roi_z" subst_value="true">$(arg board_roi_z)</rosparam>
         <param name="board_ransac_thresh_m" value="$(arg board_ransac_thresh_m)" />
         <param name="board_min_inliers_frac" value="$(arg board_min_inliers_frac)" />
         <param name="board_verify_scale" value="$(arg board_verify_scale)" />
         <param name="camera_frame" value="camera_color_optical_frame" />
         <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw" />
+        <param name="color_topic" value="/camera/color/image_raw" />
 
         <param name="block_samples" value="3" />
     </node>
