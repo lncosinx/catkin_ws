@@ -1,0 +1,43 @@
+<launch>
+    <arg name="robot_ip" default="192.168.1.228" />
+    <arg name="num_points" default="9" />
+    <arg name="capture_frames" default="30" />
+    <arg name="sample_win_half" default="4" />
+    <arg name="sample_min_valid" default="8" />
+    <arg name="save_path" default="" />
+    <arg name="config_path" default="$(find tly)/config/tetris_config.yaml" />
+
+    <!-- Keep this launch's TF chain identical to calibrate_tool.launch. -->
+    <include file="$(find xarm6_moveit_config)/launch/realMove_exec.launch">
+        <arg name="robot_ip" value="$(arg robot_ip)" />
+    </include>
+
+    <node pkg="tf2_ros" type="static_transform_publisher" name="suction_tcp_broadcaster"
+          args="0.00046 -0.00026 0.06962 0 0 0 link6 link_tcp" />
+
+    <include file="$(find realsense2_camera)/launch/rs_camera.launch">
+        <arg name="align_depth" value="true" />
+        <arg name="filters" value="spatial,temporal,hole_filling" />
+    </include>
+
+    <include file="$(find easy_handeye)/launch/publish.launch">
+        <arg name="eye_on_hand" value="true" />
+        <arg name="namespace_prefix" value="xarm6_realsense_calibration" />
+    </include>
+
+    <node pkg="tly" type="pixel_touch_check.py" name="pixel_touch_check" output="screen"
+          launch-prefix="bash -c 'sleep 5; exec $0 $@'">
+        <param name="base_frame" value="link_base" />
+        <param name="eef_frame" value="link_tcp" />
+        <param name="camera_frame" value="camera_color_optical_frame" />
+        <param name="image_topic" value="/camera/color/image_raw" />
+        <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw" />
+        <param name="camera_info_topic" value="/camera/color/camera_info" />
+        <param name="config_path" value="$(arg config_path)" />
+        <param name="num_points" value="$(arg num_points)" />
+        <param name="capture_frames" value="$(arg capture_frames)" />
+        <param name="sample_win_half" value="$(arg sample_win_half)" />
+        <param name="sample_min_valid" value="$(arg sample_min_valid)" />
+        <param name="save_path" value="$(arg save_path)" />
+    </node>
+</launch>

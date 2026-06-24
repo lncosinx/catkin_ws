@@ -14,7 +14,7 @@ config，控制/路径/单应性节点直接在 base 系用它换算（全量 ba
   步骤2  单机位对齐深度多帧中值 + ROI + RANSAC 拟板面 → 法向定义 board_frame 的 Z 轴。
   步骤3  采白板凸起网格 (A=9 / B=25 / C=140, base 系采点) → 仿射网格 + 高度图；并由网格
          派生 board_frame（origin=网格原点, X≈行轴, 方向对齐到现有系以保 way 约定）。
-  步骤4  采方块顶面高度 → block_thickness（仅作覆盖判据/path 平面回退）。
+  步骤4  方块厚度（触顶面+触旁边裸面，沿法向取差，同波纹管；恒正，免疫绝对零点）→ block_thickness。
   步骤5  分批在白板上摆方块，按格心采深度【方块顶面】→ 直接得每格放置 Z（不受方块缝隙影响，
          自动含板面翘曲+凸起+多格架桥）；裸板面(步骤2平面)仅作覆盖判据基准。
   步骤6  波纹管长度补偿（可选）：拆波纹管触碰发光板 + 装波纹管触碰同一点，两次 link_tcp
@@ -37,6 +37,12 @@ config，控制/路径/单应性节点直接在 base 系用它换算（全量 ba
   等其它工具写入的内容）原样保留。
   注意依赖：重跑步骤 2 会让 3/4/5/6 的旧数据失配；重跑步骤 3(网格+坐标系)会让 4/5/6
   以及单应性失配。这种情况脚本会提示并要求确认。
+
+单独修改某些放置格心（不重标整块网格）：
+  用 ROS 参数 ~edit_cells:=true 进入交互模式：选 (col,row) → 吸嘴对准该格凸起中心回车读 TF
+  → 覆盖该格的放置 XY；覆盖量存入 BOARD_CELL_OVERRIDES_BOARD 并即时重写 BOARD_CENTERS_14x10_BOARD。
+  只改 XY（z=凸起高度、放置深度 PLACE_Z_MAP 不变）。需已有步骤 2/3 的坐标系与网格；重跑步骤 3
+  会重派生网格并清空这些逐格覆盖。输入 'list' 查看已有覆盖，'undo' 撤销上一次修改，'q' 结束。
 """
 
 import os
@@ -440,10 +446,10 @@ def make_roi_display(depth_m, color_bgr):
 
 def show_coverage_overlay(depth_m, color_bgr, P, R_mat, R_cam, t_cam, intr,
                           origin, row_vec, col_vec, proj_z_map, block_thickness,
-                          covered, newly_cells, batch, save_dir):
+                          covered, newly_cells, batch, save_dir, H_inv=None):
     """步骤5每批覆盖调试图：彩色底图(无深度区压暗)上画 140 个格心投影点。
     绿=本批新增, 青=既有覆盖, 红=未覆盖。存盘并弹窗(在图窗按任意键继续)。
-    proj_z_map 为逐格【投影高度】(触点真实面 bump_height_map)，避免深度 tare 偏置把点投偏。"""
+    H_inv 给定则用单应性(board-XY->pixel)投影格心(更准、绕开手眼)，否则用 proj_z_map+手眼 3D 投影。"""
     if cv2 is None:
         return
     base = make_roi_display(depth_m, color_bgr) if color_bgr is not None else depth_preview(depth_m)
@@ -456,7 +462,7 @@ def show_coverage_overlay(depth_m, color_bgr, P, R_mat, R_cam, t_cam, intr,
             cell_z = float(proj_z_map[r][c])
             p_board = point_on_grid(origin, row_vec, col_vec, r, c)
             p_guess = np.array([p_board[0], p_board[1], cell_z], dtype=float)
-            uv = project_board_to_pixel(p_guess, P, R_mat, R_cam, t_cam, intr)
+            uv = cell_center_pixel(p_guess, H_inv, P, R_mat, R_cam, t_cam, intr)
             if uv is None:
                 continue
             ui, vi = int(round(uv[0])), int(round(uv[1]))
@@ -609,6 +615,158 @@ def sample_window_median_depth(depth_m, u, v, half=2, min_valid=5):
     return float(np.median(win))
 
 
+def load_homography_inv(tcfg):
+    """从 PICK_HOMOGRAPHY(pixel->board-XY, 9 数行主序 3x3) 取逆 → board-XY->pixel。
+    返回 3x3 ndarray 或 None。单应性是【拍照位姿专属】的平面映射，绕开手眼 3D 投影。"""
+    h = tcfg.get("PICK_HOMOGRAPHY") if isinstance(tcfg, dict) else None
+    if not isinstance(h, dict) or not h.get("enabled"):
+        return None
+    m = h.get("matrix")
+    if not m or len(m) != 9:
+        return None
+    try:
+        return np.linalg.inv(np.asarray(m, dtype=float).reshape(3, 3))
+    except Exception:
+        return None
+
+
+def board_xy_to_pixel(bx, by, H_inv):
+    """board-XY → 像素 (u,v)，经 PICK_HOMOGRAPHY 的逆。要求相机处于 affine/拍照位姿。"""
+    p = H_inv.dot(np.array([float(bx), float(by), 1.0], dtype=float))
+    if abs(p[2]) < 1e-9:
+        return None
+    return (p[0] / p[2], p[1] / p[2])
+
+
+def cell_center_pixel(p_board, H_inv, P, R_mat, R_cam, t_cam, intr):
+    """格心 board 点 → 像素。有单应性 H_inv(board-XY->pixel)就用它(平面映射, 不经手眼)，否则回退手眼 3D 投影。"""
+    if H_inv is not None:
+        return board_xy_to_pixel(p_board[0], p_board[1], H_inv)
+    return project_board_to_pixel(p_board, P, R_mat, R_cam, t_cam, intr)
+
+
+def place_homography_from_clicks(color_img, origin, row_vec, col_vec, rows, cols):
+    """在当前彩色图上点选白板网格【四个角格】的凸起中心，配合已知 board-XY 拟合 board-XY->pixel 单应性。
+    pose+region 都正确(当前机位、白板本身)，绕开手眼和抓取单应性的外推误差。带放大镜便于精确点选。
+    返回 3x3 (board-XY->pixel) 或 None。"""
+    if cv2 is None:
+        return None
+    corners = [(0, 0), (0, cols - 1), (rows - 1, cols - 1), (rows - 1, 0)]
+    names = ["左上(r0,c0)", f"右上(r0,c{cols-1})", f"右下(r{rows-1},c{cols-1})", f"左下(r{rows-1},c0)"]
+    clicks = []
+    st = {"x": 0, "y": 0}
+
+    def on_mouse(event, x, y, flags, param):
+        st["x"], st["y"] = x, y
+        if event == cv2.EVENT_LBUTTONDOWN and len(clicks) < len(corners):
+            clicks.append((x, y))
+            print(f"  ✅ 角{len(clicks)} {names[len(clicks)-1]} pixel=({x},{y})")
+        elif event == cv2.EVENT_RBUTTONDOWN and clicks:
+            clicks.pop()
+            print("  ↩️ 撤销上一个角点")
+
+    win = "click 4 grid CORNER bumps: TL -> TR -> BR -> BL (right=undo, Enter=ok, q=skip)"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(win, on_mouse)
+    print("\n  按【左上→右上→右下→左下】依次点白板网格四角的凸起中心(右上角有放大镜)；右键撤销，点满4个回车确认，q跳过。")
+    H_full, W_full = color_img.shape[:2]
+    while not rospy.is_shutdown():
+        disp = color_img.copy()
+        for i, (u, v) in enumerate(clicks):
+            cv2.drawMarker(disp, (u, v), (0, 255, 0), cv2.MARKER_CROSS, 18, 2)
+            cv2.putText(disp, str(i + 1), (u + 7, v - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        # 放大镜
+        mh, ms = 26, 7
+        mx, my = st["x"], st["y"]
+        x0, y0 = max(0, mx - mh), max(0, my - mh)
+        x1, y1 = min(W_full, mx + mh), min(H_full, my + mh)
+        patch = color_img[y0:y1, x0:x1]
+        if patch.size > 0:
+            zoom = cv2.resize(patch, (0, 0), fx=ms, fy=ms, interpolation=cv2.INTER_NEAREST)
+            zx, zy = int((mx - x0) * ms), int((my - y0) * ms)
+            cv2.drawMarker(zoom, (zx, zy), (0, 255, 0), cv2.MARKER_CROSS, 22, 1)
+            zh, zw = zoom.shape[:2]
+            ox = disp.shape[1] - zw - 10
+            if ox > 0 and zh + 10 < disp.shape[0]:
+                disp[10:10 + zh, ox:ox + zw] = zoom
+                cv2.rectangle(disp, (ox, 10), (ox + zw, 10 + zh), (0, 255, 0), 2)
+        nxt = names[len(clicks)] if len(clicks) < len(corners) else "完成→回车"
+        cv2.putText(disp, f"next: {nxt}  ({len(clicks)}/4)", (15, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.imshow(win, disp)
+        k = cv2.waitKey(30) & 0xFF
+        if k in (13, 10) and len(clicks) == len(corners):
+            break
+        if k == ord("q"):
+            cv2.destroyWindow(win)
+            return None
+    cv2.destroyWindow(win)
+    board_xy = np.array([point_on_grid(origin, row_vec, col_vec, r, c)[:2] for (r, c) in corners], dtype=np.float64)
+    pix = np.array(clicks, dtype=np.float64)
+    H, _ = cv2.findHomography(board_xy, pix)   # board-XY -> pixel
+    if H is None:
+        print("  ⚠️ 单应性拟合失败，回退。")
+        return None
+    # 残差自检
+    res = []
+    for (bx, by), (pu, pv) in zip(board_xy, pix):
+        q = H.dot([bx, by, 1.0]); q = q / q[2]
+        res.append(((q[0] - pu) ** 2 + (q[1] - pv) ** 2) ** 0.5)
+    print("  ✅ 点角单应性拟合完成(当前机位)，四角重投影残差 max=%.1f px。" % max(res))
+    return H
+
+
+def click_pixels(color_img, num_points, title="click points (Left=add Right=undo Enter=ok q=cancel)"):
+    """带放大镜在彩色图上点选 num_points 个像素点。左键加、右键撤销、回车确认、q 取消。返回 [(u,v),...] 或 None。"""
+    if cv2 is None:
+        return None
+    clicks = []
+    st = {"x": 0, "y": 0}
+
+    def on_mouse(event, x, y, flags, param):
+        st["x"], st["y"] = x, y
+        if event == cv2.EVENT_LBUTTONDOWN and len(clicks) < num_points:
+            clicks.append((x, y))
+            print(f"  ✅ P{len(clicks)} pixel=({x},{y})")
+        elif event == cv2.EVENT_RBUTTONDOWN and clicks:
+            clicks.pop()
+            print("  ↩️ 撤销上一个点")
+
+    cv2.namedWindow(title, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(title, on_mouse)
+    H_full, W_full = color_img.shape[:2]
+    while not rospy.is_shutdown():
+        disp = color_img.copy()
+        for i, (u, v) in enumerate(clicks):
+            cv2.drawMarker(disp, (u, v), (0, 0, 255), cv2.MARKER_CROSS, 15, 2)
+            cv2.circle(disp, (u, v), 9, (0, 0, 255), 2)
+            cv2.putText(disp, f"P{i+1}", (u + 8, v - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        mh, ms = 30, 6
+        mx, my = st["x"], st["y"]
+        x0, y0 = max(0, mx - mh), max(0, my - mh)
+        x1, y1 = min(W_full, mx + mh), min(H_full, my + mh)
+        patch = color_img[y0:y1, x0:x1]
+        if patch.size > 0:
+            z = cv2.resize(patch, (0, 0), fx=ms, fy=ms, interpolation=cv2.INTER_NEAREST)
+            cv2.drawMarker(z, (int((mx - x0) * ms), int((my - y0) * ms)), (0, 255, 0), cv2.MARKER_CROSS, 20, 1)
+            zh, zw = z.shape[:2]
+            ox = disp.shape[1] - zw - 10
+            if ox > 0 and zh + 10 < disp.shape[0]:
+                disp[10:10 + zh, ox:ox + zw] = z
+                cv2.rectangle(disp, (ox, 10), (ox + zw, 10 + zh), (0, 255, 0), 2)
+        cv2.putText(disp, f"{len(clicks)}/{num_points}  Left=add Right=undo Enter=ok q=cancel",
+                    (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.imshow(title, disp)
+        k = cv2.waitKey(30) & 0xFF
+        if k in (13, 10) and len(clicks) == num_points:
+            break
+        if k == ord("q"):
+            cv2.destroyWindow(title)
+            return None
+    cv2.destroyWindow(title)
+    return clicks
+
+
 def fit_plane_capture(tf_buffer, depth_m, roi, z_range, intr, camera_frame, base_frame,
                       thresh, iters, min_inliers_frac=0.3):
     """从一张(已多帧中值的)深度图拟板面，并转入 base 系。返回结果字典。"""
@@ -721,6 +879,150 @@ def run_depth_offset_check(tf_buffer, base_frame, eef_frame, tcfg, config_path, 
     print("=" * 72)
 
 
+def parse_cell_overrides(tcfg):
+    """读 BOARD_CELL_OVERRIDES_BOARD（稀疏列表，每项 {col,row,board:[x,y,(z)]}）→ dict[(row,col)]=[x,y,z]。
+    board 为该格在 board 系的覆盖坐标；放置只用 XY。非法项忽略。"""
+    out = {}
+    ov = tcfg.get("BOARD_CELL_OVERRIDES_BOARD") if isinstance(tcfg, dict) else None
+    if not isinstance(ov, list):
+        return out
+    for rec in ov:
+        try:
+            r = int(rec["row"])
+            c = int(rec["col"])
+            b = [float(v) for v in rec["board"]]
+            if 0 <= r < ROWS and 0 <= c < COLS and len(b) >= 2:
+                out[(r, c)] = b
+        except Exception:
+            continue
+    return out
+
+
+def run_edit_cell_centers(tf_buffer, base_frame, eef_frame, tcfg, config_path, existing_cfg):
+    """单独修改白板【放置格心】(BOARD_CENTERS_14x10_BOARD)：交互选 (col,row)，吸嘴对准该格凸起中心
+    回车读 TF（link_base<-link_eef）→ 转 board 系覆盖该格 XY；覆盖量累加进 BOARD_CELL_OVERRIDES_BOARD
+    （稀疏），并即时重写 BOARD_CENTERS_14x10_BOARD。只改 XY（z=凸起高度、放置深度 PLACE_Z_MAP 不变）。
+    需已有步骤 2/3 的坐标系+网格；重跑步骤 3 会重派生网格并清空这些逐格覆盖。"""
+    bp = cfg_get(tcfg, "BOARD_POSE_BASE", "3")
+    P = np.asarray(bp["origin"], dtype=float)
+    rpy = tuple(float(v) for v in bp["rpy"])
+    R_mat = euler_matrix(rpy[0], rpy[1], rpy[2], axes="sxyz")[:3, :3]
+    origin = np.asarray(cfg_get(tcfg, "BOARD_ORIGIN_BOARD", "3"), dtype=float)
+    row_vec = np.asarray(cfg_get(tcfg, "BOARD_ROW_STEP_BOARD", "3"), dtype=float)
+    col_vec = np.asarray(cfg_get(tcfg, "BOARD_COL_STEP_BOARD", "3"), dtype=float)
+    bump_height_map = cfg_get(tcfg, "BOARD_BUMP_HEIGHT_MAP_14x10", "3")
+
+    overrides = parse_cell_overrides(tcfg)   # dict[(row,col)] = [x,y,z]（board 系）
+
+    def build_centers():
+        """仿射网格 XY + 逐格覆盖 → 140 格心；z 一律用凸起高度图（覆盖不改 z）。"""
+        centers = []
+        for r in range(ROWS):
+            line = []
+            for c in range(COLS):
+                p = point_on_grid(origin, row_vec, col_vec, r, c)
+                cx, cy = float(p[0]), float(p[1])
+                if (r, c) in overrides:
+                    ov = overrides[(r, c)]
+                    cx, cy = float(ov[0]), float(ov[1])
+                line.append([cx, cy, float(bump_height_map[r][c])])
+            centers.append(line)
+        return centers
+
+    def overrides_to_records():
+        recs = []
+        for (r, c), b in sorted(overrides.items()):
+            z = float(b[2]) if len(b) > 2 else float(bump_height_map[r][c])
+            recs.append({"col": int(c), "row": int(r),
+                         "board": [float(b[0]), float(b[1]), z]})
+        return recs
+
+    def persist(cfg):
+        return write_config_merge(config_path, cfg, {
+            "BOARD_CELL_OVERRIDES_BOARD": overrides_to_records(),
+            "BOARD_CENTERS_14x10_BOARD": build_centers(),
+        })
+
+    print("\n" + "=" * 72)
+    print("=== 单独修改白板放置格心 (BOARD_CENTERS_14x10_BOARD) ===")
+    print("= 选 (col,row) → 吸嘴对准该格凸起中心回车读 TF → 覆盖该格放置 XY。")
+    print("= 只改 XY（放置朝向/深度不变：z=凸起高度, 放置深度仍用步骤5 PLACE_Z_MAP）。")
+    print(f"= 网格尺寸 {COLS} 列 x {ROWS} 行，col∈[0,{COLS-1}], row∈[0,{ROWS-1}]。")
+    print(f"= 当前已有 {len(overrides)} 个格被覆盖。命令：list=查看, undo=撤销上一次, q=结束。")
+    print("=" * 72)
+
+    history = []   # 撤销栈：(row, col, prev_override_or_None)
+    while not rospy.is_shutdown():
+        ans = input("\n选择要修改的格 col,row（或 list / undo / q）: ").strip().lower()
+        if ans in ("q", "quit", "结束", ""):
+            break
+        if ans in ("list", "ls", "l"):
+            if not overrides:
+                print("  （暂无覆盖）")
+            for (r, c), b in sorted(overrides.items()):
+                p = point_on_grid(origin, row_vec, col_vec, r, c)
+                print("  (c{},r{}) 覆盖 XY=[{:.4f}, {:.4f}]  网格 XY=[{:.4f}, {:.4f}]  Δ=[{:+.1f}, {:+.1f}] mm".format(
+                    c, r, b[0], b[1], p[0], p[1], (b[0] - p[0]) * 1000.0, (b[1] - p[1]) * 1000.0))
+            continue
+        if ans in ("u", "undo", "撤销"):
+            if not history:
+                print("  无可撤销。")
+                continue
+            r, c, prev = history.pop()
+            if prev is None:
+                overrides.pop((r, c), None)
+                print(f"  ↩️ 已撤销 (c{c},r{r}) 的修改（恢复为网格 XY）。")
+            else:
+                overrides[(r, c)] = prev
+                print(f"  ↩️ 已撤销 (c{c},r{r}) 的修改（恢复上一次覆盖值）。")
+            existing_cfg = persist(existing_cfg)
+            print("  💾 已写入 config。")
+            continue
+
+        parts = [p for p in ans.replace("，", ",").replace(",", " ").split() if p]
+        if len(parts) != 2:
+            print("  请输入两个整数：col,row（例如 3,5）。")
+            continue
+        try:
+            col, row = int(parts[0]), int(parts[1])
+        except ValueError:
+            print("  col/row 必须是整数。")
+            continue
+        if not (0 <= col < COLS and 0 <= row < ROWS):
+            print(f"  越界：col∈[0,{COLS-1}], row∈[0,{ROWS-1}]。")
+            continue
+
+        p_grid = point_on_grid(origin, row_vec, col_vec, row, col)
+        cur = overrides.get((row, col))
+        if cur is not None:
+            print("  当前覆盖 XY=[{:.4f}, {:.4f}]（网格 XY=[{:.4f}, {:.4f}]）".format(
+                cur[0], cur[1], p_grid[0], p_grid[1]))
+        else:
+            print("  当前用网格 XY=[{:.4f}, {:.4f}]".format(p_grid[0], p_grid[1]))
+
+        p_base = require_pose(tf_buffer, f"  吸嘴对准格 (col={col}, row={row}) 的凸起中心",
+                              base_frame, eef_frame, allow_undo=True)
+        if isinstance(p_base, str) and p_base == "UNDO":
+            print("  ↩️ 放弃本次修改（未改动该格）。")
+            continue
+
+        b = to_table(R_mat, P, p_base)   # board 系 [x,y,z]
+        prev = overrides.get((row, col))
+        history.append((row, col, list(prev) if prev is not None else None))
+        overrides[(row, col)] = [float(b[0]), float(b[1]), float(b[2])]
+        dx = (b[0] - p_grid[0]) * 1000.0
+        dy = (b[1] - p_grid[1]) * 1000.0
+        print("  ✅ (c{},r{}) 新 XY=[{:.4f}, {:.4f}]  相对网格 Δ=[{:+.1f}, {:+.1f}] mm".format(
+            col, row, b[0], b[1], dx, dy))
+        existing_cfg = persist(existing_cfg)
+        print("  💾 已写入 config（即时落盘）。")
+
+    existing_cfg = persist(existing_cfg)
+    print(f"\n🎉 完成：共 {len(overrides)} 个格被覆盖，已写入 BOARD_CELL_OVERRIDES_BOARD 和 "
+          "BOARD_CENTERS_14x10_BOARD。")
+    print("=" * 72)
+
+
 def choose_board_mode():
     val = str(rospy.get_param("~board_mode", "")).strip().upper()
     if val in ("A", "B", "C"):
@@ -765,15 +1067,16 @@ def choose_height_interpolation(board_mode):
     return default
 
 
-ALL_STEPS = [1, 2, 3, 4, 5, 6]
+ALL_STEPS = [1, 2, 3, 4, 5, 6, 7]
 
 STEP_TITLES = {
     1: "拍照起点位姿 + 相机内参",
     2: "深度拟合白板平面（板面法向，base 系）",
     3: "白板凸起网格 + 由网格派生 board_frame (BOARD_POSE_BASE)",
-    4: "散落区方块顶面高度 (block_thickness)",
+    4: "方块厚度（触顶面+触旁边裸面取差，同波纹管）",
     5: "放置 Z：分批摆方块按格心采深度方块顶面",
     6: "波纹管长度补偿 (tcp_pick/place_offset_z)",
+    7: "抓取单应性 (发光板 pixel->board-XY, PICK_HOMOGRAPHY)",
 }
 
 
@@ -897,6 +1200,11 @@ def main():
     if bool(rospy.get_param("~depth_offset_check", False)):
         run_depth_offset_check(tf_buffer, base_frame, eef_frame, tcfg, config_path, existing_cfg,
                                int(rospy.get_param("~check_points", 5)))
+        return
+
+    # 单独修改白板放置格心（独立模式）：~edit_cells:=true 时只跑逐格覆盖并退出（需已有步骤2/3结果）。
+    if bool(rospy.get_param("~edit_cells", False)):
+        run_edit_cell_centers(tf_buffer, base_frame, eef_frame, tcfg, config_path, existing_cfg)
         return
 
     run = choose_steps()
@@ -1150,6 +1458,8 @@ def main():
             "BOARD_GRID_FIT_RMS_XY_M": float(xy_rms), "BOARD_GRID_FIT_RMS_Z_M": float(grid_z_rms),
             "BOARD_BUMP_HEIGHT_MODEL": height_model_info,
             "BOARD_BUMP_HEIGHT_MAP_14x10": bump_height_map,
+            # 网格已重派生，旧的逐格手动覆盖（~edit_cells 写入）已失配，清空。
+            "BOARD_CELL_OVERRIDES_BOARD": [],
         })
         print("  💾 步骤3参数已保存到 config（触点网格/凸起高度，崩溃也不丢）。")
     else:
@@ -1175,28 +1485,49 @@ def main():
         height_max_abs = float(height_model_info.get("selected_residual_max_abs_m") or 0.0)
         print("  origin(base): [{:.6f}, {:.6f}, {:.6f}]".format(*P))
 
-    # Step 4: 散落区方块顶面高度 → block_thickness。
+    # Step 4: 方块厚度（触点差值，与波纹管同理）→ block_thickness。
+    # 触【方块顶面】+ 触【旁边裸表面(方块所坐的面)】，沿板面法向取差 = 真实厚度(恒正)。
+    # 不再用方块顶面的 board-z 绝对值（那受 board z=0 零点偏置影响，曾测出负厚度）。
     if 4 in run:
-        print("\n--- 步骤 4：标定散落区方块顶面高度 ---")
-        print("建议换不同颜色/不同位置采样，最终取中位数。")
-        block_top_points_base = []
-        block_top_points_table = []
+        print("\n--- 步骤 4：方块厚度（触顶面 + 触旁边裸面，取差，同波纹管）---")
+        print("每个方块两次触碰：先轻触【方块顶面】，再触【方块旁边的裸表面(方块所坐的面)】。")
+        print("建议换不同颜色/不同位置多采几个，取中位数。")
+        # 投影法向：优先 align_tool_to_board 的对齐法向，否则步骤2板面法向（与波纹管一致）。
+        align_cfg = tcfg.get("TOOL_BOARD_ALIGN", {}) or {}
+        align_normal = align_cfg.get("normal_base")
+        if align_normal:
+            n_up = normalize(np.asarray(align_normal, dtype=float), "aligned board normal")
+        else:
+            n_up = normalize(np.asarray(surface_normal_base, dtype=float), "board normal")
+
+        thicknesses = []
         num_blocks = max(1, block_samples)
         i = 0
         while i < num_blocks:
-            pt = require_pose(tf_buffer, f"[步骤 4.{i+1}/{num_blocks}] 方块平放在散落区，吸盘轻触【方块顶面】", base_frame, eef_frame, allow_undo=(i > 0))
-            if isinstance(pt, str) and pt == "UNDO":
+            p_top = require_pose(
+                tf_buffer, f"[步骤 4.{i+1}/{num_blocks}.1] 吸嘴轻触【方块顶面】",
+                base_frame, eef_frame, allow_undo=(i > 0))
+            if isinstance(p_top, str) and p_top == "UNDO":
                 i -= 1
-                block_top_points_base.pop()
-                block_top_points_table.pop()
-                print(f"  ↩️ 已撤销，重新标定第 {i+1} 个方块高度。")
+                thicknesses.pop()
+                print(f"  ↩️ 已撤销，重测第 {i+1} 个方块（从触顶面开始）。")
                 continue
-            block_top_points_base.append(pt)
-            block_top_points_table.append(to_table(R_mat, P, pt))
+            p_surf = require_pose(
+                tf_buffer, f"[步骤 4.{i+1}/{num_blocks}.2] 触【方块旁边的裸表面】(方块所坐的面)",
+                base_frame, eef_frame, allow_undo=True)
+            if isinstance(p_surf, str) and p_surf == "UNDO":
+                print("  ↩️ 已撤销，重测本方块（从触顶面开始）。")
+                continue
+            t = float(np.dot(p_top - p_surf, n_up))   # 沿法向：顶面 − 裸面 = 厚度(应为正)
+            if t <= 1e-4:
+                print(f"  ⚠️ 量出厚度 = {t*1000:.1f} mm，异常(可能顶面/裸面触反了/触太轻)，重测本方块。")
+                continue
+            thicknesses.append(t)
+            print(f"  方块 {i+1} 厚度 = {t*1000:.2f} mm")
             i += 1
 
-        block_top_points_table = np.asarray(block_top_points_table)
-        block_thickness = float(np.median(block_top_points_table[:, 2]))
+        block_thickness = float(np.median(thicknesses))
+        print(f"  ✅ 方块厚度中位 = {block_thickness*1000:.2f} mm（差值法，恒正）")
 
         # 检查点：步骤4完成即落盘（方块厚度）。
         existing_cfg = write_config_merge(config_path, existing_cfg, {
@@ -1250,8 +1581,25 @@ def main():
         show_overlay = bool(rospy.get_param("~place_show_overlay", True)) and cv2 is not None
         overlay_save_dir = str(rospy.get_param("~place_overlay_save_dir", "/tmp"))
         use_empty_baseline = bool(rospy.get_param("~place_empty_baseline", True))
+        # 格心投影优先级：① 现场点白板四角拟合的单应性(当前机位、白板本身，最准)；
+        # ② PICK_HOMOGRAPHY(抓取区/别的机位标的，用到白板上是外推，可能不准)；③ 手眼 3D 投影(受 ~cm 手眼误差)。
         print("  覆盖判据: 深度顶面高出【空板深度基准】{:.1f}~{:.1f} mm 视为有方块；格心采样窗口 {}x{} px。".format(
             cover_min * 1000.0, cover_max * 1000.0, 2 * win_half + 1, 2 * win_half + 1))
+        H_inv = None
+        if bool(rospy.get_param("~place_corner_clicks", True)) and cv2 is not None:
+            print("\n  先【点白板四角】当场拟合投影单应性(免手眼/抓取单应性的误差)。请确保白板空、相机别再动。")
+            input("  把相机停在采集机位后按回车，开始点角...")
+            color_h = grab_color_bgr(color_topic)
+            if color_h is not None:
+                H_inv = place_homography_from_clicks(color_h, origin, row_vec, col_vec, ROWS, COLS)
+        if H_inv is not None:
+            print("  ✅ 格心投影用【点角单应性】(当前机位+白板, 最准)——之后相机不要移动！")
+        elif bool(rospy.get_param("~place_use_homography", True)):
+            H_inv = load_homography_inv(tcfg)
+            if H_inv is not None:
+                print("  ⚠️ 回退 PICK_HOMOGRAPHY(抓取区标的, 用到白板是外推, 可能偏)——相机须在 affine 拍照位姿。")
+        if H_inv is None:
+            print("  ℹ️ 无单应性，格心投影回退手眼 3D 投影(受手眼 ~cm 误差影响)。")
 
         # 逐格基准 base_map：优先用【空白板深度】(与方块顶面同一深度零点)，回退触点凸起 bump_height_map。
         base_map = [[float(bump_height_map[r][c]) for c in range(COLS)] for r in range(ROWS)]
@@ -1265,7 +1613,7 @@ def main():
                 for c in range(COLS):
                     p_board = point_on_grid(origin, row_vec, col_vec, r, c)
                     p_guess = np.array([p_board[0], p_board[1], float(bump_height_map[r][c])], dtype=float)
-                    uv = project_board_to_pixel(p_guess, P, R_mat, R_cam_e, t_cam_e, intr)
+                    uv = cell_center_pixel(p_guess, H_inv, P, R_mat, R_cam_e, t_cam_e, intr)
                     if uv is None:
                         continue
                     zz = sample_window_median_depth(depth_e, uv[0], uv[1], win_half, min_valid)
@@ -1321,7 +1669,7 @@ def main():
                     # 投影到【触点真实面】(物理格心位置)，确保采样像素落在该格上；空格采到基准面、
                     # 有方块采到方块顶(盖住整格)。深度的 tare 偏置只进 dz 的两端、做差时抵消，不进投影。
                     p_guess = np.array([p_board[0], p_board[1], cell_proj_z], dtype=float)
-                    uv = project_board_to_pixel(p_guess, P, R_mat, R_cam, t_cam, intr)
+                    uv = cell_center_pixel(p_guess, H_inv, P, R_mat, R_cam, t_cam, intr)
                     if uv is None:
                         continue
                     z_meas = sample_window_median_depth(depth_b, uv[0], uv[1], win_half, min_valid)
@@ -1349,7 +1697,7 @@ def main():
             if show_overlay:
                 show_coverage_overlay(depth_b, color_b, P, R_mat, R_cam, t_cam, intr,
                                       origin, row_vec, col_vec, bump_height_map, block_thickness,
-                                      covered, newly_cells, batch, overlay_save_dir)
+                                      covered, newly_cells, batch, overlay_save_dir, H_inv=H_inv)
             if newly == 0:
                 print("  ⚠️ 本批没采到新格：检查方块是否摆在未覆盖格、相机是否看得到、阈值是否合适。")
 
@@ -1431,13 +1779,20 @@ def main():
                 row.append(float(base_z + block_thickness + place_z_margin))
         place_z_map.append(row)
 
+    # 逐格手动覆盖（BOARD_CELL_OVERRIDES_BOARD, 由 ~edit_cells 模式写入）：重跑步骤3会重派生网格、
+    # 旧覆盖失配 → 清空；否则沿用并叠加到格心 XY（z=凸起高度、放置深度 PLACE_Z_MAP 不受影响）。
+    cell_overrides = {} if (3 in run) else parse_cell_overrides(tcfg)
     board_centers = []
     for r in range(ROWS):
         line = []
         for c in range(COLS):
             p = point_on_grid(origin, row_vec, col_vec, r, c)
-            # x/y from affine grid, z from selected height map
-            line.append([float(p[0]), float(p[1]), float(bump_height_map[r][c])])
+            # x/y from affine grid (or per-cell override), z from selected height map
+            cx, cy = float(p[0]), float(p[1])
+            if (r, c) in cell_overrides:
+                ov = cell_overrides[(r, c)]
+                cx, cy = float(ov[0]), float(ov[1])
+            line.append([cx, cy, float(bump_height_map[r][c])])
         board_centers.append(line)
 
     legacy_grid = float(0.5 * (np.linalg.norm(row_vec[:2]) + np.linalg.norm(col_vec[:2])))
@@ -1509,6 +1864,71 @@ def main():
             existing_cfg = write_config_merge(config_path, existing_cfg, bellows_cfg)
             print("  💾 步骤6参数已保存到 config。")
 
+    # Step 7: 抓取单应性 (发光板 pixel->board-XY)。整合自 pick_affine：在【整流彩色图】上点选黑点 + 逐个触点
+    # 取 board-XY → findHomography → 写 PICK_HOMOGRAPHY（控制节点抓取 XY 用它）。依赖步骤3的 board_frame。
+    # ⚠️ 单应性绑定相机【拍照位姿】——标定时相机摆在生产视觉那个机位；改坐标系(步骤3)后必须重标本步。
+    if 7 in run:
+        print("\n--- 步骤 7：抓取单应性标定 (发光板 pixel->board-XY → PICK_HOMOGRAPHY) ---")
+        nph = int(rospy.get_param("~pick_homography_points", 9))
+        rect_topic = rospy.get_param("~rect_color_topic", "/camera/color/image_rect_color")
+        if cv2 is None:
+            print("  ⚠️ cv2 不可用，跳过步骤7。")
+        else:
+            print(f"  把相机摆到【拍照位姿】，取整流彩色图 {rect_topic}（需 image_proc 在跑）...")
+            img = grab_color_bgr(rect_topic)
+            if img is None:
+                print("  ⚠️ 取整流彩色图失败，跳过步骤7（确认 image_proc 在跑、话题对）。")
+            else:
+                print(f"  在【发光板/标定纸】上点选 {nph} 个黑点(带放大镜)。")
+                clicks = click_pixels(img, nph, "pick homography: click black dots (zoom)")
+                if not clicks:
+                    print("  已取消，跳过步骤7。")
+                else:
+                    print(f"\n  点选完成 {len(clicks)} 个。现在逐个把吸嘴尖压到对应物理黑点、回车记录('u'撤销)。")
+                    rows = []
+                    i = 0
+                    while i < len(clicks):
+                        u, v = clicks[i]
+                        p = require_pose(
+                            tf_buffer, f"[步骤 7.{i+1}/{len(clicks)}] 吸嘴尖压到像素({u},{v})对应的物理黑点",
+                            base_frame, eef_frame, allow_undo=(i > 0))
+                        if isinstance(p, str) and p == "UNDO":
+                            i -= 1
+                            rows.pop()
+                            print("  ↩️ 已撤销，重记上一个点。")
+                            continue
+                        bxy = to_table(R_mat, P, p)
+                        rows.append({"u": int(u), "v": int(v), "board": [float(bxy[0]), float(bxy[1])]})
+                        i += 1
+                    src = np.array([[r["u"], r["v"]] for r in rows], dtype=np.float64)
+                    dst = np.array([r["board"] for r in rows], dtype=np.float64)
+                    Hpk, _ = cv2.findHomography(src, dst)   # pixel -> board-XY
+                    if Hpk is None:
+                        print("  ⚠️ 单应性拟合失败，未写入。")
+                    else:
+                        res = []
+                        for r in rows:
+                            q = Hpk.dot([r["u"], r["v"], 1.0])
+                            q = q / q[2]
+                            res.append(((q[0] - r["board"][0]) ** 2 + (q[1] - r["board"][1]) ** 2) ** 0.5)
+                        rms = float(np.sqrt(np.mean(np.square(res))))
+                        updates = {"PICK_HOMOGRAPHY": {
+                            "enabled": True,
+                            "model": "x = (H00*u + H01*v + H02)/W; y = (H10*u + H11*v + H12)/W; W = H20*u + H21*v + H22",
+                            "matrix": [float(x) for x in Hpk.flatten()],
+                            "rms_m": rms,
+                            "sample_count": int(len(rows)),
+                        }}
+                        # 禁用旧的 affine 防止冲突（与 pick_affine 一致）。
+                        paff = (existing_cfg.get("tetris", {}) or {}).get("PICK_AFFINE_CORRECTION")
+                        if isinstance(paff, dict):
+                            paff = dict(paff)
+                            paff["enabled"] = False
+                            updates["PICK_AFFINE_CORRECTION"] = paff
+                        existing_cfg = write_config_merge(config_path, existing_cfg, updates)
+                        print(f"  ✅ 抓取单应性拟合完成，RMS={rms*1000:.3f} mm，已写入 PICK_HOMOGRAPHY。")
+                        print("  💾 步骤7参数已保存到 config（控制节点抓取 XY 用它；改坐标系后须重标）。")
+
     inl_all = first["inliers_base"]
     if len(inl_all) > 300:
         _sel = np.linspace(0, len(inl_all) - 1, 300).astype(int)
@@ -1573,6 +1993,8 @@ def main():
             "BOARD_ROW_STEP_BOARD": [float(row_vec[0]), float(row_vec[1]), float(row_vec[2])],
             "BOARD_COL_STEP_BOARD": [float(col_vec[0]), float(col_vec[1]), float(col_vec[2])],
             "BOARD_CENTERS_14x10_BOARD": board_centers,
+            # 逐格手动覆盖：步骤3重跑则清空，否则原样保留（board_centers 已叠加它）。
+            "BOARD_CELL_OVERRIDES_BOARD": ([] if (3 in run) else (tcfg.get("BOARD_CELL_OVERRIDES_BOARD") or [])),
             "BOARD_GRID_FIT_RMS_XY_M": float(xy_rms),
             "BOARD_GRID_FIT_RMS_Z_M": float(grid_z_rms),
 

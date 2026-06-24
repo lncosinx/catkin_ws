@@ -507,6 +507,8 @@ struct SeqConfig
     bool cyclic = false;          // 是否循环重复该序列
     vector<int> inventory;        // size 7，各形状可用数量
     bool require_support = true; // true=竞赛规则③(下方有方块支撑/第一层除外)；false=宽松实验
+    bool reward_four_colors = false; // 满行且≥4色 +10 的竞赛加分(规则②)。默认 false：
+                                     // 实际比赛可能没有此约束，关掉则只追求满行不强求配色。
     int board_rows = 14;
     int board_cols = 10;
     int beam_width = 120;         // 束宽
@@ -521,7 +523,8 @@ struct SeqResult
 };
 
 // 计分：board 为 rows*cols 扁平数组，0=空，否则 shape_type+1（颜色）。
-inline int seqScore(const vector<int> &board, int rows, int cols)
+// reward_four_colors=true 时才对“满行且≥4色”再 +10（竞赛规则②）；默认关闭。
+inline int seqScore(const vector<int> &board, int rows, int cols, bool reward_four_colors = false)
 {
     int s = 0;
     for (int r = 0; r < rows; ++r)
@@ -539,7 +542,7 @@ inline int seqScore(const vector<int> &board, int rows, int cols)
         if (full)
         {
             s += 10;
-            if ((int)colors.size() >= 4)
+            if (reward_four_colors && (int)colors.size() >= 4)
                 s += 10;
         }
     }
@@ -553,8 +556,9 @@ inline int seqScore(const vector<int> &board, int rows, int cols)
     return s;
 }
 
-// 启发值：主项 score；次项偏好填满行(filled^2)、低行优先、颜色多样，引导束搜索。
-inline long seqHeuristic(const vector<int> &board, int rows, int cols, int score)
+// 启发值：主项 score；次项偏好填满行(filled^2)、低行优先，引导束搜索。
+// reward_four_colors=true 时才加入“颜色多样”次项，与计分口径一致；默认关闭。
+inline long seqHeuristic(const vector<int> &board, int rows, int cols, int score, bool reward_four_colors = false)
 {
     long h = (long)score * 1000000L;
     for (int r = 0; r < rows; ++r)
@@ -567,11 +571,12 @@ inline long seqHeuristic(const vector<int> &board, int rows, int cols, int score
             if (v)
             {
                 filled++;
-                colors.insert(v);
+                if (reward_four_colors)
+                    colors.insert(v);
             }
         }
         h += (long)filled * filled * (1 + r); // 低行(r 大)权重略高
-        if (filled > 0)
+        if (reward_four_colors && filled > 0)
             h += (long)colors.size();
     }
     return h;
@@ -717,8 +722,8 @@ inline SeqResult solveSequence(const SeqConfig &cfg)
                     ns.board[cell.x * cols + cell.y] = shape + 1;
                 ns.placements.push_back(p);
                 ns.placed = st.placed + 1;
-                ns.score = seqScore(ns.board, rows, cols);
-                ns.heuristic = seqHeuristic(ns.board, rows, cols, ns.score);
+                ns.score = seqScore(ns.board, rows, cols, cfg.reward_four_colors);
+                ns.heuristic = seqHeuristic(ns.board, rows, cols, ns.score, cfg.reward_four_colors);
                 consider(ns);
                 next.push_back(std::move(ns));
             }

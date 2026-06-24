@@ -62,7 +62,7 @@ static bool verify(const SeqResult &res, const SeqConfig &cfg)
         for (auto &c : pl.cells)
             board[c.x * cols + c.y] = pl.shape_type + 1;
     }
-    int sc = seqScore(board, rows, cols);
+    int sc = seqScore(board, rows, cols, cfg.reward_four_colors);
     if (sc != res.score)
     {
         printf("FAIL: score mismatch reported=%d recomputed=%d\n", res.score, sc);

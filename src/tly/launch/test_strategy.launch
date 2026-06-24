@@ -14,6 +14,8 @@
     <arg name="advanced_mode" default="false" />
     <arg name="seq_cyclic" default="true" />
     <arg name="seq_require_support" default="true" />
+    <!-- 满行且≥4色额外加分(竞赛规则②)。默认 false：实际比赛可能没有此约束 -->
+    <arg name="seq_reward_four_colors" default="false" />
 
     <node pkg="tly" type="strategy_node" name="strategy_node" output="screen">
         <param name="expected_total_blocks" value="35" />
@@ -25,6 +27,7 @@
         <param name="advanced_mode" value="$(arg advanced_mode)" />
         <param name="seq_cyclic" value="$(arg seq_cyclic)" />
         <param name="seq_require_support" value="$(arg seq_require_support)" />
+        <param name="seq_reward_four_colors" value="$(arg seq_reward_four_colors)" />
         <!-- 形状放置顺序 (0线/1田/2T/3L左/4L右/5Z左/6Z右)，按现场抽签填写 -->
         <rosparam param="shape_sequence">[0, 1, 2, 3, 4, 5, 6]</rosparam>
     </node>

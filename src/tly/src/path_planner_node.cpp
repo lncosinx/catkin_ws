@@ -1,15 +1,24 @@
 // 路径规划节点 (Path Planner)
 //
-// 职责（步骤5a，附加式）：消费 /tetris_plan，把每个任务的「抓取像素 / 放置格子」
-// 解算成 base 系可直接 move_line 的抓放位姿，发布 /motion_cmds。
+// 职责：消费 strategy 的 /tetris_plan，把每个任务的「抓取像素 / 放置格子」解算成
+// base 系抓放位姿，并对「抓取-放置」序列做全局路程优化，输出优化后的计划。
 //   - 抓取 XY：单应性矩阵（与控制节点一致）；抓取 Z：RealSense 对齐深度（新），
 //     深度无效时回退到平面拟合 Z。
 //   - 放置 XY/Z：白板格心双线性插值 + PLACE_Z_MAP（与控制节点一致）。
-//   - 顺序：沿用 /tetris_plan 原有顺序（直通）；最短路径排序留待后续步骤。
 //
-// 本步骤不改动控制节点：它仍消费 /tetris_plan。/motion_cmds 供 rostopic echo 对照
-// 验证（日志同时打印 z_plane 与 z_depth）。坐标解算逻辑从 xarm_controller_node.cpp
-// 原样移植，保证与现有行为一致；yaw 的 0/180° 关节翻转选择属控制侧逻辑，未移植。
+// 路程优化（optimize_order）：放置 XY 由 plan 固定，故总路程可按「每个放置槽配哪个
+// 物理块 + 放置先后顺序」两个自由度联合优化。
+//   - 抓取候选池：订阅 /vision/board_state 取每种形状的全部检测块（含 strategy 未用
+//     的闲置块）；同一形状的块互换（无吸取依赖）。
+//   - 放置依赖：从每个任务的 target_cells 重建「被压在下面的先放」DAG（与 strategy
+//     一致），仅在合法拓扑序内重排。
+//   - 贪心前沿：每步在依赖已满足的就绪槽 × 未用候选块里，选当前 TCP→pick→place 增量
+//     路程最小的一对。池不足时安全退化为「仅重排、保留 strategy 抓取」。
+//
+// 输出：优化后的 17-int 计划发到 optimized_plan_topic（默认 /tetris_plan_opt，latched），
+// 供控制节点消费（tly.launch 将控制器 plan_topic 指向该话题；控制器代码不变，仍自行
+// 解算并做 yaw 0/180° 关节翻转）。/motion_cmds 仍按优化后顺序发布，供对照验证。
+// 坐标解算逻辑从 xarm_controller_node.cpp 原样移植。
 
 #include <ros/ros.h>
 #include <std_msgs/Int32MultiArray.h>
@@ -38,7 +47,9 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct PixelPoint
@@ -72,6 +83,20 @@ struct TaskGoal
     GridCenter place_grid_center;
     std::vector<GridCell> target_cells;
     bool has_target_cells = false;
+
+    // 原始 17-int 任务块（用于无损重排/回填抓取字段后再发布）。
+    std::vector<int> raw;
+};
+
+// /vision/board_state 里的一个检测块（候选抓取目标）。
+struct PoolBlock
+{
+    int u = 0;
+    int v = 0;
+    int ang = 0;
+    int geom_u = 0;
+    int geom_v = 0;
+    bool has_geom = false;
 };
 
 class PathPlanner
@@ -94,11 +119,16 @@ public:
         if (use_depth_pick_z_)
             depth_sampler_.init(nh_, depth_topic_);
 
+        if (optimize_order_)
+            board_state_sub_ = nh_.subscribe(board_state_topic_, 1, &PathPlanner::boardStateCallback, this);
+
         plan_sub_ = nh_.subscribe(plan_topic_, 1, &PathPlanner::planCallback, this);
         motion_pub_ = nh_.advertise<tly::MotionPlan>(motion_topic_, 1, true);
+        opt_plan_pub_ = nh_.advertise<std_msgs::Int32MultiArray>(optimized_plan_topic_, 1, true);
 
-        ROS_INFO("[PATH] ready: in=%s out=%s depth_pick_z=%s xy_source=%s",
-                 plan_topic_.c_str(), motion_topic_.c_str(),
+        ROS_INFO("[PATH] ready: in=%s opt_out=%s motion_out=%s optimize=%s pool_topic=%s depth_pick_z=%s xy_source=%s",
+                 plan_topic_.c_str(), optimized_plan_topic_.c_str(), motion_topic_.c_str(),
+                 optimize_order_ ? "on" : "off", board_state_topic_.c_str(),
                  use_depth_pick_z_ ? "on" : "off",
                  pick_xy_source_depth_ ? "depth" : "homography");
     }
@@ -108,16 +138,26 @@ private:
     ros::NodeHandle pnh_;
     ros::Subscriber plan_sub_;
     ros::Subscriber camera_info_sub_;
+    ros::Subscriber board_state_sub_;
     ros::Publisher motion_pub_;
+    ros::Publisher opt_plan_pub_;
 
     tf2_ros::Buffer tf_buffer_;
     tf2_ros::TransformListener tf_listener_;
 
     std::string plan_topic_ = "/tetris_plan";
     std::string motion_topic_ = "/motion_cmds";
+    std::string optimized_plan_topic_ = "/tetris_plan_opt";
+    std::string board_state_topic_ = "/vision/board_state";
     std::string camera_info_topic_ = "/camera/color/camera_info";
     std::string base_frame_ = "link_base";
     std::string camera_frame_ = "camera_color_optical_frame";
+    std::string eef_frame_ = "link_tcp";
+
+    // 路程优化：开关 + board_state 候选池缓存（按形状分组）。
+    bool optimize_order_ = true;
+    bool pool_ready_ = false;
+    std::vector<PoolBlock> pool_by_shape_[7];
 
     // board_frame 在 base 的常量位姿（由 /tetris/BOARD_POSE_BASE 派生），取代旧 table_frame TF。
     bool board_pose_loaded_ = false;
@@ -255,9 +295,13 @@ private:
     {
         pnh_.param("plan_topic", plan_topic_, plan_topic_);
         pnh_.param("motion_topic", motion_topic_, motion_topic_);
+        pnh_.param("optimized_plan_topic", optimized_plan_topic_, optimized_plan_topic_);
+        pnh_.param("board_state_topic", board_state_topic_, board_state_topic_);
+        pnh_.param("optimize_order", optimize_order_, optimize_order_);
         pnh_.param("camera_info_topic", camera_info_topic_, camera_info_topic_);
         pnh_.param("base_frame", base_frame_, base_frame_);
         pnh_.param("camera_frame", camera_frame_, camera_frame_);
+        pnh_.param("eef_frame", eef_frame_, eef_frame_);
 
         pnh_.param("use_true_pick_plane", use_true_pick_plane_, use_true_pick_plane_);
         pnh_.param("use_pick_homography", use_pick_homography_, use_pick_homography_);
@@ -908,6 +952,284 @@ private:
         return true;
     }
 
+    // 缓存最新候选池：board_state 末段是每个检测块 [shape,u,v,ang(,geom_u,geom_v)]。
+    void boardStateCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
+    {
+        // 头部：7 库存 + 140 占用栅格 + num_blocks，之后才是检测块。
+        if ((int)msg->data.size() <= 147)
+            return;
+        int idx = 147;
+        int num_blocks = msg->data[idx++];
+        int remaining = (int)msg->data.size() - idx;
+        bool has_geom = (num_blocks > 0 && remaining >= num_blocks * 6);
+        int stride = has_geom ? 6 : 4;
+
+        std::vector<PoolBlock> tmp[7];
+        for (int i = 0; i < num_blocks && idx + stride - 1 < (int)msg->data.size(); ++i)
+        {
+            PoolBlock b;
+            int shape = msg->data[idx++];
+            b.u = msg->data[idx++];
+            b.v = msg->data[idx++];
+            b.ang = msg->data[idx++];
+            if (has_geom)
+            {
+                b.geom_u = msg->data[idx++];
+                b.geom_v = msg->data[idx++];
+                b.has_geom = true;
+            }
+            else
+            {
+                b.geom_u = b.u;
+                b.geom_v = b.v;
+                b.has_geom = false;
+            }
+            if (shape >= 0 && shape < 7)
+                tmp[shape].push_back(b);
+        }
+        for (int s = 0; s < 7; ++s)
+            pool_by_shape_[s] = tmp[s];
+        pool_ready_ = true;
+    }
+
+    // 优化用的抓取 XY（board 系）：优先单应性，回退真平面反投影。距离度量只需 XY。
+    bool pickXYForOpt(int u, int v, double &x, double &y) const
+    {
+        geometry_msgs::Point p;
+        if (use_pick_homography_ && pick_homography_loaded_ &&
+            applyPickHomographyXY(static_cast<double>(u), static_cast<double>(v), p))
+        {
+            x = p.x;
+            y = p.y;
+            return true;
+        }
+        PixelPoint px;
+        px.u = u;
+        px.v = v;
+        geometry_msgs::Point tp;
+        if (pixelToPickPointTable(px, tp))
+        {
+            x = tp.x;
+            y = tp.y;
+            return true;
+        }
+        return false;
+    }
+
+    // 起点：当前 TCP 位置换算到 board 系 XY。失败则无起点项（第一步只按 pick->place 选）。
+    bool getStartBoardXY(double &x, double &y)
+    {
+        if (!board_pose_loaded_)
+            return false;
+        try
+        {
+            geometry_msgs::TransformStamped tf =
+                tf_buffer_.lookupTransform(base_frame_, eef_frame_, ros::Time(0), ros::Duration(0.5));
+            tf2::Vector3 p_base(tf.transform.translation.x, tf.transform.translation.y, tf.transform.translation.z);
+            tf2::Vector3 p_board = base_to_board_ * p_base;
+            x = p_board.x();
+            y = p_board.y();
+            return true;
+        }
+        catch (const tf2::TransformException &ex)
+        {
+            ROS_WARN_THROTTLE(2.0, "[PATH] start TCP TF lookup failed: %s", ex.what());
+            return false;
+        }
+    }
+
+    // 联合优化：放置顺序（DAG 内重排）+ 抓取分配（同形状互换），最小化总行程。
+    // 直接在 goals 上重排并回填每个任务的抓取字段。
+    void optimizePlan(std::vector<TaskGoal> &goals)
+    {
+        const int n = static_cast<int>(goals.size());
+        if (n <= 1)
+            return;
+
+        // 放置点（board XY，由 plan 固定）。
+        std::vector<double> place_x(n), place_y(n);
+        for (int i = 0; i < n; ++i)
+        {
+            geometry_msgs::Point bc = bilinearBoardCenter(goals[i].place_grid_center.row, goals[i].place_grid_center.col);
+            place_x[i] = bc.x;
+            place_y[i] = bc.y;
+        }
+
+        // 每形状需求数。
+        int need[7] = {0};
+        for (const auto &g : goals)
+            if (g.shape_type >= 0 && g.shape_type < 7)
+                need[g.shape_type]++;
+
+        // 候选池（含闲置块），过滤掉无法投影的，再判可行性。
+        std::vector<PoolBlock> cand[7];
+        std::vector<double> cand_x[7], cand_y[7];
+        std::vector<char> cand_used[7];
+        bool use_pool = pool_ready_;
+        if (use_pool)
+        {
+            for (int s = 0; s < 7; ++s)
+            {
+                for (const auto &b : pool_by_shape_[s])
+                {
+                    double x, y;
+                    if (!pickXYForOpt(b.u, b.v, x, y))
+                        continue;
+                    cand[s].push_back(b);
+                    cand_x[s].push_back(x);
+                    cand_y[s].push_back(y);
+                    cand_used[s].push_back(0);
+                }
+            }
+            for (int s = 0; s < 7; ++s)
+                if (static_cast<int>(cand[s].size()) < need[s])
+                    use_pool = false;
+        }
+        if (!use_pool)
+            ROS_WARN("[PATH] board_state pool unavailable/insufficient; reorder-only (keep strategy picks).");
+
+        // 放置依赖 DAG：与 strategy 一致——某格 (r,c) 之下 (r+1,c) 是别的块，则下面的块先放。
+        std::vector<int> indeg(n, 0);
+        std::vector<std::vector<int>> succ(n);
+        std::map<std::pair<int, int>, int> cell2goal;
+        for (int i = 0; i < n; ++i)
+            if (goals[i].has_target_cells)
+                for (const auto &c : goals[i].target_cells)
+                    cell2goal[{c.row, c.col}] = i;
+        for (int i = 0; i < n; ++i)
+        {
+            if (!goals[i].has_target_cells)
+                continue;
+            for (const auto &c : goals[i].target_cells)
+            {
+                auto it = cell2goal.find({c.row + 1, c.col});
+                if (it == cell2goal.end() || it->second == i)
+                    continue;
+                int h = it->second; // h（下面的块）必须先于 i
+                bool dup = false;
+                for (int s : succ[h])
+                    if (s == i)
+                    {
+                        dup = true;
+                        break;
+                    }
+                if (!dup)
+                {
+                    succ[h].push_back(i);
+                    indeg[i]++;
+                }
+            }
+        }
+
+        double cur_x = 0.0, cur_y = 0.0;
+        bool has_cur = getStartBoardXY(cur_x, cur_y);
+
+        std::vector<char> placed(n, 0), in_frontier(n, 0);
+        std::vector<int> frontier;
+        for (int i = 0; i < n; ++i)
+            if (indeg[i] == 0)
+            {
+                frontier.push_back(i);
+                in_frontier[i] = 1;
+            }
+
+        std::vector<int> order;
+        order.reserve(n);
+        for (int step = 0; step < n; ++step)
+        {
+            double best = std::numeric_limits<double>::max();
+            int best_goal = -1, best_cand = -1;
+            for (int g : frontier)
+            {
+                if (placed[g])
+                    continue;
+                int s = goals[g].shape_type;
+                if (use_pool && s >= 0 && s < 7)
+                {
+                    for (int k = 0; k < static_cast<int>(cand[s].size()); ++k)
+                    {
+                        if (cand_used[s][k])
+                            continue;
+                        double d = (has_cur ? std::hypot(cur_x - cand_x[s][k], cur_y - cand_y[s][k]) : 0.0) +
+                                   std::hypot(cand_x[s][k] - place_x[g], cand_y[s][k] - place_y[g]);
+                        if (d < best)
+                        {
+                            best = d;
+                            best_goal = g;
+                            best_cand = k;
+                        }
+                    }
+                }
+                else
+                {
+                    double px, py;
+                    if (!pickXYForOpt(goals[g].pick_pixel.u, goals[g].pick_pixel.v, px, py))
+                    {
+                        px = place_x[g];
+                        py = place_y[g];
+                    }
+                    double d = (has_cur ? std::hypot(cur_x - px, cur_y - py) : 0.0) +
+                               std::hypot(px - place_x[g], py - place_y[g]);
+                    if (d < best)
+                    {
+                        best = d;
+                        best_goal = g;
+                        best_cand = -1;
+                    }
+                }
+            }
+            if (best_goal < 0)
+            {
+                for (int g : frontier)
+                    if (!placed[g])
+                    {
+                        best_goal = g;
+                        break;
+                    }
+            }
+            if (best_goal < 0)
+                break; // 不应发生
+
+            int s = goals[best_goal].shape_type;
+            if (use_pool && best_cand >= 0 && s >= 0 && s < 7)
+            {
+                const PoolBlock &b = cand[s][best_cand];
+                cand_used[s][best_cand] = 1;
+                goals[best_goal].pick_pixel.u = b.u;
+                goals[best_goal].pick_pixel.v = b.v;
+                goals[best_goal].pick_angle_deg = b.ang;
+                goals[best_goal].geom_pixel.u = b.geom_u;
+                goals[best_goal].geom_pixel.v = b.geom_v;
+                goals[best_goal].has_geom_pixel = b.has_geom;
+            }
+            placed[best_goal] = 1;
+            order.push_back(best_goal);
+            cur_x = place_x[best_goal];
+            cur_y = place_y[best_goal];
+            has_cur = true;
+            for (int v : succ[best_goal])
+                if (--indeg[v] == 0 && !in_frontier[v])
+                {
+                    frontier.push_back(v);
+                    in_frontier[v] = 1;
+                }
+        }
+
+        if (static_cast<int>(order.size()) != n)
+        {
+            ROS_WARN("[PATH] optimize produced %lu/%d tasks (cycle?); keeping original order.",
+                     order.size(), n);
+            return;
+        }
+
+        std::vector<TaskGoal> reordered;
+        reordered.reserve(n);
+        for (int idx : order)
+            reordered.push_back(goals[idx]);
+        goals.swap(reordered);
+        ROS_INFO("[PATH] optimized order+assign: %d task(s), pool=%s.", n, use_pool ? "on" : "off");
+    }
+
     void planCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
     {
         if (msg->data.empty() || !camera_info_ready_)
@@ -938,15 +1260,10 @@ private:
             return;
         }
 
-        int exec_total = total;
-        if (max_tasks_per_plan_ > 0 && exec_total > max_tasks_per_plan_)
-            exec_total = max_tasks_per_plan_;
-
-        tly::MotionPlan plan;
-        plan.header.stamp = ros::Time::now();
-        plan.header.frame_id = base_frame_;
-
-        for (int i = 0; i < exec_total; ++i)
+        // 解析全部任务（重排在全集上做，截断交给控制节点）。
+        std::vector<TaskGoal> goals;
+        goals.reserve(total);
+        for (int i = 0; i < total; ++i)
         {
             int base = 1 + i * stride;
             TaskGoal goal;
@@ -987,16 +1304,52 @@ private:
                 }
             }
 
+            goal.raw.assign(msg->data.begin() + base, msg->data.begin() + base + stride);
+            goals.push_back(goal);
+        }
+
+        if (optimize_order_)
+            optimizePlan(goals);
+
+        // 1) 优化后的 17-int 计划（全集，供控制节点消费）：回填抓取字段后无损重排。
+        std_msgs::Int32MultiArray opt;
+        opt.data.reserve(1 + total * stride);
+        opt.data.push_back(total);
+        for (const auto &g : goals)
+        {
+            std::vector<int> blk = g.raw;
+            blk[4] = g.pick_pixel.u;
+            blk[5] = g.pick_pixel.v;
+            blk[6] = g.pick_angle_deg;
+            if (static_cast<int>(blk.size()) >= 9)
+            {
+                blk[7] = g.geom_pixel.u;
+                blk[8] = g.geom_pixel.v;
+            }
+            opt.data.insert(opt.data.end(), blk.begin(), blk.end());
+        }
+        opt_plan_pub_.publish(opt);
+
+        // 2) /motion_cmds（调试对照，按优化后顺序；受 max_tasks_per_plan_ 限制）。
+        int exec_total = total;
+        if (max_tasks_per_plan_ > 0 && exec_total > max_tasks_per_plan_)
+            exec_total = max_tasks_per_plan_;
+
+        tly::MotionPlan plan;
+        plan.header.stamp = ros::Time::now();
+        plan.header.frame_id = base_frame_;
+        for (int i = 0; i < exec_total; ++i)
+        {
             tly::MotionTask task;
-            if (buildTask(goal, task))
+            if (buildTask(goals[i], task))
                 plan.tasks.push_back(task);
             else
                 ROS_WARN("[PATH] Skip task %d: failed to build pick/place pose.", i + 1);
         }
-
         motion_pub_.publish(plan);
-        ROS_INFO("[PATH] Published /motion_cmds with %lu task(s) (from %d plan task(s)).",
-                 plan.tasks.size(), total);
+
+        ROS_INFO("[PATH] Published %s with %d task(s) + /motion_cmds with %lu task(s) (from %d plan task(s)).",
+                 optimized_plan_topic_.c_str(), total, plan.tasks.size(), total);
     }
 };
 

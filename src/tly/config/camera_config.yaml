@@ -1,55 +1,47 @@
 !!python/object/new:dynamic_reconfigure.encoding.Config
 dictitems:
-  auto_exposure_limit: 165000
-  auto_exposure_limit_toggle: false
-  auto_gain_limit: 248
-  auto_gain_limit_toggle: false
-  emitter_enabled: 1
-  enable_auto_exposure: true
+  auto_exposure_priority: false
+  backlight_compensation: false
+  brightness: 0
+  contrast: 50
+  enable_auto_exposure: false
   enable_auto_white_balance: false
-  error_polling_enabled: true
-  exposure: 33000
+  exposure: 180
   frames_queue_size: 16
-  gain: 16
+  gain: 64
+  gamma: 300
   global_time_enabled: true
   groups: !!python/object/new:dynamic_reconfigure.encoding.Config
     dictitems:
-      auto_exposure_limit: 165000
-      auto_exposure_limit_toggle: false
-      auto_gain_limit: 248
-      auto_gain_limit_toggle: false
-      emitter_enabled: 1
-      enable_auto_exposure: true
+      auto_exposure_priority: false
+      backlight_compensation: false
+      brightness: 0
+      contrast: 50
+      enable_auto_exposure: false
       enable_auto_white_balance: false
-      error_polling_enabled: true
-      exposure: 33000
+      exposure: 180
       frames_queue_size: 16
-      gain: 16
+      gain: 64
+      gamma: 300
       global_time_enabled: true
       groups: !!python/object/new:dynamic_reconfigure.encoding.Config
         state: []
-      hdr_enabled: false
+      hue: 0
       id: 0
-      inter_cam_sync_mode: 0
-      laser_power: 360.0
       name: Default
-      output_trigger_enabled: false
       parameters: !!python/object/new:dynamic_reconfigure.encoding.Config
         state: []
       parent: 0
-      sequence_id: 0
-      sequence_name: 0
-      sequence_size: 2
+      power_line_frequency: 3
+      saturation: 64
+      sharpness: 50
       state: true
       type: ''
-      visual_preset: 3
+      white_balance: 6000.0
     state: []
-  hdr_enabled: false
-  inter_cam_sync_mode: 0
-  laser_power: 360.0
-  output_trigger_enabled: false
-  sequence_id: 0
-  sequence_name: 0
-  sequence_size: 2
-  visual_preset: 3
+  hue: 0
+  power_line_frequency: 3
+  saturation: 64
+  sharpness: 50
+  white_balance: 6000.0
 state: []

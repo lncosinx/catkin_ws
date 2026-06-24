@@ -9,7 +9,7 @@
          ========================================================= -->
     <arg name="robot_ip" default="192.168.1.228" />
     <arg name="expected_blocks" default="35" />
-    <arg name="vision_node" default="vision_processor_node_cpp" />
+    <arg name="vision_node" default="vision_processor_node_dexined" />
 
     <param name="robot_description" command="$(find xacro)/xacro --inorder '$(find xarm_description)/urdf/xarm_device.urdf.xacro' robot_type:=xarm dof:=6 add_gripper:=false" />
 

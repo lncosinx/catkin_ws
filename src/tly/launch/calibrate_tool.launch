@@ -16,6 +16,10 @@
     <arg name="depth_offset_check" default="false" />
     <arg name="check_points" default="5" />
 
+    <!-- 单独修改白板放置格心：true=进入交互模式，选 (col,row) 用吸嘴触碰逐格覆盖 BOARD_CENTERS_14x10_BOARD
+         的 XY（覆盖存 BOARD_CELL_OVERRIDES_BOARD），不重标整块网格；需已有步骤2/3结果。改完即退出。 -->
+    <arg name="edit_cells" default="false" />
+
     <!-- 白板标定模式：A=9点，B=25点，C=140点。白板翘曲明显建议 C -->
     <arg name="board_mode" default="B" />
 
@@ -34,6 +38,11 @@
     <arg name="place_sample_min_valid" default="5" />
     <!-- true=步骤5先采空白板深度作逐格基准(纯深度对深度,免疫触点零点偏差)；false=用步骤3触点凸起 -->
     <arg name="place_empty_baseline" default="true" />
+    <!-- true=步骤5开始先【现场点白板四角】当场拟合投影单应性(当前机位+白板本身,最准,免手眼/抓取单应性外推)。
+         这是首选；关掉则按下面 place_use_homography 走 PICK_HOMOGRAPHY 或手眼。 -->
+    <arg name="place_corner_clicks" default="true" />
+    <!-- 点角关掉时的次选：true=用 PICK_HOMOGRAPHY(抓取区标的,用到白板是外推,可能偏)；false/无→手眼3D投影。 -->
+    <arg name="place_use_homography" default="true" />
     <!-- 每批采完弹彩色覆盖调试图(绿=新增/青=既有/红=未覆盖)并存盘；false=纯文本进度 -->
     <arg name="place_show_overlay" default="true" />
     <arg name="place_overlay_save_dir" default="/tmp" />
@@ -63,6 +72,9 @@
         <arg name="namespace_prefix" value="xarm6_realsense_calibration" />
     </include>
 
+    <!-- 2.6 整流彩色图 -> /camera/color/image_rect_color（步骤7 抓取单应性在它上面点选黑点） -->
+    <node pkg="image_proc" type="image_proc" name="image_proc" ns="/camera/color" output="screen" />
+
     <!-- 3. 启动白板标定工具 (calibrate_board.py) -->
     <node pkg="tly" type="calibrate_board.py" name="calibrate_board" output="screen"
           launch-prefix="bash -c 'sleep 5; exec $0 $@'">
@@ -76,6 +88,8 @@
         <param name="depth_offset_check" value="$(arg depth_offset_check)" />
         <param name="check_points" value="$(arg check_points)" />
 
+        <param name="edit_cells" value="$(arg edit_cells)" />
+
         <param name="board_mode" value="$(arg board_mode)" />
         <param name="height_interpolation" value="$(arg height_interpolation)" />
         <param name="place_z_margin" value="$(arg place_z_margin)" />
@@ -86,6 +100,8 @@
         <param name="place_sample_win_half" value="$(arg place_sample_win_half)" />
         <param name="place_sample_min_valid" value="$(arg place_sample_min_valid)" />
         <param name="place_empty_baseline" value="$(arg place_empty_baseline)" />
+        <param name="place_corner_clicks" value="$(arg place_corner_clicks)" />
+        <param name="place_use_homography" value="$(arg place_use_homography)" />
         <param name="place_show_overlay" value="$(arg place_show_overlay)" />
         <param name="place_overlay_save_dir" value="$(arg place_overlay_save_dir)" />
 
@@ -101,6 +117,10 @@
         <param name="camera_frame" value="camera_color_optical_frame" />
         <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw" />
         <param name="color_topic" value="/camera/color/image_raw" />
+
+        <!-- 步骤7 抓取单应性：整流彩色图 + 点数 -->
+        <param name="rect_color_topic" value="/camera/color/image_rect_color" />
+        <param name="pick_homography_points" value="9" />
 
         <param name="block_samples" value="3" />
     </node>

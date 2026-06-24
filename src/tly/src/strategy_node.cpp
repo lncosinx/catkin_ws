@@ -36,6 +36,8 @@ bool advanced_mode = false;
 vector<int> shape_sequence;     // 形状 id 顺序，例如 [0,1,2,3,...]
 bool seq_cyclic = false;        // 是否按序列循环放置
 bool seq_require_support = true; // true=竞赛规则③(下方支撑)；false=宽松实验
+bool seq_reward_four_colors = false; // 满行且≥4色额外 +10(竞赛规则②)。默认 false：
+                                     // 实际比赛可能没有此配色加分，关掉只追求满行。
 
 void statusCallback(const std_msgs::Bool::ConstPtr &msg)
 {
@@ -200,11 +202,13 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
         cfg.cyclic = seq_cyclic;
         cfg.inventory = current_inventory;
         cfg.require_support = seq_require_support;
+        cfg.reward_four_colors = seq_reward_four_colors;
         cfg.board_rows = 14;
         cfg.board_cols = 10;
         SeqResult res = solveSequence(cfg);
-        ROS_INFO("[ADVANCED] solveSequence: placed=%d score=%d (seq_len=%lu cyclic=%d support=%d)",
-                 res.placed, res.score, shape_sequence.size(), (int)seq_cyclic, (int)seq_require_support);
+        ROS_INFO("[ADVANCED] solveSequence: placed=%d score=%d (seq_len=%lu cyclic=%d support=%d four_colors=%d)",
+                 res.placed, res.score, shape_sequence.size(), (int)seq_cyclic, (int)seq_require_support,
+                 (int)seq_reward_four_colors);
 
         if (res.placements.empty())
         {
@@ -569,10 +573,12 @@ int main(int argc, char **argv)
     pnh.param("advanced_mode", advanced_mode, advanced_mode);
     pnh.param("seq_cyclic", seq_cyclic, seq_cyclic);
     pnh.param("seq_require_support", seq_require_support, seq_require_support);
+    pnh.param("seq_reward_four_colors", seq_reward_four_colors, seq_reward_four_colors);
     pnh.getParam("shape_sequence", shape_sequence); // 形状 id 列表，例如 [0,1,2,3]
     if (advanced_mode)
-        ROS_INFO("[ADVANCED] mode ON: seq_len=%lu cyclic=%d require_support=%d",
-                 shape_sequence.size(), (int)seq_cyclic, (int)seq_require_support);
+        ROS_INFO("[ADVANCED] mode ON: seq_len=%lu cyclic=%d require_support=%d reward_four_colors=%d",
+                 shape_sequence.size(), (int)seq_cyclic, (int)seq_require_support,
+                 (int)seq_reward_four_colors);
 
     plan_pub = nh.advertise<std_msgs::Int32MultiArray>("/tetris_plan", 10, true);
 

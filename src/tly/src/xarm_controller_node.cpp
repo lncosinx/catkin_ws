@@ -169,8 +169,8 @@ private:
 
     // board_frame 在 base 的常量位姿（由 /tetris/BOARD_POSE_BASE 派生），取代旧 table_frame TF。
     bool board_pose_loaded_ = false;
-    tf2::Transform board_to_base_;   // board_frame -> base
-    tf2::Transform base_to_board_;   // 逆
+    tf2::Transform board_to_base_; // board_frame -> base
+    tf2::Transform base_to_board_; // 逆
 
     double control_period_ = 0.05;
     bool xarm_wait_for_finish_ = true;
