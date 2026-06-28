@@ -136,6 +136,56 @@ def load_board_pose(config_path):
         return None, None
 
 
+def load_pick_homography(config_path):
+    """读 PICK_HOMOGRAPHY.matrix（9 个 row-major 浮点）-> 3x3，失败返回 None。"""
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            tcfg = (yaml.safe_load(f) or {}).get("tetris", {})
+        hg = tcfg.get("PICK_HOMOGRAPHY")
+        if not hg:
+            return None
+        mat = hg.get("matrix")
+        if not mat or len(mat) < 9:
+            return None
+        return np.asarray([float(v) for v in mat[:9]], dtype=np.float64).reshape(3, 3)
+    except Exception:
+        return None
+
+
+def load_pick_z(config_path, default=0.0):
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            tcfg = (yaml.safe_load(f) or {}).get("tetris", {})
+        v = tcfg.get("PICK_Z")
+        return float(v) if v is not None else float(default)
+    except Exception:
+        return float(default)
+
+
+def raw_to_rectified_px(u, v, K, D, P3x3):
+    """把点选的 raw 像素去畸变到 rect 像素空间（控制器/单应性用的就是 rect 像素）。
+    D≈0 时近似恒等；cv2 不可用时直接返回原值。"""
+    if cv2 is None or P3x3 is None:
+        return float(u), float(v)
+    pts = np.array([[[float(u), float(v)]]], dtype=np.float64)
+    rect = cv2.undistortPoints(pts, K, D, P=P3x3)[0, 0]
+    return float(rect[0]), float(rect[1])
+
+
+def homography_board_xy(H, u_rect, v_rect, cx, cy, cam_z, block_z, use_parallax):
+    """复刻 xarm_controller_node 的抓取 XY：先按 (cam_z-block_z)/cam_z 把像素往光心拉
+    （视差补偿），再用 PICK_HOMOGRAPHY 映射到 board-XY。返回 [bx, by] 或 None。"""
+    uu, vv = float(u_rect), float(v_rect)
+    if use_parallax and cam_z is not None and block_z is not None and cam_z > block_z + 0.05:
+        ratio = (cam_z - block_z) / cam_z
+        uu = cx + (uu - cx) * ratio
+        vv = cy + (vv - cy) * ratio
+    res = H.dot(np.array([uu, vv, 1.0], dtype=np.float64))
+    if abs(res[2]) < 1e-12:
+        return None
+    return np.array([res[0] / res[2], res[1] / res[2]], dtype=np.float64)
+
+
 class PixelTouchCheck(object):
     def __init__(self):
         rospy.init_node("pixel_touch_check", anonymous=True)
@@ -155,6 +205,12 @@ class PixelTouchCheck(object):
         self.sample_min_valid = max(1, int(rospy.get_param("~sample_min_valid", 8)))
         self.save_path = str(rospy.get_param("~save_path", "")).strip()
 
+        # 对照模式：除了「深度+手眼」那条感知路径，再用控制器真正在用的
+        # 「单应性(+视差)」路径预测同一个物理点，二者各自与触点比对，一刀切开
+        # 感知误差 vs 单应性/视差误差。
+        self.compare_homography = bool(rospy.get_param("~compare_homography", True))
+        self.use_parallax = bool(rospy.get_param("~use_parallax", True))
+
         self.bridge = CvBridge()
         self.latest_image = None
         self.points = []
@@ -164,6 +220,16 @@ class PixelTouchCheck(object):
         self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(30.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
         self.board_R, self.board_P = load_board_pose(self.config_path)
+        self.pick_H = load_pick_homography(self.config_path) if self.compare_homography else None
+        self.pick_z = load_pick_z(self.config_path, 0.0)
+        if self.compare_homography:
+            if self.pick_H is None:
+                rospy.logwarn("compare_homography 开启但未读到 PICK_HOMOGRAPHY，单应性对照将跳过。")
+            elif self.board_R is None:
+                rospy.logwarn("compare_homography 开启但未读到 BOARD_POSE_BASE，单应性对照将跳过。")
+            else:
+                rospy.loginfo("单应性对照: ON (use_parallax=%s, PICK_Z=%.4f)",
+                              self.use_parallax, self.pick_z)
 
         rospy.Subscriber(self.image_topic, Image, self.image_cb, queue_size=1)
 
@@ -188,12 +254,33 @@ class PixelTouchCheck(object):
                                             rospy.Time(0), rospy.Duration(10.0)):
             raise RuntimeError("TF 不可用: %s <- %s" % (self.base_frame, self.eef_frame))
 
+    def _disp_to_image(self, x, y):
+        # WINDOW_NORMAL 窗口被 WM 缩放时，鼠标回调给的是“显示坐标”，须按实际显示尺寸换算回
+        # 全分辨率图像坐标，否则点选像素被缩放带偏（与标定同源的隐患，会让验证假性合格）。
+        img = self.latest_image
+        if img is None:
+            return int(round(x)), int(round(y))
+        H_full, W_full = img.shape[:2]
+        win = getattr(self, "_sel_win", None)
+        if win is not None:
+            try:
+                _, _, rw, rh = cv2.getWindowImageRect(win)
+                if rw > 0 and rh > 0:
+                    x = x * W_full / float(rw)
+                    y = y * H_full / float(rh)
+            except Exception:
+                pass
+        ix = int(max(0, min(W_full - 1, round(x))))
+        iy = int(max(0, min(H_full - 1, round(y))))
+        return ix, iy
+
     def mouse_cb(self, event, x, y, flags, param):
-        self.mouse_x, self.mouse_y = x, y
+        ix, iy = self._disp_to_image(x, y)
+        self.mouse_x, self.mouse_y = ix, iy
         if event == cv2.EVENT_LBUTTONDOWN:
             if len(self.points) < self.num_points:
-                self.points.append({"id": len(self.points) + 1, "u": int(x), "v": int(y)})
-                print("  添加 P%d pixel=(%d,%d)" % (len(self.points), x, y))
+                self.points.append({"id": len(self.points) + 1, "u": ix, "v": iy})
+                print("  添加 P%d pixel=(%d,%d)" % (len(self.points), ix, iy))
             else:
                 print("  已选满 %d 个点，按 Enter 确认。" % self.num_points)
         elif event == cv2.EVENT_RBUTTONDOWN and self.points:
@@ -221,9 +308,10 @@ class PixelTouchCheck(object):
         cv2.rectangle(display, (ox, oy), (ox + zw, oy + zh), (0, 255, 0), 2)
 
     def select_pixels(self):
-        print("\n手动点选像素：左键添加，右键撤销，c 清空，Enter 确认，q 退出。")
+        print("\n手动点选像素：左键添加，右键撤销，i 键入(u,v)，c 清空，Enter 确认，q 退出。")
         print("建议按固定顺序点 3x3，例如左上→中上→右上→左中→...→右下。\n")
         win = "pixel touch check: select points"
+        self._sel_win = win
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(win, self.mouse_cb)
         while not rospy.is_shutdown():
@@ -235,7 +323,7 @@ class PixelTouchCheck(object):
                 cv2.putText(display, "P%d" % pid, (u + 8, v - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
             self.draw_zoom(display)
-            cv2.putText(display, "Selected %d/%d  Left:add Right:undo c:clear Enter:ok q:quit" %
+            cv2.putText(display, "Selected %d/%d  Left:add Right:undo i:type(u,v) c:clear Enter:ok q:quit" %
                         (len(self.points), self.num_points),
                         (18, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
             cv2.imshow(win, display)
@@ -246,6 +334,27 @@ class PixelTouchCheck(object):
             if key == ord("c"):
                 self.points = []
                 print("  已清空点选。")
+            if key == ord("i") and len(self.points) < self.num_points:
+                # 可选：手动键入像素坐标（如从 realsense-viewer 读数直接输入），绕开点选/窗口缩放。
+                # 注意：键入时焦点要切到终端。
+                H_full, W_full = self.latest_image.shape[:2]
+                try:
+                    s = input("  ⌨️  输入像素 u,v（逗号或空格分隔，范围 0..%d, 0..%d；空回车取消）: "
+                              % (W_full - 1, H_full - 1)).strip()
+                except EOFError:
+                    s = ""
+                if s:
+                    try:
+                        parts = s.replace(",", " ").split()
+                        u, v = int(round(float(parts[0]))), int(round(float(parts[1])))
+                        if 0 <= u < W_full and 0 <= v < H_full:
+                            self.points.append({"id": len(self.points) + 1, "u": u, "v": v})
+                            self.mouse_x, self.mouse_y = u, v
+                            print("  ✅ 添加 P%d pixel=(%d,%d)  [手动输入]" % (len(self.points), u, v))
+                        else:
+                            print("  ⚠️ 越界，已忽略。")
+                    except (ValueError, IndexError):
+                        print("  ⚠️ 格式无效，示例：640 360 或 640,360")
             if key == ord("q"):
                 cv2.destroyWindow(win)
                 return False
@@ -255,33 +364,58 @@ class PixelTouchCheck(object):
     def compute_vision_points(self):
         info = rospy.wait_for_message(self.camera_info_topic, CameraInfo, timeout=5.0)
         K, D = camera_info_to_KD(info)
+        P3 = np.asarray(info.P, dtype=np.float64).reshape(3, 4)[:3, :3] if len(info.P) >= 12 else K
+        cx_p, cy_p = float(P3[0, 2]), float(P3[1, 2])
         print("相机内参: %dx%d fx=%.3f fy=%.3f cx=%.3f cy=%.3f Dmax=%.6f" %
               (info.width, info.height, K[0, 0], K[1, 1], K[0, 2], K[1, 2],
                float(np.max(np.abs(D))) if D.size else 0.0))
         depth = grab_median_depth(self.depth_topic, self.capture_frames)
         R_cb, t_cb = lookup_R_t(self.tf_buffer, self.base_frame, self.camera_frame)
 
+        # 相机光心在 board 系的高度，给单应性视差当 cam_z。
+        cam_z = None
+        if self.board_R is not None:
+            cam_z = abs(float(self.board_R.T.dot(t_cb - self.board_P)[2]))
+        hom_ok = self.pick_H is not None and self.board_R is not None
+
         rows = []
         for p in self.points:
             z = sample_depth(depth, p["u"], p["v"], self.sample_win_half, self.sample_min_valid)
             row = dict(p)
             row["depth_m"] = z
-            if z is None:
-                print("  P%d pixel=(%d,%d) 深度无效，后续会跳过。" % (p["id"], p["u"], p["v"]))
-                row["valid_depth"] = False
-                rows.append(row)
-                continue
-            p_cam = pixel_depth_to_camera(p["u"], p["v"], z, K, D)
-            p_base = R_cb.dot(p_cam) + t_cb
-            row["valid_depth"] = True
-            row["camera_xyz_m"] = [float(v) for v in p_cam]
-            row["vision_base_m"] = [float(v) for v in p_base]
-            if self.board_R is not None:
-                p_board = self.board_R.T.dot(p_base - self.board_P)
-                row["vision_board_m"] = [float(v) for v in p_board]
+            row["valid_depth"] = z is not None
+            p_board = None
+            if z is not None:
+                p_cam = pixel_depth_to_camera(p["u"], p["v"], z, K, D)
+                p_base = R_cb.dot(p_cam) + t_cb
+                row["camera_xyz_m"] = [float(v) for v in p_cam]
+                row["vision_base_m"] = [float(v) for v in p_base]
+                if self.board_R is not None:
+                    p_board = self.board_R.T.dot(p_base - self.board_P)
+                    row["vision_board_m"] = [float(v) for v in p_board]
+                print("  P%d pixel=(%d,%d) z=%.4f -> 深度+手眼 base=[%.5f %.5f %.5f]" %
+                      (p["id"], p["u"], p["v"], z, p_base[0], p_base[1], p_base[2]))
+            else:
+                print("  P%d pixel=(%d,%d) 深度无效（深度路径跳过；单应性路径用 PICK_Z 仍可比）。" %
+                      (p["id"], p["u"], p["v"]))
+
+            # 单应性(+视差)路径：复刻 xarm_controller_node 的抓取 XY。
+            # 这些点点在发光板（board 系 z=0，单应性标定所在平面）上，不是方块顶面，
+            # 所以 block_z=0（视差比例=1，无平移），回投也落在 board 平面 z=0。
+            if hom_ok:
+                block_z = 0.0
+                bz = 0.0
+                u_rect, v_rect = raw_to_rectified_px(p["u"], p["v"], K, D, P3)
+                hxy = homography_board_xy(self.pick_H, u_rect, v_rect, cx_p, cy_p,
+                                          cam_z, block_z, self.use_parallax)
+                if hxy is not None:
+                    hom_base = self.board_R.dot(np.array([hxy[0], hxy[1], bz])) + self.board_P
+                    row["valid_homography"] = True
+                    row["homography_board_xy_m"] = [float(hxy[0]), float(hxy[1])]
+                    row["homography_base_m"] = [float(v) for v in hom_base]
+                    print("       单应性 board_xy=[%.5f %.5f] -> base=[%.5f %.5f]" %
+                          (hxy[0], hxy[1], hom_base[0], hom_base[1]))
             rows.append(row)
-            print("  P%d pixel=(%d,%d) z=%.4f -> base=[%.5f %.5f %.5f]" %
-                  (p["id"], p["u"], p["v"], z, p_base[0], p_base[1], p_base[2]))
         return rows, K, D
 
     def collect_touch_points(self, rows):
@@ -289,7 +423,9 @@ class PixelTouchCheck(object):
         print("每次让 link_tcp/吸嘴尖对准同一个物理点，按回车记录；s 跳过；q 结束。\n")
         out = []
         for row in rows:
-            if not row.get("valid_depth"):
+            has_depth = bool(row.get("valid_depth")) and ("vision_base_m" in row)
+            has_hom = bool(row.get("valid_homography")) and ("homography_base_m" in row)
+            if not has_depth and not has_hom:
                 out.append(row)
                 continue
             pid = row["id"]
@@ -306,50 +442,74 @@ class PixelTouchCheck(object):
                 except Exception as e:
                     print("  读取 TCP 失败: %s" % e)
                     continue
-                p_vis = np.asarray(row["vision_base_m"], dtype=np.float64)
-                diff = p_touch - p_vis
                 row["touch_base_m"] = [float(v) for v in p_touch]
-                row["error_m"] = [float(v) for v in diff]
-                row["error_norm_m"] = float(np.linalg.norm(diff))
-                row["error_xy_m"] = float(np.linalg.norm(diff[:2]))
                 if self.board_R is not None:
-                    p_board = self.board_R.T.dot(p_touch - self.board_P)
-                    row["touch_board_m"] = [float(v) for v in p_board]
-                    row["error_board_m"] = [float(v) for v in self.board_R.T.dot(diff)]
-                print("  P%d 误差 touch-vision: dx=%+.2f dy=%+.2f dz=%+.2f mm |xy|=%.2f |3d|=%.2f mm" %
-                      (pid, diff[0] * 1000.0, diff[1] * 1000.0, diff[2] * 1000.0,
-                       row["error_xy_m"] * 1000.0, row["error_norm_m"] * 1000.0))
+                    row["touch_board_m"] = [float(v) for v in self.board_R.T.dot(p_touch - self.board_P)]
+
+                parts = []
+                if has_depth:
+                    diff = p_touch - np.asarray(row["vision_base_m"], dtype=np.float64)
+                    row["error_m"] = [float(v) for v in diff]
+                    row["error_norm_m"] = float(np.linalg.norm(diff))
+                    row["error_xy_m"] = float(np.linalg.norm(diff[:2]))
+                    if self.board_R is not None:
+                        row["error_board_m"] = [float(v) for v in self.board_R.T.dot(diff)]
+                    parts.append("深度+手眼 dx=%+.2f dy=%+.2f dz=%+.2f |xy|=%.2f mm" %
+                                 (diff[0] * 1000.0, diff[1] * 1000.0, diff[2] * 1000.0,
+                                  row["error_xy_m"] * 1000.0))
+                if has_hom:
+                    hdiff = p_touch - np.asarray(row["homography_base_m"], dtype=np.float64)
+                    row["homography_error_m"] = [float(v) for v in hdiff]
+                    row["homography_error_xy_m"] = float(np.linalg.norm(hdiff[:2]))
+                    parts.append("单应性 dx=%+.2f dy=%+.2f |xy|=%.2f mm" %
+                                 (hdiff[0] * 1000.0, hdiff[1] * 1000.0,
+                                  row["homography_error_xy_m"] * 1000.0))
+                print("  P%d  " % pid + "  |  ".join(parts))
                 out.append(row)
                 break
         return out
 
-    def summarize(self, rows):
-        valid = [r for r in rows if r.get("error_m") is not None]
+    @staticmethod
+    def _err_stats(rows, key_vec):
+        valid = [r for r in rows if r.get(key_vec) is not None]
         if not valid:
-            print("\n没有有效对比点。")
-            return {}
-        E = np.asarray([r["error_m"] for r in valid], dtype=np.float64)
+            return None
+        E = np.asarray([r[key_vec] for r in valid], dtype=np.float64)
         norms = np.linalg.norm(E, axis=1)
         xy = np.linalg.norm(E[:, :2], axis=1)
-        summary = {
+        return {
             "count": int(len(valid)),
             "mean_error_m": [float(v) for v in E.mean(axis=0)],
             "median_abs_error_m": [float(v) for v in np.median(np.abs(E), axis=0)],
-            "rms_3d_m": float(np.sqrt(np.mean(norms ** 2))),
             "rms_xy_m": float(np.sqrt(np.mean(xy ** 2))),
-            "max_3d_m": float(np.max(norms)),
+            "rms_3d_m": float(np.sqrt(np.mean(norms ** 2))),
             "max_xy_m": float(np.max(xy)),
+            "max_3d_m": float(np.max(norms)),
         }
-        print("\n========== pixel/depth/hand-eye vs touch 误差汇总 ==========")
-        print("有效点: %d" % summary["count"])
-        print("mean dx/dy/dz: %+.2f / %+.2f / %+.2f mm" %
-              tuple(np.asarray(summary["mean_error_m"]) * 1000.0))
-        print("RMS xy/3d: %.2f / %.2f mm" %
-              (summary["rms_xy_m"] * 1000.0, summary["rms_3d_m"] * 1000.0))
-        print("MAX xy/3d: %.2f / %.2f mm" %
-              (summary["max_xy_m"] * 1000.0, summary["max_3d_m"] * 1000.0))
-        print("===========================================================\n")
-        return summary
+
+    def summarize(self, rows):
+        depth_s = self._err_stats(rows, "error_m")
+        hom_s = self._err_stats(rows, "homography_error_m")
+        if depth_s is None and hom_s is None:
+            print("\n没有有效对比点。")
+            return {}
+        print("\n========== 误差汇总（以实际 touch 为基准） ==========")
+        if depth_s:
+            print("[深度+手眼 ] n=%d  mean dx/dy/dz=%+.2f/%+.2f/%+.2f mm  RMS xy=%.2f mm  MAX xy=%.2f mm" %
+                  (depth_s["count"], depth_s["mean_error_m"][0] * 1000.0,
+                   depth_s["mean_error_m"][1] * 1000.0, depth_s["mean_error_m"][2] * 1000.0,
+                   depth_s["rms_xy_m"] * 1000.0, depth_s["max_xy_m"] * 1000.0))
+        if hom_s:
+            print("[单应性+视差] n=%d  mean dx/dy   =%+.2f/%+.2f mm        RMS xy=%.2f mm  MAX xy=%.2f mm" %
+                  (hom_s["count"], hom_s["mean_error_m"][0] * 1000.0,
+                   hom_s["mean_error_m"][1] * 1000.0,
+                   hom_s["rms_xy_m"] * 1000.0, hom_s["max_xy_m"] * 1000.0))
+        elif self.compare_homography:
+            print("[单应性+视差] 无（缺 PICK_HOMOGRAPHY / BOARD_POSE_BASE？）")
+        print("提示：深度+手眼=感知路径；单应性+视差=控制器运行时真正用的 XY 路径。")
+        print("两者都小→抓偏在执行(move_line/xArm-TCP)；仅单应性大→标定/位姿/视差；都大→相机/手眼。")
+        print("===================================================\n")
+        return {"depth_handeye": depth_s, "homography": hom_s}
 
     def save(self, rows, summary, K, D):
         if not self.save_path:

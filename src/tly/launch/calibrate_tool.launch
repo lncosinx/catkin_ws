@@ -20,6 +20,24 @@
          的 XY（覆盖存 BOARD_CELL_OVERRIDES_BOARD），不重标整块网格；需已有步骤2/3结果。改完即退出。 -->
     <arg name="edit_cells" default="false" />
 
+    <!-- 步骤8 白板格心巡检（验证标定准不准，⚠️会自动驱动真机）：true=驱动机械臂依次悬停到白板各格
+         中心【上方设定高度】，按回车走下一个格；与生产控制器同一路径(原生 move_line + BOARD_POSE_BASE)。
+         需已有步骤2/3结果；只读不写配置；走完即退出。 -->
+    <arg name="verify_cells" default="false" />
+    <!-- 选哪些格：all=全部140格(蛇形); 也可 r3(整行)/c5(整列)/'0,0;9,13'(指定格,col,row) -->
+    <arg name="verify_cells_spec" default="all" />
+    <!-- 每格悬停高度(距该格基准面，米)；巡检中输入 'h' 可改 -->
+    <arg name="verify_height" default="0.05" />
+    <!-- 基准面：bump=格心凸起顶面(查 XY 对准用)；place=放置面 PLACE_Z_MAP(查放置高度用) -->
+    <arg name="verify_z_ref" default="bump" />
+    <!-- move_line 速度/加速度(mm/s, mm/s^2)，巡检宜慢 -->
+    <arg name="verify_speed" default="60" />
+    <arg name="verify_acc" default="300" />
+    <!-- 横移安全平面相对最高格顶的抬升余量(米)，up-over-down 走位用 -->
+    <arg name="verify_travel_clearance" default="0.08" />
+    <!-- true=巡检前把 xArm 工具偏置设为吸盘尖 link_tcp(从 TF 读, 让 move_line 控制 link_tcp, 已存盘) -->
+    <arg name="verify_set_tcp_offset" default="true" />
+
     <!-- 白板标定模式：A=9点，B=25点，C=140点。白板翘曲明显建议 C -->
     <arg name="board_mode" default="B" />
 
@@ -55,8 +73,8 @@
     </include>
 
     <!-- 【核心新增】：在空间点标定阶段，也必须发布精确的吸盘 TCP 坐标系！ -->
-    <node pkg="tf2_ros" type="static_transform_publisher" name="suction_tcp_broadcaster" 
-          args="0.00046 -0.00026 0.06962 0 0 0 link6 link_tcp" />
+    <node pkg="tf2_ros" type="static_transform_publisher" name="suction_tcp_broadcaster"
+          args="0.0007 -0.00027 0.06706 0 0 0 link6 link_tcp" />
 
     <!-- 2. 启动 RealSense，相机内参来自 /camera/color/camera_info（滤波与手眼标定时一致） -->
     <arg name="depth_filters" default="spatial,temporal,hole_filling" />
@@ -89,6 +107,16 @@
         <param name="check_points" value="$(arg check_points)" />
 
         <param name="edit_cells" value="$(arg edit_cells)" />
+
+        <!-- 步骤8 白板格心巡检（验证模式） -->
+        <param name="verify_cells" value="$(arg verify_cells)" />
+        <param name="verify_cells_spec" value="$(arg verify_cells_spec)" />
+        <param name="verify_height" value="$(arg verify_height)" />
+        <param name="verify_z_ref" value="$(arg verify_z_ref)" />
+        <param name="verify_speed" value="$(arg verify_speed)" />
+        <param name="verify_acc" value="$(arg verify_acc)" />
+        <param name="verify_travel_clearance" value="$(arg verify_travel_clearance)" />
+        <param name="verify_set_tcp_offset" value="$(arg verify_set_tcp_offset)" />
 
         <param name="board_mode" value="$(arg board_mode)" />
         <param name="height_interpolation" value="$(arg height_interpolation)" />

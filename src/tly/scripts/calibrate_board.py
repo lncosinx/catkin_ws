@@ -43,10 +43,17 @@ config，控制/路径/单应性节点直接在 base 系用它换算（全量 ba
   → 覆盖该格的放置 XY；覆盖量存入 BOARD_CELL_OVERRIDES_BOARD 并即时重写 BOARD_CENTERS_14x10_BOARD。
   只改 XY（z=凸起高度、放置深度 PLACE_Z_MAP 不变）。需已有步骤 2/3 的坐标系与网格；重跑步骤 3
   会重派生网格并清空这些逐格覆盖。输入 'list' 查看已有覆盖，'undo' 撤销上一次修改，'q' 结束。
+
+步骤8 白板格心巡检（验证标定，不写配置）：
+  用 ROS 参数 ~verify_cells:=true 进入：驱动机械臂依次悬停到白板各格中心【上方设定高度】，
+  肉眼核对标定 XY 是否对准（与生产控制器同一条路径：原生 /xarm/move_line + BOARD_POSE_BASE）。
+  按回车走下一个格；支持选定格子（~verify_cells_spec: all / r<行> / c<列> / 'col,row;...'）与设置
+  每格上方高度（~verify_height，米；巡检中输入 'h' 可改）。需已有步骤 2/3 结果。⚠️ 会自动驱动真机。
 """
 
 import os
 import sys
+import json
 import yaml
 import rospy
 import tf2_ros
@@ -80,6 +87,44 @@ BOARD_MODE_B_COLS = [0, 2, 5, 7, 9]
 BOARD_MODE_B_ROWS = [0, 3, 7, 10, 13]
 
 
+def _step3_progress_path(config_path):
+    return os.path.join(os.path.dirname(os.path.abspath(config_path)), ".step3_bump_progress.json")
+
+
+def _save_step3_progress(path, board_mode, cols, rows, pts):
+    """边采边存白板凸起进度，便于相机掉线/重启 launch 后续采，避免重标整堆凸起。"""
+    try:
+        data = {"board_mode": str(board_mode),
+                "points": [[int(c), int(r), float(p[0]), float(p[1]), float(p[2])]
+                           for c, r, p in zip(cols, rows, pts)]}
+        with open(path, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        rospy.logwarn("步骤3进度保存失败(不影响标定): %s", e)
+
+
+def _load_step3_progress(path, board_mode):
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path) as f:
+            data = json.load(f)
+        if str(data.get("board_mode")) != str(board_mode):
+            return None
+        pts = data.get("points") or []
+        return pts if pts else None
+    except Exception:
+        return None
+
+
+def _clear_step3_progress(path):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
 def get_eef_pose(tf_buffer, parent="link_base", child="link_eef"):
     try:
         trans = tf_buffer.lookup_transform(parent, child, rospy.Time(0), rospy.Duration(3.0))
@@ -90,6 +135,17 @@ def get_eef_pose(tf_buffer, parent="link_base", child="link_eef"):
         ], dtype=float)
     except Exception as e:
         rospy.logerr("TF 变换获取失败，请确认机械臂状态: %s", e)
+        return None
+
+
+def get_eef_rotmat(tf_buffer, parent="link_base", child="link_eef"):
+    """读 parent<-child 的旋转矩阵(3x3)。失败返回 None。"""
+    try:
+        trans = tf_buffer.lookup_transform(parent, child, rospy.Time(0), rospy.Duration(3.0))
+        q = trans.transform.rotation
+        return quaternion_matrix([q.x, q.y, q.z, q.w])[:3, :3]
+    except Exception as e:
+        rospy.logerr("TF 朝向获取失败，请确认机械臂状态: %s", e)
         return None
 
 
@@ -721,20 +777,36 @@ def click_pixels(color_img, num_points, title="click points (Left=add Right=undo
     if cv2 is None:
         return None
     clicks = []
-    st = {"x": 0, "y": 0}
+    H_full, W_full = color_img.shape[:2]
+    st = {"x": W_full // 2, "y": H_full // 2}
+
+    def disp_to_image(x, y):
+        # WINDOW_NORMAL 窗口被 WM 缩放时，鼠标回调给的是“显示坐标”而非图像坐标。
+        # 按当前实际显示尺寸换算回全分辨率图像坐标，否则记录的像素被缩放带偏，
+        # 污染单应性标定（运行时检测像素未缩放 → 系统性、随位置变化的吸偏）。
+        try:
+            _, _, rw, rh = cv2.getWindowImageRect(title)
+            if rw > 0 and rh > 0:
+                x = x * W_full / float(rw)
+                y = y * H_full / float(rh)
+        except Exception:
+            pass
+        ix = int(max(0, min(W_full - 1, round(x))))
+        iy = int(max(0, min(H_full - 1, round(y))))
+        return ix, iy
 
     def on_mouse(event, x, y, flags, param):
-        st["x"], st["y"] = x, y
+        ix, iy = disp_to_image(x, y)
+        st["x"], st["y"] = ix, iy
         if event == cv2.EVENT_LBUTTONDOWN and len(clicks) < num_points:
-            clicks.append((x, y))
-            print(f"  ✅ P{len(clicks)} pixel=({x},{y})")
+            clicks.append((ix, iy))
+            print(f"  ✅ P{len(clicks)} pixel=({ix},{iy})")
         elif event == cv2.EVENT_RBUTTONDOWN and clicks:
             clicks.pop()
             print("  ↩️ 撤销上一个点")
 
     cv2.namedWindow(title, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(title, on_mouse)
-    H_full, W_full = color_img.shape[:2]
     while not rospy.is_shutdown():
         disp = color_img.copy()
         for i, (u, v) in enumerate(clicks):
@@ -754,7 +826,7 @@ def click_pixels(color_img, num_points, title="click points (Left=add Right=undo
             if ox > 0 and zh + 10 < disp.shape[0]:
                 disp[10:10 + zh, ox:ox + zw] = z
                 cv2.rectangle(disp, (ox, 10), (ox + zw, 10 + zh), (0, 255, 0), 2)
-        cv2.putText(disp, f"{len(clicks)}/{num_points}  Left=add Right=undo Enter=ok q=cancel",
+        cv2.putText(disp, f"{len(clicks)}/{num_points}  Left=add Right=undo i=type(u,v) Enter=ok q=cancel",
                     (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.imshow(title, disp)
         k = cv2.waitKey(30) & 0xFF
@@ -763,6 +835,25 @@ def click_pixels(color_img, num_points, title="click points (Left=add Right=undo
         if k == ord("q"):
             cv2.destroyWindow(title)
             return None
+        if k == ord("i") and len(clicks) < num_points:
+            # 可选：手动键入像素坐标（如从 realsense-viewer 读数直接输入），彻底绕开点选/窗口缩放。
+            # 注意：键入时焦点要切到终端。
+            try:
+                s = input(f"  ⌨️  输入像素 u,v（逗号或空格分隔，范围 0..{W_full-1}, 0..{H_full-1}；空回车取消）: ").strip()
+            except EOFError:
+                s = ""
+            if s:
+                try:
+                    parts = s.replace(",", " ").split()
+                    u, v = int(round(float(parts[0]))), int(round(float(parts[1])))
+                    if 0 <= u < W_full and 0 <= v < H_full:
+                        clicks.append((u, v))
+                        st["x"], st["y"] = u, v
+                        print(f"  ✅ P{len(clicks)} pixel=({u},{v})  [手动输入]")
+                    else:
+                        print("  ⚠️ 越界，已忽略。")
+                except (ValueError, IndexError):
+                    print("  ⚠️ 格式无效，示例：640 360 或 640,360")
     cv2.destroyWindow(title)
     return clicks
 
@@ -1023,6 +1114,329 @@ def run_edit_cell_centers(tf_buffer, base_frame, eef_frame, tcfg, config_path, e
     print("=" * 72)
 
 
+def parse_cell_spec(spec, rows=ROWS, cols=COLS):
+    """把格子选择串解析成有序 [(row,col), ...]（走位顺序即此顺序）。支持：
+       'all' / 空 → 全部 rows*cols 格，蛇形 row-major（减少往返）；
+       'r<idx>' → 整行（如 r3）；'c<idx>' → 整列（如 c5）；
+       'col,row' → 单格（按 col,row 顺序，与标定提示一致）；
+       多个 token 用 ';' 或空白分隔。越界/非法 token 跳过，重复格去重。"""
+    spec = str(spec).strip().lower()
+
+    def snake_all():
+        out = []
+        for r in range(rows):
+            crange = range(cols) if r % 2 == 0 else range(cols - 1, -1, -1)
+            for c in crange:
+                out.append((r, c))
+        return out
+
+    if spec in ("", "all", "全部"):
+        return snake_all()
+
+    out = []
+    seen = set()
+
+    def add(r, c):
+        if 0 <= r < rows and 0 <= c < cols and (r, c) not in seen:
+            seen.add((r, c))
+            out.append((r, c))
+
+    for tok in spec.replace("；", ";").replace("，", ",").replace(";", " ").split():
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok in ("all", "全部"):
+            for r, c in snake_all():
+                add(r, c)
+        elif tok.startswith("r") and tok[1:].isdigit():
+            r = int(tok[1:])
+            for c in range(cols):
+                add(r, c)
+        elif tok.startswith("c") and tok[1:].isdigit():
+            c = int(tok[1:])
+            for r in range(rows):
+                add(r, c)
+        elif "," in tok:
+            a, b = tok.split(",", 1)
+            try:
+                col, row = int(a), int(b)
+            except ValueError:
+                continue
+            add(row, col)
+    return out
+
+
+def run_cell_tour(tf_buffer, base_frame, eef_frame, tcfg):
+    """步骤8（独立验证模式）：驱动机械臂依次悬停到白板各格中心【上方设定高度】，肉眼核对标定 XY 是否对准。
+    与生产控制器同一条路径：原生 /xarm/move_line（set_mode 0 / set_state 0），位姿用 BOARD_POSE_BASE
+    把 board 系格心换算到 base 系，工具朝下（roll=π，与放置一致）。只读取标定结果，不修改任何配置。
+    交互：按回车走下一个格；支持选定格子（all / r<行> / c<列> / 'col,row;...'）与设置每格上方高度。"""
+    import math
+    try:
+        from xarm_msgs.srv import SetInt16, Move, SetAxis, TCPOffset
+        from xarm_msgs.msg import RobotMsg
+    except Exception as e:
+        print(f"❌ 无法导入 xarm_msgs（确认已 catkin_make 且 source devel/setup.bash）：{e}")
+        return
+
+    # ---- 读取标定几何（与控制器消费的同一批键）----
+    bp = tcfg.get("BOARD_POSE_BASE")
+    centers = tcfg.get("BOARD_CENTERS_14x10_BOARD")
+    if not isinstance(bp, dict) or "origin" not in bp or "rpy" not in bp:
+        print("❌ 配置缺少 BOARD_POSE_BASE，请先完成步骤 3。")
+        return
+    if not isinstance(centers, list) or not centers or not isinstance(centers[0], list):
+        print("❌ 配置缺少 BOARD_CENTERS_14x10_BOARD，请先完成步骤 3。")
+        return
+    P = np.asarray(bp["origin"], dtype=float)
+    rpy = [float(v) for v in bp["rpy"]]
+    R_bb = euler_matrix(rpy[0], rpy[1], rpy[2], axes="sxyz")[:3, :3]   # board -> base 旋转
+    rows = len(centers)
+    cols = len(centers[0])
+
+    # 每格基准 Z：默认用格心凸起顶面（board_centers 的 z）；verify_z_ref=place 时改用 PLACE_Z_MAP（放置面）。
+    z_ref = str(rospy.get_param("~verify_z_ref", "bump")).strip().lower()
+    place_map = tcfg.get("PLACE_Z_MAP_14x10") if z_ref == "place" else None
+    if z_ref == "place" and (not isinstance(place_map, list) or len(place_map) != rows):
+        print("  ⚠️ verify_z_ref=place 但缺 PLACE_Z_MAP_14x10，回退用凸起顶面作基准。")
+        place_map = None
+
+    cell_xyz = []
+    for r in range(rows):
+        line = []
+        for c in range(cols):
+            x = float(centers[r][c][0])
+            y = float(centers[r][c][1])
+            top = float(place_map[r][c]) if place_map is not None else float(centers[r][c][2])
+            line.append((x, y, top))
+        cell_xyz.append(line)
+    max_top = max(cell_xyz[r][c][2] for r in range(rows) for c in range(cols))
+
+    # ---- 参数 ----
+    height_above = float(rospy.get_param("~verify_height", 0.05))
+    spec = str(rospy.get_param("~verify_cells_spec", "all"))
+    speed = float(rospy.get_param("~verify_speed", 60.0))
+    acc = float(rospy.get_param("~verify_acc", 300.0))
+    travel_clear = float(rospy.get_param("~verify_travel_clearance", 0.08))
+    do_set_tcp = bool(rospy.get_param("~verify_set_tcp_offset", True))
+    # 工具下扎朝向（board 系）：roll=π 让工具 Z 指向板内（朝下），与放置朝向一致。
+    tool_R = euler_matrix(math.pi, 0.0, 0.0, axes="sxyz")[:3, :3]
+
+    # ---- xArm 原生服务（calibrate_tool.launch 的 realMove_exec 已起 ns=xarm 的驱动）----
+    print("\n等待 xArm 原生服务 /xarm/move_line ...")
+    try:
+        rospy.wait_for_service("/xarm/move_line", timeout=15.0)
+    except Exception:
+        print("❌ 未发现 /xarm/move_line（确认机器人在线、robot_ip 正确）。")
+        return
+    set_mode = rospy.ServiceProxy("/xarm/set_mode", SetInt16)
+    set_state = rospy.ServiceProxy("/xarm/set_state", SetInt16)
+    motion_ctrl = rospy.ServiceProxy("/xarm/motion_ctrl", SetAxis)
+    move_line = rospy.ServiceProxy("/xarm/move_line", Move)
+    set_tcp = rospy.ServiceProxy("/xarm/set_tcp_offset", TCPOffset)
+
+    # 当前原生位姿（解缠 roll/pitch/yaw，避免手腕兜大圈）。
+    native = {"pose": None}
+
+    def on_state(msg):
+        if len(msg.pose) >= 6:
+            native["pose"] = list(msg.pose[:6])
+
+    rospy.Subscriber("/xarm/xarm_states", RobotMsg, on_state)
+    try:
+        rospy.wait_for_message("/xarm/xarm_states", RobotMsg, timeout=5.0)
+    except Exception:
+        print("  ⚠️ 暂未收到 /xarm/xarm_states；首个移动不做角度解缠（影响不大）。")
+
+    def unwrap(cur, tgt):
+        d = tgt - cur
+        while d > math.pi:
+            d -= 2.0 * math.pi
+        while d < -math.pi:
+            d += 2.0 * math.pi
+        return cur + d
+
+    # ---- 设工具坐标偏置 = 吸盘尖（link_tcp），让 move_line 控制 link_tcp（与标定测量的点一致）----
+    # link_eef ≡ link6（joint_eef 为单位变换），故 firmware 工具偏置=TF(link_eef→eef_frame)。
+    if do_set_tcp:
+        try:
+            tr = tf_buffer.lookup_transform("link_eef", eef_frame, rospy.Time(0), rospy.Duration(3.0))
+            ox = tr.transform.translation.x * 1000.0
+            oy = tr.transform.translation.y * 1000.0
+            oz = tr.transform.translation.z * 1000.0
+            resp = set_tcp(ox, oy, oz, 0.0, 0.0, 0.0)
+            if getattr(resp, "ret", 0) != 0:
+                print(f"  ⚠️ set_tcp_offset 返回 ret={resp.ret}；沿用控制器内已保存的工具偏置。")
+            else:
+                print("  已设 xArm 工具偏置(TCP) = link_eef→{} = ({:.2f}, {:.2f}, {:.2f}) mm，"
+                      "move_line 控制 {}（已存盘，持久生效）。".format(eef_frame, ox, oy, oz, eef_frame))
+        except Exception as e:
+            print(f"  ⚠️ 读 TF/设工具偏置失败（{e}）；沿用控制器内已保存的工具偏置。")
+
+    def board_to_native(bx, by, bz):
+        pos_base = R_bb.dot(np.array([bx, by, bz], dtype=float)) + P
+        M = np.eye(4)
+        M[:3, :3] = R_bb.dot(tool_R)
+        r, p, y = euler_from_matrix(M, axes="sxyz")
+        cur = native["pose"]
+        if cur is not None:
+            r = unwrap(cur[3], r)
+            p = unwrap(cur[4], p)
+            y = unwrap(cur[5], y)
+        return [pos_base[0] * 1000.0, pos_base[1] * 1000.0, pos_base[2] * 1000.0, r, p, y]
+
+    def do_move(bx, by, bz, label):
+        pose = board_to_native(bx, by, bz)
+        try:
+            resp = move_line(pose, speed, acc, 0.0, 0.0)
+        except Exception as e:
+            print(f"  ❌ move_line 调用失败({label}): {e}")
+            return False
+        if getattr(resp, "ret", 0) != 0:
+            print(f"  ❌ move_line 失败({label}): ret={resp.ret} msg={resp.message}")
+            return False
+        return True
+
+    prev = {"xy": None}
+
+    def goto(r, c):
+        """up-over-down 安全走位：先在上一格 XY 升到安全平面，横移到目标 XY，再下降到目标上方高度。"""
+        x, y, top = cell_xyz[r][c]
+        hover_z = top + height_above
+        safe_z = max(max_top + travel_clear, hover_z)   # 横移用的全局安全平面（board 系）
+        if prev["xy"] is not None:
+            if not do_move(prev["xy"][0], prev["xy"][1], safe_z, "lift"):
+                return False
+        if not do_move(x, y, safe_z, "over"):
+            return False
+        if not do_move(x, y, hover_z, "descend"):
+            return False
+        prev["xy"] = (x, y)
+        return True
+
+    # ---- 组装格子列表 ----
+    cells = parse_cell_spec(spec, rows, cols)
+    if not cells:
+        print(f"⚠️ 选择 '{spec}' 解析为空，默认走全部。")
+        cells = parse_cell_spec("all", rows, cols)
+
+    print("\n" + "=" * 78)
+    print("=== 步骤 8：白板格心巡检（驱动真机悬停核对标定 XY）===")
+    print(f"= 网格 {cols} 列 x {rows} 行；本次将走 {len(cells)} 个格，悬停在每格上方 {height_above*1000:.0f} mm。")
+    print(f"= 基准面: {'放置面 PLACE_Z_MAP' if place_map is not None else '格心凸起顶面'}；"
+          f"速度 {speed:.0f} mm/s, 加速度 {acc:.0f} mm/s²。")
+    print("= 交互命令：回车=下一个 | b=上一个 | r=重走本格 | g col,row=跳到某格 | h=改高度 |")
+    print("=           sel=重选格子 | list=看剩余 | q=退出。工具下扎朝向同放置（朝下）。")
+    print("=" * 78)
+    print("⚠️ 该步骤会【自动驱动真机】移动。请确保白板上无方块、周围无障碍、急停在手边。")
+    confirm = input("确认现场安全后，输入 GO 回车开始（其它任意输入=取消）: ").strip().lower()
+    if confirm != "go":
+        print("已取消，未移动机械臂。")
+        return
+
+    # 让 move_line 阻塞到运动完成再返回（驱动每次调用动态读此参数），保证回车后臂到位才提示下一步。
+    rospy.set_param("/xarm/wait_for_finish", True)
+
+    # 切到原生位置模式（calibrate_tool 默认起 MoveIt；这里接管为 xArm 原生 move_line）。
+    try:
+        motion_ctrl(8, 1)
+        rospy.sleep(0.2)
+        set_mode(0)
+        rospy.sleep(0.2)
+        set_state(0)
+        rospy.sleep(0.3)
+    except Exception as e:
+        print(f"⚠️ 切换原生模式失败: {e}（仍尝试移动；若不动请检查 set_mode/set_state）。")
+
+    # 用当前位姿(base→board)初始化走位锚点：让首个移动先在原地竖直抬到安全平面再横移，避免贴板斜插。
+    cur = native["pose"]
+    if cur is not None:
+        base_pos = np.array([cur[0] / 1000.0, cur[1] / 1000.0, cur[2] / 1000.0], dtype=float)
+        bxy = R_bb.T.dot(base_pos - P)
+        prev["xy"] = (float(bxy[0]), float(bxy[1]))
+
+    i = 0
+    if not goto(*cells[i]):
+        print("❌ 首个移动失败，终止巡检。检查机器人是否使能/有报错。")
+        return
+
+    while not rospy.is_shutdown():
+        r, c = cells[i]
+        cmd = input(
+            f"\n[{i+1}/{len(cells)}] 现处于 (col={c}, row={r}) 上方 {height_above*1000:.0f} mm。"
+            "回车=下一个 | b=上一个 | r=重走 | g col,row | h[=高度m] | sel | list | q: "
+        ).strip().lower()
+
+        if cmd in ("q", "quit", "退出"):
+            break
+        elif cmd in ("", "n", "next", "下一个"):
+            if i + 1 >= len(cells):
+                if ask_yes_no("已是最后一个，重头再走一遍？", default=False):
+                    i = 0
+                    goto(*cells[i])
+                else:
+                    break
+            else:
+                i += 1
+                goto(*cells[i])
+        elif cmd in ("b", "back", "上一个"):
+            if i > 0:
+                i -= 1
+                goto(*cells[i])
+            else:
+                print("  已是第一个。")
+        elif cmd in ("r", "redo", "重走"):
+            goto(*cells[i])
+        elif cmd in ("list", "ls"):
+            rem = ", ".join(f"(c{cc},r{rr})" for rr, cc in cells[i + 1:i + 21])
+            print(f"  剩余 {len(cells) - i - 1} 格，接下来：{rem}{' ...' if len(cells) - i - 1 > 20 else ''}")
+        elif cmd.startswith("h"):
+            rest = cmd[1:].strip().lstrip("=").strip()
+            if rest == "":
+                rest = input("  输入每格上方高度(米，例 0.05；也可填 mm 如 30): ").strip()
+            try:
+                hv = float(rest)
+            except ValueError:
+                print("  无效数字。")
+                continue
+            if hv > 1.0:           # 看起来是 mm
+                hv = hv / 1000.0
+            if hv < 0.0:
+                print("  高度不能为负。")
+                continue
+            height_above = hv
+            print(f"  ✅ 高度改为 {height_above*1000:.0f} mm，重走本格。")
+            goto(*cells[i])
+        elif cmd.startswith("g"):
+            sub = parse_cell_spec(cmd[1:].strip(), rows, cols)
+            if not sub:
+                print("  跳转格无效，格式 'g col,row'（如 g 3,5）。")
+                continue
+            tr_, tc_ = sub[0]
+            cells.insert(i + 1, (tr_, tc_))
+            i += 1
+            goto(*cells[i])
+        elif cmd.startswith("sel"):
+            rest = cmd[3:].strip()
+            if rest == "":
+                rest = input("  新的格子选择(all / r3 / c5 / '0,0;9,13'): ").strip()
+            new = parse_cell_spec(rest, rows, cols)
+            if not new:
+                print("  选择无效，保持原列表。")
+                continue
+            cells = new
+            i = 0
+            goto(*cells[i])
+        else:
+            print("  未识别命令。回车=下一个，q=退出。")
+
+    # 收尾：升到安全平面，方便取下/离开。
+    if prev["xy"] is not None:
+        do_move(prev["xy"][0], prev["xy"][1], max_top + travel_clear, "final_lift")
+    print("\n🎉 格心巡检结束。机械臂已升到安全高度；如需继续用 MoveIt 请重启 calibrate_tool.launch。")
+    print("=" * 78)
+
+
 def choose_board_mode():
     val = str(rospy.get_param("~board_mode", "")).strip().upper()
     if val in ("A", "B", "C"):
@@ -1207,6 +1621,12 @@ def main():
         run_edit_cell_centers(tf_buffer, base_frame, eef_frame, tcfg, config_path, existing_cfg)
         return
 
+    # 步骤8 白板格心巡检（独立验证模式）：~verify_cells:=true 时驱动真机依次悬停到各格核对标定，
+    # 然后退出（需已有步骤 2/3 结果；只读不写配置）。
+    if bool(rospy.get_param("~verify_cells", False)):
+        run_cell_tour(tf_buffer, base_frame, eef_frame, tcfg)
+        return
+
     run = choose_steps()
     warn_stale_dependencies(run)
 
@@ -1362,6 +1782,22 @@ def main():
         sample_cols = []
         sample_points_base = []
         i = 0
+        # 边采边存盘 + 重启续采：相机掉线/手滑重启 launch 后不必重标整堆凸起。
+        progress_path = _step3_progress_path(config_path)
+        saved = _load_step3_progress(progress_path, board_mode)
+        if saved:
+            saved = saved[:len(board_sample_col_row)]
+            ans = input(f"  🔁 检测到上次未完成的凸起进度（已采 {len(saved)}/{len(board_sample_col_row)} 点，模式 {board_mode}）。续采？[Y/n]: ").strip().lower()
+            if ans not in ("n", "no"):
+                for c, r, x, y, z in saved:
+                    sample_cols.append(int(c))
+                    sample_rows.append(int(r))
+                    sample_points_base.append(np.array([x, y, z], dtype=float))
+                i = len(sample_points_base)
+                print(f"  ▶️ 已恢复 {i} 点，从第 {i+1} 点继续。")
+            else:
+                _clear_step3_progress(progress_path)
+                print("  已丢弃旧进度，从头开始。")
         while i < len(board_sample_col_row):
             col, row = board_sample_col_row[i]
             p_base = require_pose(
@@ -1373,14 +1809,17 @@ def main():
                 sample_cols.pop()
                 sample_rows.pop()
                 sample_points_base.pop()
+                _save_step3_progress(progress_path, board_mode, sample_cols, sample_rows, sample_points_base)
                 prev_col, prev_row = board_sample_col_row[i]
                 print(f"  ↩️ 已撤销！退回上一个点 (col={prev_col}, row={prev_row}) 重新记录。")
                 continue
             sample_cols.append(col)
             sample_rows.append(row)
             sample_points_base.append(p_base)
+            _save_step3_progress(progress_path, board_mode, sample_cols, sample_rows, sample_points_base)
             i += 1
 
+        _clear_step3_progress(progress_path)
         sample_points_base = np.asarray(sample_points_base, dtype=float)
         sample_rows = np.asarray(sample_rows, dtype=float)
         sample_cols = np.asarray(sample_cols, dtype=float)
@@ -1879,6 +2318,12 @@ def main():
             if img is None:
                 print("  ⚠️ 取整流彩色图失败，跳过步骤7（确认 image_proc 在跑、话题对）。")
             else:
+                # 相机此刻在【拍照位姿/初始点】=视觉与单应性同一机位；在此读取工具朝向，
+                # 换算到 board 系后写盘，供控制节点抓取下扎复用其 roll/pitch（消除工具相对
+                # 板面微小倾角经 TCP 偏移投影造成的抓偏）。须在用户挪臂压黑点之前读。
+                tool_R_base = get_eef_rotmat(tf_buffer, base_frame, eef_frame)
+                if tool_R_base is None:
+                    print("  ⚠️ 读取初始点工具朝向失败，本次将不写 PICK_TOOL_RPY_BOARD。")
                 print(f"  在【发光板/标定纸】上点选 {nph} 个黑点(带放大镜)。")
                 clicks = click_pixels(img, nph, "pick homography: click black dots (zoom)")
                 if not clicks:
@@ -1919,6 +2364,15 @@ def main():
                             "rms_m": rms,
                             "sample_count": int(len(rows)),
                         }}
+                        # 初始点工具朝向换算到 board 系；控制节点取其 roll/pitch 作为抓取下扎朝向。
+                        if tool_R_base is not None:
+                            R_tool_board = R_mat.T.dot(tool_R_base)   # base->board · 工具(base) = 工具(board)
+                            M4 = np.eye(4)
+                            M4[:3, :3] = R_tool_board
+                            rpy_b = euler_from_matrix(M4, axes="sxyz")
+                            updates["PICK_TOOL_RPY_BOARD"] = [float(rpy_b[0]), float(rpy_b[1]), float(rpy_b[2])]
+                            print("  🧭 初始点工具朝向(board系 rpy)=[{:.4f}, {:.4f}, {:.4f}]；".format(*rpy_b)
+                                  + "控制节点抓取下扎将用其 roll/pitch（替代写死的 pi,0）。")
                         # 禁用旧的 affine 防止冲突（与 pick_affine 一致）。
                         paff = (existing_cfg.get("tetris", {}) or {}).get("PICK_AFFINE_CORRECTION")
                         if isinstance(paff, dict):

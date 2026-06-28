@@ -9,7 +9,7 @@
          vision_processor_node_dexined (神经网络边缘检测) -->
     <arg name="vision_node" default="vision_processor_node_dexined" />
     <!-- 进阶任务模式: true 则策略按 shape_sequence 求解(详见 strategy_node) -->
-    <arg name="advanced_mode" default="true" />
+    <arg name="advanced_mode" default="false" />
     <param name="robot_description" command="$(find xacro)/xacro --inorder '$(find xarm_description)/urdf/xarm_device.urdf.xacro' robot_type:=xarm dof:=6 add_gripper:=false" />
 
     <!-- =========================
@@ -68,7 +68,7 @@
          Make sure CMake executable name is vision_processor_node_cpp.
          If your executable is vision_processor_node, change type below accordingly.
          ========================= -->
-    <arg name="color_edge_thresh" default="30" /><!-- 命令行可覆盖,边看 debug_edges 边扫 -->
+    <arg name="color_edge_thresh" default="35" /><!-- 命令行可覆盖,边看 debug_edges 边扫 -->
     <arg name="color_edge_min_area" default="40" /><!-- 颜色边最小连通面积:滤掉掉漆零碎边,掉漆还切就调大 -->
     <arg name="use_dexined_for_split" default="true" /><!-- 或上DexiNed强边切同色贴碰块;不稳就设false纯颜色 -->
     <arg name="temporal_alpha" default="0.3" /><!-- 输入帧EMA时间平均系数,0=关;静止料堆抑噪/抗闪,越小越稳(更滞后) -->
@@ -188,18 +188,35 @@
     <param name="pick_yaw_offset_deg" value="-90.0" />
     <param name="yaw_homography_probe_px" value="30.0" />
     <param name="yaw_homography_v_sign" value="-1.0" />
+    <!-- J6 限位由 path_planner 全局 DP 解算并在 opt 计划里下发绝对 base-yaw；控制节点原样命令。 -->
+    <param name="use_planner_yaw" value="true" />
 
     <!-- Real board and placement -->
     <param name="place_release_z_margin" value="0.0" />
     <!-- tcp_*_offset_z(波纹管补偿)默认从标定写入的 /tetris/TCP_*_OFFSET_Z 读取；
          如需手动覆盖，取消下面两行注释即可。 -->
-    <param name="tcp_pick_offset_z" value="-0.015" />
+    <param name="tcp_pick_offset_z" value="-0.005" />
     <!-- <param name="tcp_place_offset_z" value="0.004" /> -->
+
+    <!-- RealSense 逐块抓取深度：用对齐深度图测每块真实顶面高度修正抓取 Z（仅 Z，X/Y 仍走单应性）。
+         相对 flat PICK_Z 夹紧到 ±max_dev，深度无效/野值自动回退平面假设。开启后建议把上面的
+         tcp_pick_offset_z 调小到“仅波纹管下压量”（深度已给真实顶面，不再需要补偿 PICK_Z 误差）。 -->
+    <param name="use_pick_depth_z" value="false" />
+    <param name="pick_depth_topic" value="/camera/aligned_depth_to_color/image_raw" />
+    <param name="pick_depth_sample_radius" value="5" />
+    <param name="pick_depth_max_dev_m" value="0.02" />
+    <param name="pick_depth_min_valid_m" value="0.05" />
     <param name="tcp_pick_offset_x" value="0.0" />
     <param name="tcp_pick_offset_y" value="0.0" />
     <param name="tcp_place_offset_x" value="0.0" />
-    <param name="tcp_place_offset_y" value="0.001" />
-    <param name="verify_native_xyz_after_motion" value="false" />
+    <param name="tcp_place_offset_y" value="0.0" />
+    <param name="verify_native_xyz_after_motion" value="true" />
+    <param name="native_xyz_tolerance_mm" value="6.0" />
+    <!-- 到位校验：轮询等"运动后的新鲜上报"进入容差，取代固定 sleep -->
+    <param name="native_verify_timeout_s" value="1.0" />
+    <param name="native_verify_poll_hz" value="50.0" />
+    <!-- 腕部 yaw 软限位(约 J6 上界,弧度,硬限±2π)。A/B 翻转以"腕部转角最小"为目标、此限位为约束 -->
+    <param name="wrist_soft_limit_rad" value="5.5" />
 
     <!-- Speed: first test must be slow -->
     <param name="transit_speed_mm_s" value="500.0" />
@@ -259,9 +276,17 @@
         <param name="use_cell_max_place_z" value="true" />
         <param name="require_board_map" value="true" />
         <param name="require_place_z_map" value="true" />
-        <param name="pick_yaw_offset_deg" value="90.0" />
+        <param name="pick_yaw_offset_deg" value="-90.0" />
         <param name="yaw_homography_probe_px" value="30.0" />
         <param name="yaw_homography_v_sign" value="-1.0" />
+
+        <!-- J6 限位全局 DP：读 joint_states 的真实 J6(已解缠)+xarm_states 的 base-yaw 作起点，
+             对优化后整条序列求最优绕角，绝对 yaw 随 opt 计划下发给控制节点。
+             硬限位±360°(±6.283rad)；软限位留余量(默认5.24≈300°)，偶发触限调小、想榨范围可调到~6.0。 -->
+        <param name="joint_state_topic" value="/xarm/joint_states" />
+        <param name="robot_state_topic" value="/xarm/xarm_states" />
+        <param name="j6_soft_limit_rad" value="5.24" />
+        <param name="j6_center_weight" value="0.05" />
 
         <param name="place_release_z_margin" value="0.006" />
         <!-- tcp_*_offset_z(波纹管补偿)默认从标定写入的 /tetris/TCP_*_OFFSET_Z 读取；
@@ -271,7 +296,7 @@
         <param name="tcp_pick_offset_x" value="0.0" />
         <param name="tcp_pick_offset_y" value="0.0" />
         <param name="tcp_place_offset_x" value="0.0" />
-        <param name="tcp_place_offset_y" value="-0.001" />
+        <param name="tcp_place_offset_y" value="0.0" />
 
         <!-- 深度抓取 Z (D2: 两种 XY 来源可切换) -->
         <param name="use_depth_pick_z" value="true" />
@@ -313,6 +338,6 @@
         <!-- 满行且≥4色额外加分(竞赛规则②)。默认 false：实际比赛可能没有此约束，
              开启时设 true -->
         <param name="seq_reward_four_colors" value="false" />
-        <rosparam param="shape_sequence">[0, 1, 5, 4, 2]</rosparam>
+        <rosparam param="shape_sequence">[5,3,2,1,0,6,4]</rosparam>
     </node>
 </launch>

@@ -25,6 +25,8 @@
 #include <algorithm>
 #include <cmath>
 #include <csignal>
+#include <limits>
+#include <mutex>
 #include <queue>
 #include <stdexcept>
 #include <string>
@@ -176,6 +178,11 @@ private:
     bool xarm_wait_for_finish_ = true;
     bool verify_native_xyz_after_motion_ = true;
     double native_xyz_tolerance_mm_ = 6.0;
+    double native_verify_timeout_s_ = 1.0; // 校验位置时最长等待新上报到位的时间
+    double native_verify_poll_hz_ = 50.0;  // 校验轮询频率
+    // 腕部 yaw 软限位（sim_yaw / TCP base-yaw 空间的近似 J6 上界）。A/B 方案选择以"腕部转角最小"
+    // 为目标、此限位为约束：预测 |腕角| 超过它的方案才被排除。硬限 ±2π，默认留余量。
+    double wrist_soft_limit_rad_ = 5.5; // ≈315°
 
     // 坐标 / 标定参数
     double GRID_SIZE_ = 0.0202;
@@ -259,6 +266,9 @@ private:
 
     bool robot_state_ready_ = false;
     std::vector<float> native_pose_{0, 0, 0, 3.14159f, 0, 0};
+    // native_pose_ 由 robotStateCallback（spinner 线程）写、verifyReachedXYZ（控制线程）读，加锁保护。
+    std::mutex native_pose_mutex_;
+    ros::Time native_pose_stamp_;
 
     static double normalizeAngleRad(double a)
     {
@@ -351,6 +361,9 @@ private:
         pnh_.param("xarm_wait_for_finish", xarm_wait_for_finish_, xarm_wait_for_finish_);
         pnh_.param("verify_native_xyz_after_motion", verify_native_xyz_after_motion_, verify_native_xyz_after_motion_);
         pnh_.param("native_xyz_tolerance_mm", native_xyz_tolerance_mm_, native_xyz_tolerance_mm_);
+        pnh_.param("native_verify_timeout_s", native_verify_timeout_s_, native_verify_timeout_s_);
+        pnh_.param("native_verify_poll_hz", native_verify_poll_hz_, native_verify_poll_hz_);
+        pnh_.param("wrist_soft_limit_rad", wrist_soft_limit_rad_, wrist_soft_limit_rad_);
 
         pnh_.param("use_true_pick_plane", use_true_pick_plane_, use_true_pick_plane_);
         pnh_.param("use_pick_homography", use_pick_homography_, use_pick_homography_);
@@ -622,7 +635,9 @@ private:
     {
         if (msg->pose.size() >= 6)
         {
+            std::lock_guard<std::mutex> lk(native_pose_mutex_);
             native_pose_.assign(msg->pose.begin(), msg->pose.begin() + 6);
+            native_pose_stamp_ = ros::Time::now();
             robot_state_ready_ = true;
         }
     }
@@ -970,30 +985,51 @@ private:
         poseTableToNativeBase(makePoseTable(0, 0, 0, place_yaw_base + M_PI), native_test);
         double place_base_B = native_test[5];
 
-        // 用转换后的物理角度预测累加器
+        // 用转换后的物理角度预测两套方案的"腕部转角"。固件按就近解执行，给定姿态的旋转量已最小；
+        // 唯一的自由度是 A/B 这 180° 翻转（吸盘对 180° 对称，pick/place 同步翻转后落点不变）。
+        // 目标：腕部转角最小——xArm 各轴同时到达，多转的 yaw 会成为整段运动的速度瓶颈。
+        // 限位仅作约束：预测 |腕角| 超软限位的方案才被排除（避免长期累积撞 ±2π 硬限）。
         // 方案 A：不翻转
         double pick_unwrapped_A = unwrapAngle(sim_yaw, pick_base_A);
         double place_unwrapped_A = unwrapAngle(pick_unwrapped_A, place_base_A);
+        double travel_A = std::abs(pick_unwrapped_A - sim_yaw) + std::abs(place_unwrapped_A - pick_unwrapped_A);
         double max_abs_A = std::max(std::abs(pick_unwrapped_A), std::abs(place_unwrapped_A));
 
         // 方案 B：翻转 180 度
         double pick_unwrapped_B = unwrapAngle(sim_yaw, pick_base_B);
         double place_unwrapped_B = unwrapAngle(pick_unwrapped_B, place_base_B);
+        double travel_B = std::abs(pick_unwrapped_B - sim_yaw) + std::abs(place_unwrapped_B - pick_unwrapped_B);
         double max_abs_B = std::max(std::abs(pick_unwrapped_B), std::abs(place_unwrapped_B));
 
+        const bool feasible_A = max_abs_A <= wrist_soft_limit_rad_;
+        const bool feasible_B = max_abs_B <= wrist_soft_limit_rad_;
+
+        bool choose_B;
+        if (feasible_A && feasible_B)
+            choose_B = travel_B < travel_A; // 都不越限：选腕部转角更小的（保速度）
+        else if (feasible_A)
+            choose_B = false; // 仅 A 可行
+        else if (feasible_B)
+            choose_B = true; // 仅 B 可行
+        else
+            choose_B = max_abs_B < max_abs_A; // 都越限（极端）：退回 |腕角| 更小的，尽量别撞限位
+
         double final_pick_yaw, final_place_yaw;
-        if (max_abs_B < max_abs_A)
+        if (choose_B)
         {
             final_pick_yaw = normalizeAngleRad(pick_yaw_base + M_PI);
             final_place_yaw = normalizeAngleRad(place_yaw_base + M_PI);
-            sim_yaw = place_unwrapped_B; // 更新预测器到 B 的真实物理落点
+            sim_yaw = place_unwrapped_B; // 更新预测器到 B 的物理落点
         }
         else
         {
             final_pick_yaw = pick_yaw_base;
             final_place_yaw = place_yaw_base;
-            sim_yaw = place_unwrapped_A; // 更新预测器到 A 的真实物理落点
+            sim_yaw = place_unwrapped_A; // 更新预测器到 A 的物理落点
         }
+        ROS_INFO("[CTRL][YAW] scheme=%s travel(A=%.0f,B=%.0f) max|wrist|(A=%.0f,B=%.0f) soft=%.0f deg",
+                 choose_B ? "B(flip)" : "A", travel_A * 180.0 / M_PI, travel_B * 180.0 / M_PI,
+                 max_abs_A * 180.0 / M_PI, max_abs_B * 180.0 / M_PI, wrist_soft_limit_rad_ * 180.0 / M_PI);
 
         // --- 使用 final_pick_yaw 计算 TCP 偏移 ---
         double pick_x = pick_p.x + std::cos(final_pick_yaw) * tcp_pick_offset_x_ - std::sin(final_pick_yaw) * tcp_pick_offset_y_;
@@ -1177,20 +1213,56 @@ private:
             return true;
         }
 
-        ros::Duration(0.2).sleep();
-        double dx = static_cast<double>(native_pose_[0]) - target[0];
-        double dy = static_cast<double>(native_pose_[1]) - target[1];
-        double dz = static_cast<double>(native_pose_[2]) - target[2];
-        double err = std::sqrt(dx * dx + dy * dy + dz * dz);
-        if (err > native_xyz_tolerance_mm_)
+        // 不再用固定 sleep 盲等：上报有延迟/抖动，定值要么太短读到运动前的陈旧位姿、
+        // 要么白白浪费时间。改为轮询，只采信进入本函数后才到达的"新鲜"上报，
+        // 等其进入容差即判定到位；超时仍未到位才判失败。
+        const ros::Time t_enter = ros::Time::now();
+        const ros::Time deadline = t_enter + ros::Duration(native_verify_timeout_s_);
+        ros::Rate rate(native_verify_poll_hz_ > 0.0 ? native_verify_poll_hz_ : 50.0);
+
+        bool got_fresh = false;
+        double err = std::numeric_limits<double>::infinity();
+        float cx = 0, cy = 0, cz = 0;
+        while (ros::ok())
         {
-            ROS_ERROR("[CTRL][VERIFY] %s did not reach target: err=%.2f mm > %.2f mm. cur=(%.1f,%.1f,%.1f) target=(%.1f,%.1f,%.1f)",
-                      label.c_str(), err, native_xyz_tolerance_mm_,
-                      native_pose_[0], native_pose_[1], native_pose_[2], target[0], target[1], target[2]);
+            std::vector<float> pose_now;
+            ros::Time stamp;
+            {
+                std::lock_guard<std::mutex> lk(native_pose_mutex_);
+                pose_now = native_pose_;
+                stamp = native_pose_stamp_;
+            }
+            if (stamp > t_enter) // 只用运动结束后到达的上报，避免拿运动前位姿误判
+            {
+                got_fresh = true;
+                cx = pose_now[0];
+                cy = pose_now[1];
+                cz = pose_now[2];
+                double dx = static_cast<double>(cx) - target[0];
+                double dy = static_cast<double>(cy) - target[1];
+                double dz = static_cast<double>(cz) - target[2];
+                err = std::sqrt(dx * dx + dy * dy + dz * dz);
+                if (err <= native_xyz_tolerance_mm_)
+                {
+                    ROS_INFO("[CTRL][VERIFY] %s reached target: err=%.2f mm", label.c_str(), err);
+                    return true;
+                }
+            }
+            if (ros::Time::now() >= deadline)
+                break;
+            rate.sleep();
+        }
+
+        if (!got_fresh)
+        {
+            ROS_ERROR("[CTRL][VERIFY] %s: no fresh /xarm state within %.2fs; cannot verify.",
+                      label.c_str(), native_verify_timeout_s_);
             return false;
         }
-        ROS_INFO("[CTRL][VERIFY] %s reached target: err=%.2f mm", label.c_str(), err);
-        return true;
+        ROS_ERROR("[CTRL][VERIFY] %s did not reach target within %.2fs: err=%.2f mm > %.2f mm. cur=(%.1f,%.1f,%.1f) target=(%.1f,%.1f,%.1f)",
+                  label.c_str(), native_verify_timeout_s_, err, native_xyz_tolerance_mm_,
+                  cx, cy, cz, target[0], target[1], target[2]);
+        return false;
     }
 
     bool moveLineNative(const geometry_msgs::Pose &target_table, double speed_mm_s, double acc_mm_s2, const std::string &label)

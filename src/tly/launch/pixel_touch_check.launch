@@ -6,6 +6,10 @@
     <arg name="sample_min_valid" default="8" />
     <arg name="save_path" default="" />
     <arg name="config_path" default="$(find tly)/config/tetris_config.yaml" />
+    <!-- 对照模式：除「深度+手眼」感知路径外，再用控制器真正在用的「单应性(+视差)」路径
+         预测同一点并各自与 touch 比对，定位抓偏到底出在感知还是单应性/视差/执行。 -->
+    <arg name="compare_homography" default="true" />
+    <arg name="use_parallax" default="true" />
 
     <!-- Keep this launch's TF chain identical to calibrate_tool.launch. -->
     <include file="$(find xarm6_moveit_config)/launch/realMove_exec.launch">
@@ -13,7 +17,7 @@
     </include>
 
     <node pkg="tf2_ros" type="static_transform_publisher" name="suction_tcp_broadcaster"
-          args="0.00046 -0.00026 0.06962 0 0 0 link6 link_tcp" />
+          args="0.0007 -0.00027 0.06706 0 0 0 link6 link_tcp" />
 
     <include file="$(find realsense2_camera)/launch/rs_camera.launch">
         <arg name="align_depth" value="true" />
@@ -39,5 +43,7 @@
         <param name="sample_win_half" value="$(arg sample_win_half)" />
         <param name="sample_min_valid" value="$(arg sample_min_valid)" />
         <param name="save_path" value="$(arg save_path)" />
+        <param name="compare_homography" value="$(arg compare_homography)" />
+        <param name="use_parallax" value="$(arg use_parallax)" />
     </node>
 </launch>

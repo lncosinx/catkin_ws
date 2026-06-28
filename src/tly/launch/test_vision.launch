@@ -7,7 +7,7 @@
          切换实现：vision_node:=vision_processor_node_cpp / vision_processor_node_dexined
          ========================================================= -->
     <arg name="vision_node" default="vision_processor_node_dexined" />
-    <arg name="color_edge_thresh" default="30" /><!-- 命令行可覆盖,边看 debug_edges 边扫 -->
+    <arg name="color_edge_thresh" default="35" /><!-- 命令行可覆盖,边看 debug_edges 边扫 -->
     <arg name="color_edge_min_area" default="40" /><!-- 颜色边最小连通面积:滤掉掉漆零碎边,掉漆还切就调大 -->
     <arg name="use_dexined_for_split" default="true" /><!-- 或上DexiNed强边切同色贴碰块;不稳就设false纯颜色 -->
     <arg name="temporal_alpha" default="0.3" /><!-- 输入帧EMA时间平均系数,0=关;静止料堆抑噪/抗闪,越小越稳(更滞后) -->

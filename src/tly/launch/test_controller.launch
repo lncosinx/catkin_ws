@@ -57,15 +57,32 @@
         <param name="pick_yaw_offset_deg" value="90.0" />
         <param name="yaw_homography_probe_px" value="30.0" />
         <param name="yaw_homography_v_sign" value="-1.0" />
+        <!-- 手动喂 /tetris_plan、无 path_planner 下发 DP yaw：关掉 use_planner_yaw，
+             控制节点自算基础角度并就近解绕(不翻转、不解 J6 限位)，仅供单任务手动测试。 -->
+        <param name="use_planner_yaw" value="false" />
 
         <param name="place_release_z_margin" value="0.006" />
         <param name="tcp_pick_offset_z" value="0.004" />
+
+        <!-- RealSense 逐块抓取深度（建议先在此单任务测试验证 [CTRL][DEPTH] 日志的 flat/depth 对比合理后再上 tly.launch）。
+             仅修正 Z；相对 flat PICK_Z 夹紧 ±max_dev，无效深度自动回退。 -->
+        <param name="use_pick_depth_z" value="true" />
+        <param name="pick_depth_topic" value="/camera/aligned_depth_to_color/image_raw" />
+        <param name="pick_depth_sample_radius" value="5" />
+        <param name="pick_depth_max_dev_m" value="0.02" />
+        <param name="pick_depth_min_valid_m" value="0.05" />
         <param name="tcp_pick_offset_x" value="0.0" />
         <param name="tcp_pick_offset_y" value="0.0" />
         <param name="tcp_place_offset_x" value="0.0" />
         <param name="tcp_place_offset_y" value="-0.001" />
         <param name="tcp_place_offset_z" value="0.004" />
         <param name="verify_native_xyz_after_motion" value="false" />
+        <param name="native_xyz_tolerance_mm" value="6.0" />
+        <!-- 到位校验：轮询等"运动后的新鲜上报"进入容差，取代固定 sleep -->
+        <param name="native_verify_timeout_s" value="1.0" />
+        <param name="native_verify_poll_hz" value="50.0" />
+        <!-- 腕部 yaw 软限位(约 J6 上界,弧度,硬限±2π)。A/B 翻转以"腕部转角最小"为目标、此限位为约束 -->
+        <param name="wrist_soft_limit_rad" value="5.5" />
 
         <param name="transit_speed_mm_s" value="500.0" />
         <param name="transit_acc_mm_s2" value="4500.0" />

@@ -227,8 +227,39 @@ public:
         return 360.0;
     }
 
+    // T(2)/L_left(3)/L_right(4)：无旋转对称，朝向需 mod-360。这些形状的“柄/缺口方向”
+    // 容易因个别帧分割噪声判反 180°；故方向不锁首帧，而由历史各帧独立测量投票决定。
+    static bool is_directed_shape(int sid) { return sid == 2 || sid == 3 || sid == 4; }
+
+    // 先用 mod-180 主轴的稳健圆均值定轴，再用各帧相对该轴的 ±180 偏差多数表决定朝向。
+    // 单帧误判会被多数正确帧覆盖，不会像“吸附首帧参考”那样把整条 track 锁死在错误 180°。
+    double directed_stable_angle() const
+    {
+        vector<double> angs;
+        for (auto &d : history)
+            angs.push_back(d.angle_deg);
+        double axis180 = vision_utils::meanPeriodicAnglePeriod(angs, 180.0);
+        int vote_flip = 0, vote_keep = 0;
+        for (double a : angs)
+        {
+            double diff = a - axis180;
+            while (diff < -180.0)
+                diff += 360.0;
+            while (diff >= 180.0)
+                diff -= 360.0;
+            if (std::abs(diff) > 90.0)
+                vote_flip++;
+            else
+                vote_keep++;
+        }
+        double directed = (vote_flip > vote_keep) ? axis180 + 180.0 : axis180;
+        return fmod(directed + 360.0, 360.0);
+    }
+
     double stable_angle() const
     {
+        if (is_directed_shape(shape_id))
+            return directed_stable_angle();
         vector<double> angs;
         for (auto &d : history)
             angs.push_back(d.angle_deg);
@@ -267,7 +298,10 @@ public:
         vector<double> angs;
         for (auto &d : history)
             angs.push_back(d.angle_deg);
-        return vision_utils::angleStdDevDegPeriod(angs, angle_period_for_shape(shape_id));
+        // T/L 的朝向交给多数表决；稳定性只衡量 mod-180 主轴抖动，
+        // 避免方向 180° 翻转把本应稳定的块误判为“不稳定”而永不发布。
+        double period = is_directed_shape(shape_id) ? 180.0 : angle_period_for_shape(shape_id);
+        return vision_utils::angleStdDevDegPeriod(angs, period);
     }
 
     bool is_stable(int min_frames, double max_px_std, double max_angle_std, int allowed_missed = 0) const
@@ -1537,36 +1571,6 @@ public:
         return numeric_limits<double>::infinity();
     }
 
-    static double angleDiffDeg(double a, double b) { return fmod(a - b + 540.0, 360.0) - 180.0; }
-    static double norm360(double a)
-    {
-        double r = fmod(a, 360.0);
-        return r < 0 ? r + 360.0 : r;
-    }
-
-    Detection make_angle_consistent_with_track(const BlockTrack &tr, const Detection &det) const
-    {
-        Detection out = det;
-        if (!(det.shape_id == 2 || det.shape_id == 3 || det.shape_id == 4))
-            return out;
-        if (tr.count() < 2)
-            return out;
-        double prev = tr.stable_angle();
-        double candidates[3] = {det.angle_deg, det.angle_deg + 180.0, det.angle_deg - 180.0};
-        double best = candidates[0], best_abs = std::abs(angleDiffDeg(candidates[0], prev));
-        for (double c : candidates)
-        {
-            double e = std::abs(angleDiffDeg(c, prev));
-            if (e < best_abs)
-            {
-                best_abs = e;
-                best = c;
-            }
-        }
-        out.angle_deg = norm360(best);
-        return out;
-    }
-
     void update_tracks(const vector<Detection> &detections)
     {
         vector<int> unmatched_t(tracks.size()), unmatched_d(detections.size());
@@ -1596,7 +1600,9 @@ public:
             auto it_d = find(unmatched_d.begin(), unmatched_d.end(), p.di);
             if (it_t != unmatched_t.end() && it_d != unmatched_d.end())
             {
-                tracks[p.ti].update(make_angle_consistent_with_track(tracks[p.ti], detections[p.di]));
+                // 直接存入各帧“独立”朝向测量；T/L 的 180° 由 stable_angle 多帧投票解析，
+                // 不再吸附首帧参考（避免首帧误判被永久锁死）。
+                tracks[p.ti].update(detections[p.di]);
                 unmatched_t.erase(it_t);
                 unmatched_d.erase(it_d);
             }
