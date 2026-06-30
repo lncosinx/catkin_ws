@@ -2381,6 +2381,14 @@ def main():
                             updates["PICK_AFFINE_CORRECTION"] = paff
                         existing_cfg = write_config_merge(config_path, existing_cfg, updates)
                         print(f"  ✅ 抓取单应性拟合完成，RMS={rms*1000:.3f} mm，已写入 PICK_HOMOGRAPHY。")
+                        # 逐点残差(mm)：findHomography 用最小二乘、不剔离群点，单个坏点会同时抬高 RMS
+                        # 并带歪 H；打印每点残差与最大点(点号与触点顺序 7.N 一致)，便于定位是否需重标某点。
+                        res_mm = [x * 1000.0 for x in res]
+                        imax = int(np.argmax(res_mm))
+                        print("  逐点残差(mm): " + ", ".join(
+                            f"#{j+1}={e:.2f}" for j, e in enumerate(res_mm)))
+                        print("  最大残差 #{} = {:.2f} mm（像素({},{})）；若明显离群于其余点，建议重标该点。".format(
+                            imax + 1, res_mm[imax], rows[imax]["u"], rows[imax]["v"]))
                         print("  💾 步骤7参数已保存到 config（控制节点抓取 XY 用它；改坐标系后须重标）。")
 
     inl_all = first["inliers_base"]

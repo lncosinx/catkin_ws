@@ -39,7 +39,7 @@
     <arg name="verify_set_tcp_offset" default="true" />
 
     <!-- 白板标定模式：A=9点，B=25点，C=140点。白板翘曲明显建议 C -->
-    <arg name="board_mode" default="B" />
+    <arg name="board_mode" default="A" />
 
     <!-- 白板高度插值：C 模式建议 idw；A/B 可用 quadratic 或 idw -->
     <arg name="height_interpolation" default="idw" />
@@ -52,8 +52,8 @@
          top_z_span_m 上限只为排除飞点/叠放；win_half=格心采样半窗(px) -->
     <arg name="place_cover_min_m" default="0.005" />
     <arg name="place_top_z_span_m" default="0.040" />
-    <arg name="place_sample_win_half" default="2" />
-    <arg name="place_sample_min_valid" default="5" />
+    <arg name="place_sample_win_half" default="1" />
+    <arg name="place_sample_min_valid" default="3" />
     <!-- true=步骤5先采空白板深度作逐格基准(纯深度对深度,免疫触点零点偏差)；false=用步骤3触点凸起 -->
     <arg name="place_empty_baseline" default="true" />
     <!-- true=步骤5开始先【现场点白板四角】当场拟合投影单应性(当前机位+白板本身,最准,免手眼/抓取单应性外推)。

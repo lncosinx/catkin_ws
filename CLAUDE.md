@@ -114,6 +114,23 @@ roslaunch tly tly.launch robot_ip:=192.168.1.228
   `camera->base`。已无 `table_frame` TF。
 - 发布 `/robot_status`（`std_msgs/Bool`，latched）作为忙/闲标志。
 
+腕部 yaw / J6 处理（**重要踩坑，务必记清**）：xArm 笛卡尔接口（`move_line`/原生
+`set_position`，以及 MoveIt Pilz LIN 同理）把命令的 RPY 转成旋转矩阵 `R` 做 IK，
+而 `R(yaw) ≡ R(yaw±2π)`——**"圈数 / winding" 无法经笛卡尔指令表达**，固件按
+**"就近解"**（从当前关节最近的 IK 分支）自行决定 J6 落哪一圈。实测佐证：在 UF Studio
+把 yaw 从 -73° 命令到 287°（差正好 360°），机械臂纹丝不动。两条推论：(1) 任何想靠
+命令带绕圈的 `+2π·k` 来躲 J6 限位的做法都是**无效**的（历史上 `path_planner` 里的
+J6 绕圈 DP `assignYaws` 因此被撤除）；(2) **一旦 J6 越过约 ±180° 就再也无法用笛卡尔
+指令拉回**（就近解会朝更远那一圈走），所以策略只能"预防"不能"补救"。能动的唯一自由度
+是 **180° 翻转**（`flip`，真正改变了 `R`，固件会照做；吸盘对 180° 对称，pick/place
+**同步**翻转后落点不变）。控制节点 `buildTask` 对每个任务在 A（不翻）/B（翻 180°）两套
+方案里选择，目标是**腕部转角最小**——因为 xArm 各轴**同时到达**，多转的 yaw 会成为
+整段运动的速度瓶颈（例：只需 +1° 却反向转 179° 就会拖慢全程）；J6 限位仅作**约束**
+（`wrist_soft_limit_rad`，默认 ≈315°，硬限 ±2π），越软限位的方案才被排除。注意这里
+**不是**"把 J6 往 0 居中"——居中虽不撞限位但会制造大量多余转角。显式用关节空间
+（`set_servo_angle`/`move_joint`）控制 J6 虽能确定性指定圈数，但**关节运动的 TCP 轨迹
+不可预测、有撞机风险，已否决**。
+
 坐标系：`board_frame` 完全由白板网格标定派生（原点=网格原点，X≈行轴，Z=板面法向），
 以常量 `BOARD_POSE_BASE`（`{origin, rpy}`）存于 `tetris_config.yaml`。旧的
 `table_frame` TF 与 `table_tf_broadcaster.py` 已删除（base 化重构）——

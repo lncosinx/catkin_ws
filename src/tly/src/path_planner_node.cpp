@@ -1,28 +1,27 @@
-// 路径规划节点 (Path Planner)
+// 路径规划节点 (Path Planner) —— 全部坐标解算 + 腕部翻转决策 + 关节空间路程优化。
 //
-// 职责：消费 strategy 的 /tetris_plan，把每个任务的「抓取像素 / 放置格子」解算成
-// base 系抓放位姿，并对「抓取-放置」序列做全局路程优化，输出优化后的计划。
-//   - 抓取 XY：单应性矩阵（与控制节点一致）；抓取 Z：RealSense 对齐深度（新），
-//     深度无效时回退到平面拟合 Z。
-//   - 放置 XY/Z：白板格心双线性插值 + PLACE_Z_MAP（与控制节点一致）。
+// 职责：消费 strategy 的 /tetris_plan，把每个任务的「抓取像素 / 放置格子」解算成 base 系
+// 抓放位姿（含沿 board 法向的悬停），决定腕部 180° 翻转，并对「抓取-放置」序列做全局优化，
+// 输出可直接执行的 MotionPlan 给控制节点（纯执行器）。
+//   - 抓取 XY：单应性矩阵；抓取 Z：RealSense 对齐深度（无效回退平面拟合）。
+//   - 放置 XY/Z：白板格心双线性插值 + PLACE_Z_MAP。
+//   - 悬停：在 table 系抬到 HOVER_Z（table +Z 即 board 法向），再换算 base。
 //
-// 路程优化（optimize_order）：放置 XY 由 plan 固定，故总路程可按「每个放置槽配哪个
-// 物理块 + 放置先后顺序」两个自由度联合优化。
-//   - 抓取候选池：订阅 /vision/board_state 取每种形状的全部检测块（含 strategy 未用
-//     的闲置块）；同一形状的块互换（无吸取依赖）。
-//   - 放置依赖：从每个任务的 target_cells 重建「被压在下面的先放」DAG（与 strategy
-//     一致），仅在合法拓扑序内重排。
-//   - 贪心前沿：每步在依赖已满足的就绪槽 × 未用候选块里，选当前 TCP→pick→place 增量
-//     路程最小的一对。池不足时安全退化为「仅重排、保留 strategy 抓取」。
+// 关节空间代价（替代旧 XY 直线距离）：用 xArm6 闭式 FK + seeded DLS IK（见
+// tly/xarm6_kinematics.hpp）把每个 TCP 位姿转成 6 关节角 q，代价
+//   Cost = Σ wᵢ (q_B,i − q_A,i)²
+// 联合优化：放置顺序（DAG 内重排）× 同形状抓取分配 × 腕部 A/B 180° 翻转，统一最小化。
+// 翻转并入该代价：A(不翻)/B(翻180°) 两套各算关节代价取小，J6 软限位作排除约束。
+// 起点关节 q 取自 /xarm/joint_states；启动用 fk/ik 对照 base→link_tcp TF 自检，失败则
+// 回退到旧的 XY 直线代价（安全网）。
 //
-// 输出：优化后的 17-int 计划发到 optimized_plan_topic（默认 /tetris_plan_opt，latched），
-// 供控制节点消费（tly.launch 将控制器 plan_topic 指向该话题；控制器代码不变，仍自行
-// 解算并做 yaw 0/180° 关节翻转）。/motion_cmds 仍按优化后顺序发布，供对照验证。
-// 坐标解算逻辑从 xarm_controller_node.cpp 原样移植。
+// 输出：MotionPlan 发到 motion_topic（默认 /motion_cmds，latched），控制节点消费。
+// 另把重排+抓取分配后的 17-int 计划发到 optimized_plan_topic（/tetris_plan_opt）仅作调试对照。
 
 #include <ros/ros.h>
 #include <std_msgs/Int32MultiArray.h>
 #include <sensor_msgs/CameraInfo.h>
+#include <sensor_msgs/JointState.h>
 
 #include <geometry_msgs/Pose.h>
 #include <geometry_msgs/PoseStamped.h>
@@ -42,12 +41,15 @@
 #include <tly/MotionPlan.h>
 #include <tly/MotionTask.h>
 #include <tly/depth_sampler.hpp>
+#include <tly/xarm6_kinematics.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -84,7 +86,9 @@ struct TaskGoal
     std::vector<GridCell> target_cells;
     bool has_target_cells = false;
 
-    // 原始 17-int 任务块（用于无损重排/回填抓取字段后再发布）。
+    bool flip = false; // 腕部 180° 翻转（由优化决定）
+
+    // 原始 17-int 任务块（用于无损重排/回填抓取字段后再发布 Int32 调试计划）。
     std::vector<int> raw;
 };
 
@@ -99,6 +103,17 @@ struct PoolBlock
     bool has_geom = false;
 };
 
+// 一个任务的 table 系四位姿（pick/place + 各自悬停）。
+struct TablePoses
+{
+    geometry_msgs::Pose pick;
+    geometry_msgs::Pose pick_hover;
+    geometry_msgs::Pose place;
+    geometry_msgs::Pose place_hover;
+    double pick_yaw = 0.0;
+    double place_yaw = 0.0;
+};
+
 class PathPlanner
 {
 public:
@@ -107,6 +122,7 @@ public:
         loadParams();
 
         camera_info_sub_ = nh_.subscribe(camera_info_topic_, 1, &PathPlanner::cameraInfoCallback, this);
+        joint_state_sub_ = nh_.subscribe(joint_state_topic_, 1, &PathPlanner::jointStateCallback, this);
 
         ROS_INFO("[PATH] Waiting for CameraInfo on %s ...", camera_info_topic_.c_str());
         sensor_msgs::CameraInfoConstPtr cam_msg =
@@ -126,11 +142,10 @@ public:
         motion_pub_ = nh_.advertise<tly::MotionPlan>(motion_topic_, 1, true);
         opt_plan_pub_ = nh_.advertise<std_msgs::Int32MultiArray>(optimized_plan_topic_, 1, true);
 
-        ROS_INFO("[PATH] ready: in=%s opt_out=%s motion_out=%s optimize=%s pool_topic=%s depth_pick_z=%s xy_source=%s",
-                 plan_topic_.c_str(), optimized_plan_topic_.c_str(), motion_topic_.c_str(),
-                 optimize_order_ ? "on" : "off", board_state_topic_.c_str(),
-                 use_depth_pick_z_ ? "on" : "off",
-                 pick_xy_source_depth_ ? "depth" : "homography");
+        ROS_INFO("[PATH] ready: in=%s motion_out=%s opt_out=%s optimize=%s joint_cost=%s pool=%s depth_z=%s",
+                 plan_topic_.c_str(), motion_topic_.c_str(), optimized_plan_topic_.c_str(),
+                 optimize_order_ ? "on" : "off", use_joint_cost_ ? "on" : "off",
+                 board_state_topic_.c_str(), use_depth_pick_z_ ? "on" : "off");
     }
 
 private:
@@ -139,6 +154,7 @@ private:
     ros::Subscriber plan_sub_;
     ros::Subscriber camera_info_sub_;
     ros::Subscriber board_state_sub_;
+    ros::Subscriber joint_state_sub_;
     ros::Publisher motion_pub_;
     ros::Publisher opt_plan_pub_;
 
@@ -150,12 +166,16 @@ private:
     std::string optimized_plan_topic_ = "/tetris_plan_opt";
     std::string board_state_topic_ = "/vision/board_state";
     std::string camera_info_topic_ = "/camera/color/camera_info";
+    std::string joint_state_topic_ = "/xarm/joint_states";
     std::string base_frame_ = "link_base";
     std::string camera_frame_ = "camera_color_optical_frame";
     std::string eef_frame_ = "link_tcp";
 
     // 路程优化：开关 + board_state 候选池缓存（按形状分组）。
     bool optimize_order_ = true;
+    // 是否允许重排放置顺序。true=在 DAG 内按代价重排；false=保持策略节点给的顺序（比赛可能有
+    // 方块相邻等 DAG 之外的约束），仅为每个槽的指定形状选代价最小的物理块 + 腕部翻转。
+    bool allow_reorder_ = true;
     bool pool_ready_ = false;
     std::vector<PoolBlock> pool_by_shape_[7];
 
@@ -203,8 +223,11 @@ private:
     double tcp_place_offset_z_ = 0.0;
     double place_release_z_margin_ = 0.004;
 
+    // 抓放下压的 roll/pitch。默认在每次收到 plan 时取自"初始位姿"(臂此刻所在=单应性标定位姿)的
+    // 工具朝向，换算到 board 系后固定；yaw 仍每任务计算。关掉则用下面 fixed_* 常量(π,0)。
     double fixed_roll_rad_ = M_PI;
     double fixed_pitch_rad_ = 0.0;
+    bool read_tool_tilt_from_initial_pose_ = true;
 
     int max_tasks_per_plan_ = 0; // 0 = 不限制，发布策略给的全部任务
 
@@ -215,6 +238,24 @@ private:
     int depth_sample_radius_px_ = 4;
     bool depth_sample_in_raw_color_ = true;
     bool pick_xy_source_depth_ = false; // false=homography(默认), true=深度反投影
+
+    // 关节空间运动学 / 代价
+    tly::XArm6Kinematics kin_;
+    using Joints = tly::XArm6Kinematics::Joints;
+    std::array<double, 6> joint_cost_weights_ = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+    // J6 限位：软限位为优化偏好（越界加罚但仍可用）；硬限位为绝对拒发阈值（留余量到 ±2π 真硬限）。
+    // 转移段沿直线笛卡尔路径采样 J6（J6≈heading−J1，J1 沿直线非线性摆动，中途可越过两端点值）。
+    double wrist_soft_limit_rad_ = 4.7;     // ≈269°，偏好上界
+    double wrist_hard_limit_rad_ = 6.10;    // ≈349°，拒发阈值（到 ±2π=360° 留 ~11° 余量）
+    int transit_j6_samples_ = 8;            // 每段转移采样点数
+    double ik_selfcheck_tol_rad_ = 0.05;    // 自检：max|ik(fk)−q| 阈值
+    bool use_joint_cost_ = true;            // 自检通过/IK 可用才为 true
+    bool selfcheck_done_ = false;
+    std::array<double, 6> nominal_seed_ = {0.0, -0.2, -1.0, 0.0, 1.2, 0.0}; // 工具朝下分支种子
+
+    bool joint_state_ready_ = false;
+    std::array<double, 6> q_meas_ = {0, 0, 0, 0, 0, 0};
+    std::mutex joint_mutex_;
 
     bool camera_info_ready_ = false;
     cv::Mat K_, D_, P_;
@@ -230,6 +271,16 @@ private:
         while (a <= -M_PI)
             a += 2.0 * M_PI;
         return a;
+    }
+
+    static double unwrapAngle(double current, double target)
+    {
+        double diff = target - current;
+        while (diff > M_PI)
+            diff -= 2.0 * M_PI;
+        while (diff < -M_PI)
+            diff += 2.0 * M_PI;
+        return current + diff;
     }
 
     static double clampDouble(double x, double lo, double hi)
@@ -297,7 +348,9 @@ private:
         pnh_.param("motion_topic", motion_topic_, motion_topic_);
         pnh_.param("optimized_plan_topic", optimized_plan_topic_, optimized_plan_topic_);
         pnh_.param("board_state_topic", board_state_topic_, board_state_topic_);
+        pnh_.param("joint_state_topic", joint_state_topic_, joint_state_topic_);
         pnh_.param("optimize_order", optimize_order_, optimize_order_);
+        pnh_.param("allow_reorder", allow_reorder_, allow_reorder_);
         pnh_.param("camera_info_topic", camera_info_topic_, camera_info_topic_);
         pnh_.param("base_frame", base_frame_, base_frame_);
         pnh_.param("camera_frame", camera_frame_, camera_frame_);
@@ -312,7 +365,6 @@ private:
 
         pnh_.param("tcp_pick_offset_x", tcp_pick_offset_x_, tcp_pick_offset_x_);
         pnh_.param("tcp_pick_offset_y", tcp_pick_offset_y_, tcp_pick_offset_y_);
-        // 波纹管补偿：优先用标定写入的 /tetris/TCP_PICK_OFFSET_Z，launch 同名私有参数可覆盖。
         nh_.getParam("/tetris/TCP_PICK_OFFSET_Z", tcp_pick_offset_z_);
         pnh_.param("tcp_pick_offset_z", tcp_pick_offset_z_, tcp_pick_offset_z_);
 
@@ -326,11 +378,11 @@ private:
 
         pnh_.param("tcp_place_offset_x", tcp_place_offset_x_, tcp_place_offset_x_);
         pnh_.param("tcp_place_offset_y", tcp_place_offset_y_, tcp_place_offset_y_);
-        // 波纹管补偿：优先用标定写入的 /tetris/TCP_PLACE_OFFSET_Z，launch 同名私有参数可覆盖。
         nh_.getParam("/tetris/TCP_PLACE_OFFSET_Z", tcp_place_offset_z_);
         pnh_.param("tcp_place_offset_z", tcp_place_offset_z_, tcp_place_offset_z_);
         pnh_.param("place_release_z_margin", place_release_z_margin_, place_release_z_margin_);
 
+        pnh_.param("read_tool_tilt_from_initial_pose", read_tool_tilt_from_initial_pose_, read_tool_tilt_from_initial_pose_);
         pnh_.param("fixed_roll_rad", fixed_roll_rad_, fixed_roll_rad_);
         pnh_.param("fixed_pitch_rad", fixed_pitch_rad_, fixed_pitch_rad_);
 
@@ -343,6 +395,13 @@ private:
         std::string xy_source = "homography";
         pnh_.param("pick_xy_source", xy_source, xy_source);
         pick_xy_source_depth_ = (xy_source == "depth");
+
+        // 关节代价参数
+        pnh_.param("wrist_soft_limit_rad", wrist_soft_limit_rad_, wrist_soft_limit_rad_);
+        pnh_.param("wrist_hard_limit_rad", wrist_hard_limit_rad_, wrist_hard_limit_rad_);
+        pnh_.param("transit_j6_samples", transit_j6_samples_, transit_j6_samples_);
+        pnh_.param("ik_selfcheck_tol_rad", ik_selfcheck_tol_rad_, ik_selfcheck_tol_rad_);
+        loadJointCostWeights();
 
         nh_.param("/tetris/GRID_SIZE", GRID_SIZE_, GRID_SIZE_);
         nh_.param("/tetris/BOARD_ORIGIN_X", BOARD_ORIGIN_X_, BOARD_ORIGIN_X_);
@@ -363,6 +422,37 @@ private:
                  place_z_map_loaded_ ? "loaded" : "MISSING",
                  pick_plane_loaded_ ? "loaded" : "flat_PICK_Z",
                  pick_homography_loaded_ ? "loaded" : "off");
+    }
+
+    void loadJointCostWeights()
+    {
+        // 权重默认按"各关节最大速度"推导：move_line 各轴同时到达，移动耗时≈maxᵢ|Δqᵢ|/vᵢ，故让二次
+        // 代价的每项 ∝ (Δqᵢ/vᵢ)² → wᵢ = 1/vᵢ²（速度越大权重越小）。按 vmin 归一(最慢轴权重=1)。
+        // xArm6 的 URDF/MoveIt 六轴限速均为 3.14 rad/s → 默认权重均匀[1,1,1,1,1,1]；若实测各轴限速
+        // 不同，用 joint_max_vel_rad_s 自动调权。
+        std::array<double, 6> vmax = {3.14, 3.14, 3.14, 3.14, 3.14, 3.14};
+        XmlRpc::XmlRpcValue vv;
+        if (pnh_.getParam("joint_max_vel_rad_s", vv) && vv.getType() == XmlRpc::XmlRpcValue::TypeArray && vv.size() == 6)
+            for (int i = 0; i < 6; ++i)
+            {
+                double x = vmax[i];
+                if (xmlToDouble(vv[i], x) && x > 1e-6)
+                    vmax[i] = x;
+            }
+        double vmin = *std::min_element(vmax.begin(), vmax.end());
+        for (int i = 0; i < 6; ++i)
+            joint_cost_weights_[i] = (vmin * vmin) / (vmax[i] * vmax[i]);
+
+        // 显式 joint_cost_weights 覆盖（手动调，绕过速度推导）。
+        XmlRpc::XmlRpcValue w;
+        if (pnh_.getParam("joint_cost_weights", w) && w.getType() == XmlRpc::XmlRpcValue::TypeArray && w.size() == 6)
+            for (int i = 0; i < 6; ++i)
+                xmlToDouble(w[i], joint_cost_weights_[i]);
+
+        ROS_INFO("[PATH] joint_cost_weights=[%.2f %.2f %.2f %.2f %.2f %.2f] (from vmax) wrist_soft=%.0f deg",
+                 joint_cost_weights_[0], joint_cost_weights_[1], joint_cost_weights_[2],
+                 joint_cost_weights_[3], joint_cost_weights_[4], joint_cost_weights_[5],
+                 wrist_soft_limit_rad_ * 180.0 / M_PI);
     }
 
     bool loadBoardPose()
@@ -512,6 +602,94 @@ private:
         camera_info_ready_ = true;
     }
 
+    // 缓存当前关节角（按名字 joint1..joint6 取，避免 gripper 等干扰顺序）。
+    void jointStateCallback(const sensor_msgs::JointState::ConstPtr &msg)
+    {
+        std::array<double, 6> q = {0, 0, 0, 0, 0, 0};
+        int found = 0;
+        for (size_t i = 0; i < msg->name.size() && i < msg->position.size(); ++i)
+        {
+            const std::string &nm = msg->name[i];
+            if (nm.size() == 6 && nm.compare(0, 5, "joint") == 0)
+            {
+                int idx = nm[5] - '1';
+                if (idx >= 0 && idx < 6)
+                {
+                    q[idx] = msg->position[i];
+                    ++found;
+                }
+            }
+        }
+        if (found < 6 && msg->position.size() >= 6)
+        {
+            for (int i = 0; i < 6; ++i)
+                q[i] = msg->position[i];
+            found = 6;
+        }
+        if (found >= 6)
+        {
+            std::lock_guard<std::mutex> lk(joint_mutex_);
+            q_meas_ = q;
+            joint_state_ready_ = true;
+        }
+    }
+
+    // 启动自检：用测量关节做 fk → 与 base→link_tcp TF 比对，再 ik 回去比关节误差。
+    // 通过则信任关节代价；失败回退 XY 代价。需要 joint_states + TF 同时可用。
+    void runSelfCheckIfPossible()
+    {
+        if (selfcheck_done_)
+            return;
+        std::array<double, 6> q;
+        {
+            std::lock_guard<std::mutex> lk(joint_mutex_);
+            if (!joint_state_ready_)
+                return;
+            q = q_meas_;
+        }
+        geometry_msgs::TransformStamped tf_msg;
+        try
+        {
+            tf_msg = tf_buffer_.lookupTransform(base_frame_, eef_frame_, ros::Time(0), ros::Duration(0.5));
+        }
+        catch (const tf2::TransformException &ex)
+        {
+            ROS_WARN_THROTTLE(2.0, "[PATH] self-check TF %s->%s unavailable: %s",
+                              base_frame_.c_str(), eef_frame_.c_str(), ex.what());
+            return;
+        }
+        selfcheck_done_ = true;
+
+        tf2::Transform tf_pose;
+        tf2::fromMsg(tf_msg.transform, tf_pose);
+
+        // FK 误差（位姿层面）
+        tf2::Transform fk_pose = kin_.fk(q);
+        double dpos = (fk_pose.getOrigin() - tf_pose.getOrigin()).length();
+
+        // IK 往返误差（关节层面）
+        Joints q_chk;
+        bool ik_ok = kin_.ik(tf_pose, q, q_chk);
+        double dq_max = 0.0;
+        if (ik_ok)
+            for (int i = 0; i < 6; ++i)
+                dq_max = std::max(dq_max, std::fabs(q_chk[i] - q[i]));
+
+        if (ik_ok && dpos < 0.01 && dq_max < ik_selfcheck_tol_rad_)
+        {
+            use_joint_cost_ = true;
+            ROS_INFO("[PATH] IK self-check PASS: fk_pos_err=%.4f m, ik_dq_max=%.4f rad. Using joint-space cost.",
+                     dpos, dq_max);
+        }
+        else
+        {
+            use_joint_cost_ = false;
+            ROS_WARN("[PATH] IK self-check FAIL (ik_ok=%d fk_pos_err=%.4f m dq_max=%.4f rad > tol=%.3f). "
+                     "Falling back to XY-distance cost.",
+                     (int)ik_ok, dpos, dq_max, ik_selfcheck_tol_rad_);
+        }
+    }
+
     bool getObservationTransforms()
     {
         if (!board_pose_loaded_)
@@ -521,7 +699,6 @@ private:
         }
         try
         {
-            // 唯一动态 TF：相机随臂动。其余用常量 board 位姿合成（base 化，不再查 table_frame）。
             observation_cam_to_base_ = tf_buffer_.lookupTransform(base_frame_, camera_frame_, ros::Time(0), ros::Duration(1.0));
             tf2::Transform cam_to_base;
             {
@@ -531,7 +708,6 @@ private:
                 const auto &tr = observation_cam_to_base_.transform.translation;
                 cam_to_base.setOrigin(tf2::Vector3(tr.x, tr.y, tr.z));
             }
-            // board<-cam = (board<-base) * (base<-cam)；board<-base = base_to_board_(常量)。
             tf2::Transform cam_to_board = base_to_board_ * cam_to_base;
             observation_cam_to_table_.transform = tf2::toMsg(cam_to_board);
             observation_base_to_table_.transform = tf2::toMsg(base_to_board_);
@@ -541,6 +717,34 @@ private:
         {
             ROS_ERROR("[PATH] TF lookup failed: %s", ex.what());
             return false;
+        }
+    }
+
+    // 抓放下压的 roll/pitch 取自"初始位姿"(臂此刻所在 = 单应性标定位姿)的工具朝向，
+    // 换算到 board 系后固定；yaw 仍每任务计算。读不到 base<-eef TF 则保留现 fixed_*(默认π,0)。
+    // 注意：依赖处理 plan 时臂确在初始/观测位姿；生产单发流程满足，手动喂 plan 的测试需关闭本项。
+    void updateToolTiltFromInitialPose()
+    {
+        if (!read_tool_tilt_from_initial_pose_ || !board_pose_loaded_)
+            return;
+        try
+        {
+            geometry_msgs::TransformStamped tf =
+                tf_buffer_.lookupTransform(base_frame_, eef_frame_, ros::Time(0), ros::Duration(0.5));
+            tf2::Quaternion q_be; // base <- eef
+            tf2::fromMsg(tf.transform.rotation, q_be);
+            tf2::Quaternion q_board = base_to_board_.getRotation() * q_be; // board <- eef
+            double r, p, y;
+            tf2::Matrix3x3(q_board).getRPY(r, p, y);
+            fixed_roll_rad_ = r;
+            fixed_pitch_rad_ = p;
+            ROS_INFO("[PATH] tool tilt from initial pose (board): roll=%.2f pitch=%.2f deg (yaw per-task).",
+                     r * 180.0 / M_PI, p * 180.0 / M_PI);
+        }
+        catch (const tf2::TransformException &ex)
+        {
+            ROS_WARN("[PATH] read initial-pose tool tilt failed (%s); keep roll=%.1f pitch=%.1f deg.",
+                     ex.what(), fixed_roll_rad_ * 180.0 / M_PI, fixed_pitch_rad_ * 180.0 / M_PI);
         }
     }
 
@@ -639,11 +843,6 @@ private:
         return true;
     }
 
-    bool applyPickHomography(const PixelPoint &px, geometry_msgs::Point &p) const
-    {
-        return applyPickHomographyXY(static_cast<double>(px.u), static_cast<double>(px.v), p);
-    }
-
     double yawFromHomography(double u, double v, double angle_img_rad) const
     {
         if (!use_pick_homography_ || !pick_homography_loaded_)
@@ -661,7 +860,7 @@ private:
         return normalizeAngleRad(std::atan2(dy, dx));
     }
 
-    // 抓取点(table)：单应性 XY + 平面 Z + 2.5D 视差补偿（与控制节点一致）。
+    // 抓取点(table)：单应性 XY + 平面 Z + 2.5D 视差补偿（不含深度）。
     bool pixelToPickPointTable(const PixelPoint &px, geometry_msgs::Point &out) const
     {
         bool ok = false;
@@ -699,7 +898,6 @@ private:
         return false;
     }
 
-    // 把 rectified 像素映射回 raw(带畸变)彩色像素，用于对齐深度采样（与视觉节点一致）。
     cv::Point2f rectifiedToRaw(double u, double v) const
     {
         if (!camera_info_ready_ || !depth_sample_in_raw_color_ || P_.empty() || K_.empty())
@@ -716,8 +914,6 @@ private:
         return img[0];
     }
 
-    // 用对齐深度求抓取点的 table 系坐标：在 raw 像素采样 Z(相机系)，
-    // 用 rectified 射线得到相机系 3D 点，再经 cam->table 变换到 table 系。
     bool depthPickPointTable(const PixelPoint &px, geometry_msgs::Point &out) const
     {
         if (!depth_sampler_.ready() || !camera_info_ready_)
@@ -743,7 +939,7 @@ private:
         return true;
     }
 
-    // 综合抓取点：XY 默认单应性，Z 优先深度（无效回退平面）；记录两种 Z 供对照。
+    // 综合抓取点：XY 默认单应性，Z 优先深度（无效回退平面）。
     bool computePickTable(const PixelPoint &px, geometry_msgs::Point &out, double &z_plane, double &z_depth) const
     {
         z_plane = std::numeric_limits<double>::quiet_NaN();
@@ -861,6 +1057,16 @@ private:
         return pose;
     }
 
+    // table 系悬停：抬到 HOVER_Z（table +Z = board 法向），至少高于目标 10mm。
+    geometry_msgs::Pose hoverFromTable(const geometry_msgs::Pose &target) const
+    {
+        geometry_msgs::Pose h = target;
+        h.position.z = HOVER_Z_;
+        if (h.position.z < target.position.z + 0.010)
+            h.position.z = target.position.z + 0.010;
+        return h;
+    }
+
     bool computePickToGeomOffset(const PixelPoint &pick_px, const PixelPoint &geom_px,
                                  double &pick_minus_geom_x, double &pick_minus_geom_y) const
     {
@@ -872,21 +1078,24 @@ private:
         return true;
     }
 
-    bool tableToBasePose(const geometry_msgs::Pose &table_pose, geometry_msgs::Pose &base_pose)
+    static tf2::Transform poseToTf(const geometry_msgs::Pose &p)
     {
-        // board pose -> base：用常量 board_to_base_，不走 TF。
+        tf2::Transform t;
+        tf2::Quaternion q;
+        tf2::fromMsg(p.orientation, q);
+        t.setRotation(q);
+        t.setOrigin(tf2::Vector3(p.position.x, p.position.y, p.position.z));
+        return t;
+    }
+
+    bool tableToBasePose(const geometry_msgs::Pose &table_pose, geometry_msgs::Pose &base_pose) const
+    {
         if (!board_pose_loaded_)
         {
             ROS_ERROR("[PATH] BOARD_POSE_BASE not loaded; cannot convert pose.");
             return false;
         }
-        tf2::Transform t_board;
-        tf2::Quaternion q;
-        tf2::fromMsg(table_pose.orientation, q);
-        t_board.setRotation(q);
-        t_board.setOrigin(tf2::Vector3(table_pose.position.x, table_pose.position.y, table_pose.position.z));
-        tf2::Transform t_base = board_to_base_ * t_board;
-
+        tf2::Transform t_base = board_to_base_ * poseToTf(table_pose);
         base_pose.position.x = t_base.getOrigin().x();
         base_pose.position.y = t_base.getOrigin().y();
         base_pose.position.z = t_base.getOrigin().z();
@@ -894,33 +1103,50 @@ private:
         return true;
     }
 
-    // 移植自控制节点 buildTask 的几何部分；不含 yaw 0/180° 关节翻转选择（属控制侧）。
-    bool buildTask(const TaskGoal &goal, tly::MotionTask &out_task)
+    double baseYawOfTable(double table_yaw) const
     {
-        geometry_msgs::Point pick_p;
-        double z_plane = std::numeric_limits<double>::quiet_NaN();
-        double z_depth = std::numeric_limits<double>::quiet_NaN();
-        if (!computePickTable(goal.pick_pixel, pick_p, z_plane, z_depth))
-            return false;
+        geometry_msgs::Pose base;
+        if (!tableToBasePose(makePoseTable(0, 0, 0, table_yaw), base))
+            return normalizeAngleRad(table_yaw);
+        double r, p, y;
+        tf2::Matrix3x3(poseToTf(base).getRotation()).getRPY(r, p, y);
+        return normalizeAngleRad(y);
+    }
 
-        double pick_yaw = normalizeAngleRad(yawFromHomography(goal.pick_pixel.u, goal.pick_pixel.v,
-                                                              goal.pick_angle_deg * M_PI / 180.0) +
-                                            pick_yaw_offset_rad_);
-        double place_yaw = normalizeAngleRad(-goal.way * M_PI / 2.0);
+    // 计算一个任务（给定抓取像素 + 翻转）的 table 系四位姿。useDepth=true 时抓取 Z 用深度。
+    bool computeTablePoses(const TaskGoal &goal, const PixelPoint &pick_px, int pick_ang,
+                           const PixelPoint &geom_px, bool has_geom, bool flip, bool use_depth,
+                           TablePoses &out) const
+    {
+        double pick_yaw_base = normalizeAngleRad(
+            yawFromHomography(pick_px.u, pick_px.v, pick_ang * M_PI / 180.0) + pick_yaw_offset_rad_);
+        double place_yaw_base = normalizeAngleRad(-goal.way * M_PI / 2.0);
+        double pick_yaw = flip ? normalizeAngleRad(pick_yaw_base + M_PI) : pick_yaw_base;
+        double place_yaw = flip ? normalizeAngleRad(place_yaw_base + M_PI) : place_yaw_base;
+
+        geometry_msgs::Point pick_p;
+        if (use_depth)
+        {
+            double zp, zd;
+            if (!computePickTable(pick_px, pick_p, zp, zd))
+                return false;
+        }
+        else if (!pixelToPickPointTable(pick_px, pick_p))
+            return false;
 
         double pick_x = pick_p.x + std::cos(pick_yaw) * tcp_pick_offset_x_ - std::sin(pick_yaw) * tcp_pick_offset_y_;
         double pick_y = pick_p.y + std::sin(pick_yaw) * tcp_pick_offset_x_ + std::cos(pick_yaw) * tcp_pick_offset_y_;
         double pick_z = pick_p.z + tcp_pick_offset_z_;
-        geometry_msgs::Pose pick_table = makePoseTable(pick_x, pick_y, pick_z, pick_yaw);
+        out.pick = makePoseTable(pick_x, pick_y, pick_z, pick_yaw);
 
         double pmgx = 0.0, pmgy = 0.0;
-        bool has_off = goal.has_geom_pixel && computePickToGeomOffset(goal.pick_pixel, goal.geom_pixel, pmgx, pmgy);
+        bool has_off = has_geom && computePickToGeomOffset(pick_px, geom_px, pmgx, pmgy);
 
         geometry_msgs::Point bc = bilinearBoardCenter(goal.place_grid_center.row, goal.place_grid_center.col);
         double place_x = bc.x, place_y = bc.y;
         if (has_off)
         {
-            double delta = place_yaw - pick_yaw;
+            double delta = place_yaw - pick_yaw; // 不受 180° 翻转影响
             double dx_rot = pmgx * std::cos(delta) - pmgy * std::sin(delta);
             double dy_rot = pmgx * std::sin(delta) + pmgy * std::cos(delta);
             place_x += dx_rot;
@@ -929,33 +1155,190 @@ private:
         place_x += std::cos(place_yaw) * tcp_place_offset_x_ - std::sin(place_yaw) * tcp_place_offset_y_;
         place_y += std::sin(place_yaw) * tcp_place_offset_x_ + std::cos(place_yaw) * tcp_place_offset_y_;
         double place_z = placeZFromTargetCells(goal) + place_release_z_margin_ + tcp_place_offset_z_;
-        geometry_msgs::Pose place_table = makePoseTable(place_x, place_y, place_z, place_yaw);
+        out.place = makePoseTable(place_x, place_y, place_z, place_yaw);
 
-        geometry_msgs::Pose pick_base, place_base;
-        if (!tableToBasePose(pick_table, pick_base) || !tableToBasePose(place_table, place_base))
-            return false;
-
-        out_task.shape = goal.shape_type;
-        out_task.way = goal.way;
-        out_task.pick_pose = pick_base;
-        out_task.place_pose = place_base;
-
-        char zdbuf[32];
-        if (std::isfinite(z_depth))
-            std::snprintf(zdbuf, sizeof(zdbuf), "%.3f", z_depth);
-        else
-            std::snprintf(zdbuf, sizeof(zdbuf), "NA");
-        ROS_INFO("[PATH][TASK] shape=%d pick_table=(%.3f,%.3f,%.3f) place_table=(%.3f,%.3f,%.3f) "
-                 "yaw_pick=%.1f yaw_place=%.1f z_plane=%.3f z_depth=%s",
-                 goal.shape_type, pick_x, pick_y, pick_z, place_x, place_y, place_z,
-                 pick_yaw * 180.0 / M_PI, place_yaw * 180.0 / M_PI, z_plane, zdbuf);
+        out.pick_hover = hoverFromTable(out.pick);
+        out.place_hover = hoverFromTable(out.place);
+        out.pick_yaw = pick_yaw;
+        out.place_yaw = place_yaw;
         return true;
+    }
+
+    double jointCost(const Joints &a, const Joints &b) const
+    {
+        double s = 0.0;
+        for (int i = 0; i < 6; ++i)
+        {
+            double d = b[i] - a[i];
+            s += joint_cost_weights_[i] * d * d;
+        }
+        return s;
+    }
+
+    geometry_msgs::Pose fkPose(const Joints &q) const
+    {
+        tf2::Transform t = kin_.fk(q);
+        geometry_msgs::Pose p;
+        p.position.x = t.getOrigin().x();
+        p.position.y = t.getOrigin().y();
+        p.position.z = t.getOrigin().z();
+        p.orientation = tf2::toMsg(t.getRotation());
+        return p;
+    }
+
+    // base 系两位姿的直线插值：位置线性、姿态 slerp。
+    static geometry_msgs::Pose interpPoseBase(const geometry_msgs::Pose &A, const geometry_msgs::Pose &B, double t)
+    {
+        geometry_msgs::Pose P;
+        P.position.x = A.position.x + t * (B.position.x - A.position.x);
+        P.position.y = A.position.y + t * (B.position.y - A.position.y);
+        P.position.z = A.position.z + t * (B.position.z - A.position.z);
+        tf2::Quaternion qa, qb;
+        tf2::fromMsg(A.orientation, qa);
+        tf2::fromMsg(B.orientation, qb);
+        tf2::Quaternion q = qa.slerp(qb, t);
+        q.normalize();
+        P.orientation = tf2::toMsg(q);
+        return P;
+    }
+
+    // 沿 A->B 直线笛卡尔路径采样（move_line 的几何），逐点 IK（连续 seed，复刻固件就近解），
+    // 返回路径上 max|J6| 与终点关节。任一采样 IK 失败返回 false。
+    // 这是端点校验抓不到的：J6≈heading−J1，直线平移里 J1 非线性摆动（过基座附近尤甚），
+    // 中途 J6 可越过两端点值撞 ±2π。
+    bool transitMaxAbsJ6(const geometry_msgs::Pose &A, const geometry_msgs::Pose &B,
+                         const Joints &seed, double &max_abs_j6, Joints &q_end) const
+    {
+        Joints q = seed;
+        max_abs_j6 = std::fabs(seed[5]);
+        int N = std::max(1, transit_j6_samples_);
+        for (int i = 1; i <= N; ++i)
+        {
+            double t = static_cast<double>(i) / N;
+            geometry_msgs::Pose P = interpPoseBase(A, B, t);
+            Joints qi;
+            if (!kin_.ik(poseToTf(P), q, qi))
+                return false;
+            q = qi;
+            max_abs_j6 = std::max(max_abs_j6, std::fabs(q[5]));
+        }
+        q_end = q;
+        return true;
+    }
+
+    // 评估一对 (放置槽, 抓取候选) 的两套翻转。可行性 = 端点 + 两段大转移（cur->pick_hover、
+    // pick_hover->place_hover）整条路径的 max|J6| ≤ 硬限位；越软限位加罚（仍可用，least-bad）；
+    // 越硬限位直接排除。返回最小可行代价、翻转、终点关节(place_hover)与终点位姿(供下段转移起点)。
+    struct PairEval
+    {
+        bool ok = false;
+        double cost = std::numeric_limits<double>::max();
+        bool flip = false;
+        Joints q_place{};
+        geometry_msgs::Pose end_pose;
+        double max_j6 = 0.0;
+    };
+    PairEval evalPairJoint(const TaskGoal &goal, const PixelPoint &pick_px, int pick_ang,
+                           const PixelPoint &geom_px, bool has_geom,
+                           const Joints &q_cur, const geometry_msgs::Pose &cur_pose) const
+    {
+        PairEval best;
+        const double SOFT_PENALTY = 1e6;
+        for (int f = 0; f < 2; ++f)
+        {
+            bool flip = (f == 1);
+            TablePoses tp;
+            if (!computeTablePoses(goal, pick_px, pick_ang, geom_px, has_geom, flip, /*use_depth=*/false, tp))
+                continue;
+            geometry_msgs::Pose pick_base, pick_hover_base, place_base, place_hover_base;
+            if (!tableToBasePose(tp.pick, pick_base) || !tableToBasePose(tp.pick_hover, pick_hover_base) ||
+                !tableToBasePose(tp.place, place_base) || !tableToBasePose(tp.place_hover, place_hover_base))
+                continue;
+
+            // 端点关节（用于代价）。
+            Joints q_p, q_pl;
+            if (!kin_.ik(poseToTf(pick_base), q_cur, q_p))
+                continue;
+            if (!kin_.ik(poseToTf(place_base), q_p, q_pl))
+                continue;
+
+            // 转移段 J6 路径校验：cur_pose -> pick_hover（接近，空载）-> place_hover（载料转移）。
+            double mjA = 0.0, mjB = 0.0;
+            Joints q_ph, q_plh;
+            if (!transitMaxAbsJ6(cur_pose, pick_hover_base, q_cur, mjA, q_ph))
+                continue;
+            if (!transitMaxAbsJ6(pick_hover_base, place_hover_base, q_ph, mjB, q_plh))
+                continue;
+            double path_max_j6 = std::max(std::max(mjA, mjB),
+                                          std::max(std::fabs(q_p[5]), std::fabs(q_pl[5])));
+
+            if (path_max_j6 > wrist_hard_limit_rad_)
+                continue; // 硬限位：直接排除该方案
+
+            double c = jointCost(q_cur, q_p) + jointCost(q_p, q_pl);
+            if (path_max_j6 > wrist_soft_limit_rad_)
+                c += SOFT_PENALTY * (path_max_j6 - wrist_soft_limit_rad_); // 软限位：加罚，least-bad
+            if (c < best.cost)
+            {
+                best.ok = true;
+                best.cost = c;
+                best.flip = flip;
+                best.q_place = q_plh; // place_hover 的关节作下段转移起点 seed
+                best.end_pose = place_hover_base;
+                best.max_j6 = path_max_j6;
+            }
+        }
+        return best;
+    }
+
+    // 优化用的抓取 XY（board 系）：用于 XY 回退代价。
+    bool pickXYForOpt(int u, int v, double &x, double &y) const
+    {
+        geometry_msgs::Point p;
+        if (use_pick_homography_ && pick_homography_loaded_ &&
+            applyPickHomographyXY(static_cast<double>(u), static_cast<double>(v), p))
+        {
+            x = p.x;
+            y = p.y;
+            return true;
+        }
+        PixelPoint px;
+        px.u = u;
+        px.v = v;
+        geometry_msgs::Point tp;
+        if (pixelToPickPointTable(px, tp))
+        {
+            x = tp.x;
+            y = tp.y;
+            return true;
+        }
+        return false;
+    }
+
+    bool getStartBoardXY(double &x, double &y)
+    {
+        if (!board_pose_loaded_)
+            return false;
+        try
+        {
+            geometry_msgs::TransformStamped tf =
+                tf_buffer_.lookupTransform(base_frame_, eef_frame_, ros::Time(0), ros::Duration(0.5));
+            tf2::Vector3 p_base(tf.transform.translation.x, tf.transform.translation.y, tf.transform.translation.z);
+            tf2::Vector3 p_board = base_to_board_ * p_base;
+            x = p_board.x();
+            y = p_board.y();
+            return true;
+        }
+        catch (const tf2::TransformException &ex)
+        {
+            ROS_WARN_THROTTLE(2.0, "[PATH] start TCP TF lookup failed: %s", ex.what());
+            return false;
+        }
     }
 
     // 缓存最新候选池：board_state 末段是每个检测块 [shape,u,v,ang(,geom_u,geom_v)]。
     void boardStateCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
     {
-        // 头部：7 库存 + 140 占用栅格 + num_blocks，之后才是检测块。
         if ((int)msg->data.size() <= 147)
             return;
         int idx = 147;
@@ -992,61 +1375,16 @@ private:
         pool_ready_ = true;
     }
 
-    // 优化用的抓取 XY（board 系）：优先单应性，回退真平面反投影。距离度量只需 XY。
-    bool pickXYForOpt(int u, int v, double &x, double &y) const
-    {
-        geometry_msgs::Point p;
-        if (use_pick_homography_ && pick_homography_loaded_ &&
-            applyPickHomographyXY(static_cast<double>(u), static_cast<double>(v), p))
-        {
-            x = p.x;
-            y = p.y;
-            return true;
-        }
-        PixelPoint px;
-        px.u = u;
-        px.v = v;
-        geometry_msgs::Point tp;
-        if (pixelToPickPointTable(px, tp))
-        {
-            x = tp.x;
-            y = tp.y;
-            return true;
-        }
-        return false;
-    }
-
-    // 起点：当前 TCP 位置换算到 board 系 XY。失败则无起点项（第一步只按 pick->place 选）。
-    bool getStartBoardXY(double &x, double &y)
-    {
-        if (!board_pose_loaded_)
-            return false;
-        try
-        {
-            geometry_msgs::TransformStamped tf =
-                tf_buffer_.lookupTransform(base_frame_, eef_frame_, ros::Time(0), ros::Duration(0.5));
-            tf2::Vector3 p_base(tf.transform.translation.x, tf.transform.translation.y, tf.transform.translation.z);
-            tf2::Vector3 p_board = base_to_board_ * p_base;
-            x = p_board.x();
-            y = p_board.y();
-            return true;
-        }
-        catch (const tf2::TransformException &ex)
-        {
-            ROS_WARN_THROTTLE(2.0, "[PATH] start TCP TF lookup failed: %s", ex.what());
-            return false;
-        }
-    }
-
-    // 联合优化：放置顺序（DAG 内重排）+ 抓取分配（同形状互换），最小化总行程。
-    // 直接在 goals 上重排并回填每个任务的抓取字段。
-    void optimizePlan(std::vector<TaskGoal> &goals)
+    // 联合优化：放置顺序（DAG 内重排）+ 抓取分配（同形状互换）+ 腕部翻转，最小化总代价。
+    // 关节代价可用时用关节空间 + 翻转 + 转移段 J6 路径校验；否则回退 XY 直线距离 + 事后 yaw 启发式。
+    // 返回 false 表示规划失败（关节模式下某就绪槽无任何 J6 可行方案）——调用方应放弃发布、待重规划。
+    bool optimizePlan(std::vector<TaskGoal> &goals)
     {
         const int n = static_cast<int>(goals.size());
-        if (n <= 1)
-            return;
+        if (n == 0)
+            return true;
 
-        // 放置点（board XY，由 plan 固定）。
+        // 放置点（board XY，用于 XY 回退代价）。
         std::vector<double> place_x(n), place_y(n);
         for (int i = 0; i < n; ++i)
         {
@@ -1088,7 +1426,129 @@ private:
         if (!use_pool)
             ROS_WARN("[PATH] board_state pool unavailable/insufficient; reorder-only (keep strategy picks).");
 
-        // 放置依赖 DAG：与 strategy 一致——某格 (r,c) 之下 (r+1,c) 是别的块，则下面的块先放。
+        // 关节起点 q_cur：测量关节优先，否则标称工具朝下种子。
+        Joints q_cur = nominal_seed_;
+        {
+            std::lock_guard<std::mutex> lk(joint_mutex_);
+            if (joint_state_ready_)
+                q_cur = q_meas_;
+        }
+        const bool joint_mode = use_joint_cost_;
+
+        // 关节代价路点起点位姿（转移段 J6 采样的起点）：初始 = 当前关节的 FK 位姿（≈初始/观测位姿）。
+        geometry_msgs::Pose cur_pose = fkPose(q_cur);
+
+        // XY 回退代价用的起点 TCP（board 系）。
+        double cur_x = 0.0, cur_y = 0.0;
+        bool has_cur = (!joint_mode) && getStartBoardXY(cur_x, cur_y);
+
+        // 不重排模式：保持策略节点给的放置顺序（比赛可能有 DAG 之外的约束，如方块相邻），
+        // 仅按当前顺序为每个槽的指定形状选代价最小的物理块 + 腕部翻转。策略给的具体抓取块仅作
+        // 占位/回退（候选池可用时由本节点重选）。
+        if (!allow_reorder_)
+        {
+            for (int i = 0; i < n; ++i)
+            {
+                int s = goals[i].shape_type;
+                double best = std::numeric_limits<double>::max();
+                int best_cand = -1;
+                bool best_flip = false;
+                bool feasible = false;
+                Joints best_qplace = q_cur;
+                geometry_msgs::Pose best_endpose = cur_pose;
+                double best_maxj6 = 0.0;
+
+                if (use_pool && s >= 0 && s < 7)
+                {
+                    for (int k = 0; k < static_cast<int>(cand[s].size()); ++k)
+                    {
+                        if (cand_used[s][k])
+                            continue;
+                        const PoolBlock &b = cand[s][k];
+                        if (joint_mode)
+                        {
+                            PixelPoint pk{b.u, b.v}, gm{b.geom_u, b.geom_v};
+                            PairEval pe = evalPairJoint(goals[i], pk, b.ang, gm, b.has_geom, q_cur, cur_pose);
+                            if (pe.ok && pe.cost < best)
+                            {
+                                best = pe.cost;
+                                best_cand = k;
+                                best_flip = pe.flip;
+                                best_qplace = pe.q_place;
+                                best_endpose = pe.end_pose;
+                                best_maxj6 = pe.max_j6;
+                                feasible = true;
+                            }
+                        }
+                        else
+                        {
+                            double d = (has_cur ? std::hypot(cur_x - cand_x[s][k], cur_y - cand_y[s][k]) : 0.0) +
+                                       std::hypot(cand_x[s][k] - place_x[i], cand_y[s][k] - place_y[i]);
+                            if (d < best)
+                            {
+                                best = d;
+                                best_cand = k;
+                            }
+                        }
+                    }
+                }
+                else if (joint_mode)
+                {
+                    // 池不可用：保留策略抓取，仍按关节代价选翻转。
+                    PairEval pe = evalPairJoint(goals[i], goals[i].pick_pixel, goals[i].pick_angle_deg,
+                                                goals[i].geom_pixel, goals[i].has_geom_pixel, q_cur, cur_pose);
+                    if (pe.ok)
+                    {
+                        best = pe.cost;
+                        best_flip = pe.flip;
+                        best_qplace = pe.q_place;
+                        best_endpose = pe.end_pose;
+                        best_maxj6 = pe.max_j6;
+                        feasible = true;
+                    }
+                }
+
+                // 不重排模式下没有重排自由度：该槽若无任何 J6 可行 (块,翻转) → 规划失败。
+                if (joint_mode && !feasible)
+                {
+                    ROS_ERROR("[PATH] PLANNING FAILED: task %d (shape %d) has no J6-feasible pick/flip "
+                              "(every transit exceeds hard limit %.0f deg). NOT publishing — re-plan needed.",
+                              i, s, wrist_hard_limit_rad_ * 180.0 / M_PI);
+                    return false;
+                }
+
+                if (use_pool && best_cand >= 0 && s >= 0 && s < 7)
+                {
+                    const PoolBlock &b = cand[s][best_cand];
+                    cand_used[s][best_cand] = 1;
+                    goals[i].pick_pixel.u = b.u;
+                    goals[i].pick_pixel.v = b.v;
+                    goals[i].pick_angle_deg = b.ang;
+                    goals[i].geom_pixel.u = b.geom_u;
+                    goals[i].geom_pixel.v = b.geom_v;
+                    goals[i].has_geom_pixel = b.has_geom;
+                }
+                if (joint_mode)
+                {
+                    if (best_maxj6 > wrist_soft_limit_rad_)
+                        ROS_WARN("[PATH] task %d J6 path peak %.0f deg exceeds soft %.0f deg (within hard); margin low.",
+                                 i, best_maxj6 * 180.0 / M_PI, wrist_soft_limit_rad_ * 180.0 / M_PI);
+                    goals[i].flip = best_flip;
+                    q_cur = best_qplace;
+                    cur_pose = best_endpose;
+                }
+                cur_x = place_x[i];
+                cur_y = place_y[i];
+                has_cur = true;
+            }
+            if (!joint_mode)
+                assignFlipsByYaw(goals);
+            ROS_INFO("[PATH] kept strategy order; assigned picks+flip: %d task(s), pool=%s, cost=%s.",
+                     n, use_pool ? "on" : "off", joint_mode ? "joint" : "xy");
+            return true;
+        }
+
+        // 放置依赖 DAG：某格 (r,c) 之下 (r+1,c) 是别的块，则下面的块先放。
         std::vector<int> indeg(n, 0);
         std::vector<std::vector<int>> succ(n);
         std::map<std::pair<int, int>, int> cell2goal;
@@ -1105,7 +1565,7 @@ private:
                 auto it = cell2goal.find({c.row + 1, c.col});
                 if (it == cell2goal.end() || it->second == i)
                     continue;
-                int h = it->second; // h（下面的块）必须先于 i
+                int h = it->second;
                 bool dup = false;
                 for (int s : succ[h])
                     if (s == i)
@@ -1120,9 +1580,6 @@ private:
                 }
             }
         }
-
-        double cur_x = 0.0, cur_y = 0.0;
-        bool has_cur = getStartBoardXY(cur_x, cur_y);
 
         std::vector<char> placed(n, 0), in_frontier(n, 0);
         std::vector<int> frontier;
@@ -1139,6 +1596,11 @@ private:
         {
             double best = std::numeric_limits<double>::max();
             int best_goal = -1, best_cand = -1;
+            bool best_flip = false;
+            Joints best_qplace = q_cur;
+            geometry_msgs::Pose best_endpose = cur_pose;
+            double best_maxj6 = 0.0;
+
             for (int g : frontier)
             {
                 if (placed[g])
@@ -1150,33 +1612,79 @@ private:
                     {
                         if (cand_used[s][k])
                             continue;
-                        double d = (has_cur ? std::hypot(cur_x - cand_x[s][k], cur_y - cand_y[s][k]) : 0.0) +
-                                   std::hypot(cand_x[s][k] - place_x[g], cand_y[s][k] - place_y[g]);
-                        if (d < best)
+                        const PoolBlock &b = cand[s][k];
+                        if (joint_mode)
                         {
-                            best = d;
-                            best_goal = g;
-                            best_cand = k;
+                            PixelPoint pk{b.u, b.v}, gm{b.geom_u, b.geom_v};
+                            PairEval pe = evalPairJoint(goals[g], pk, b.ang, gm, b.has_geom, q_cur, cur_pose);
+                            if (pe.ok && pe.cost < best)
+                            {
+                                best = pe.cost;
+                                best_goal = g;
+                                best_cand = k;
+                                best_flip = pe.flip;
+                                best_qplace = pe.q_place;
+                                best_endpose = pe.end_pose;
+                                best_maxj6 = pe.max_j6;
+                            }
+                        }
+                        else
+                        {
+                            double d = (has_cur ? std::hypot(cur_x - cand_x[s][k], cur_y - cand_y[s][k]) : 0.0) +
+                                       std::hypot(cand_x[s][k] - place_x[g], cand_y[s][k] - place_y[g]);
+                            if (d < best)
+                            {
+                                best = d;
+                                best_goal = g;
+                                best_cand = k;
+                            }
                         }
                     }
                 }
                 else
                 {
-                    double px, py;
-                    if (!pickXYForOpt(goals[g].pick_pixel.u, goals[g].pick_pixel.v, px, py))
+                    if (joint_mode)
                     {
-                        px = place_x[g];
-                        py = place_y[g];
+                        PairEval pe = evalPairJoint(goals[g], goals[g].pick_pixel, goals[g].pick_angle_deg,
+                                                    goals[g].geom_pixel, goals[g].has_geom_pixel, q_cur, cur_pose);
+                        if (pe.ok && pe.cost < best)
+                        {
+                            best = pe.cost;
+                            best_goal = g;
+                            best_cand = -1;
+                            best_flip = pe.flip;
+                            best_qplace = pe.q_place;
+                            best_endpose = pe.end_pose;
+                            best_maxj6 = pe.max_j6;
+                        }
                     }
-                    double d = (has_cur ? std::hypot(cur_x - px, cur_y - py) : 0.0) +
-                               std::hypot(px - place_x[g], py - place_y[g]);
-                    if (d < best)
+                    else
                     {
-                        best = d;
-                        best_goal = g;
-                        best_cand = -1;
+                        double px, py;
+                        if (!pickXYForOpt(goals[g].pick_pixel.u, goals[g].pick_pixel.v, px, py))
+                        {
+                            px = place_x[g];
+                            py = place_y[g];
+                        }
+                        double d = (has_cur ? std::hypot(cur_x - px, cur_y - py) : 0.0) +
+                                   std::hypot(px - place_x[g], py - place_y[g]);
+                        if (d < best)
+                        {
+                            best = d;
+                            best_goal = g;
+                            best_cand = -1;
+                        }
                     }
                 }
+            }
+            // 关节模式：DAG 就绪槽里没有任何 J6 可行的 (槽,块,翻转) → 重排也救不了 → 规划失败。
+            // 这里已经遍历了所有就绪槽×候选块×翻转（即"先试翻转/换块/重排"），仍无解才报错停。
+            if (joint_mode && best_goal < 0)
+            {
+                ROS_ERROR("[PATH] PLANNING FAILED at step %d/%d: no J6-feasible (transit <= %.0f deg) "
+                          "pick/flip for any DAG-ready slot. NOT publishing — re-plan needed.",
+                          step, n, wrist_hard_limit_rad_ * 180.0 / M_PI);
+                return false;
             }
             if (best_goal < 0)
             {
@@ -1188,7 +1696,7 @@ private:
                     }
             }
             if (best_goal < 0)
-                break; // 不应发生
+                break;
 
             int s = goals[best_goal].shape_type;
             if (use_pool && best_cand >= 0 && s >= 0 && s < 7)
@@ -1201,6 +1709,15 @@ private:
                 goals[best_goal].geom_pixel.u = b.geom_u;
                 goals[best_goal].geom_pixel.v = b.geom_v;
                 goals[best_goal].has_geom_pixel = b.has_geom;
+            }
+            if (joint_mode)
+            {
+                if (best_maxj6 > wrist_soft_limit_rad_)
+                    ROS_WARN("[PATH] task(goal=%d) J6 path peak %.0f deg exceeds soft %.0f deg (within hard); margin low.",
+                             best_goal, best_maxj6 * 180.0 / M_PI, wrist_soft_limit_rad_ * 180.0 / M_PI);
+                goals[best_goal].flip = best_flip;
+                q_cur = best_qplace;
+                cur_pose = best_endpose;
             }
             placed[best_goal] = 1;
             order.push_back(best_goal);
@@ -1219,7 +1736,7 @@ private:
         {
             ROS_WARN("[PATH] optimize produced %lu/%d tasks (cycle?); keeping original order.",
                      order.size(), n);
-            return;
+            return true;
         }
 
         std::vector<TaskGoal> reordered;
@@ -1227,7 +1744,86 @@ private:
         for (int idx : order)
             reordered.push_back(goals[idx]);
         goals.swap(reordered);
-        ROS_INFO("[PATH] optimized order+assign: %d task(s), pool=%s.", n, use_pool ? "on" : "off");
+
+        if (!joint_mode)
+            assignFlipsByYaw(goals); // XY 回退路径：事后用 yaw 启发式选翻转
+
+        ROS_INFO("[PATH] optimized order+assign: %d task(s), pool=%s, cost=%s.",
+                 n, use_pool ? "on" : "off", joint_mode ? "joint" : "xy");
+        return true;
+    }
+
+    // XY 回退时的翻转选择：沿用旧 A/B 腕角 travel 启发式（不需 IK，仅 base-yaw）。
+    void assignFlipsByYaw(std::vector<TaskGoal> &goals)
+    {
+        double sim_yaw = 0.0;
+        {
+            std::lock_guard<std::mutex> lk(joint_mutex_);
+            if (joint_state_ready_)
+                sim_yaw = q_meas_[5];
+        }
+        for (auto &g : goals)
+        {
+            double pick_yaw_base = normalizeAngleRad(
+                yawFromHomography(g.pick_pixel.u, g.pick_pixel.v, g.pick_angle_deg * M_PI / 180.0) + pick_yaw_offset_rad_);
+            double place_yaw_base = normalizeAngleRad(-g.way * M_PI / 2.0);
+
+            double pick_A = baseYawOfTable(pick_yaw_base);
+            double place_A = baseYawOfTable(place_yaw_base);
+            double pick_B = baseYawOfTable(normalizeAngleRad(pick_yaw_base + M_PI));
+            double place_B = baseYawOfTable(normalizeAngleRad(place_yaw_base + M_PI));
+
+            double pu_A = unwrapAngle(sim_yaw, pick_A);
+            double pl_A = unwrapAngle(pu_A, place_A);
+            double travel_A = std::fabs(pu_A - sim_yaw) + std::fabs(pl_A - pu_A);
+            double max_A = std::max(std::fabs(pu_A), std::fabs(pl_A));
+
+            double pu_B = unwrapAngle(sim_yaw, pick_B);
+            double pl_B = unwrapAngle(pu_B, place_B);
+            double travel_B = std::fabs(pu_B - sim_yaw) + std::fabs(pl_B - pu_B);
+            double max_B = std::max(std::fabs(pu_B), std::fabs(pl_B));
+
+            bool feas_A = max_A <= wrist_soft_limit_rad_;
+            bool feas_B = max_B <= wrist_soft_limit_rad_;
+            bool choose_B;
+            if (feas_A && feas_B)
+                choose_B = travel_B < travel_A;
+            else if (feas_A)
+                choose_B = false;
+            else if (feas_B)
+                choose_B = true;
+            else
+                choose_B = max_B < max_A;
+
+            g.flip = choose_B;
+            sim_yaw = choose_B ? pl_B : pl_A;
+        }
+    }
+
+    // 由最终顺序 + 已定翻转，构建可执行的 MotionTask（含深度 Z 与悬停位姿）。
+    bool buildMotionTask(const TaskGoal &goal, tly::MotionTask &task)
+    {
+        TablePoses tp;
+        if (!computeTablePoses(goal, goal.pick_pixel, goal.pick_angle_deg, goal.geom_pixel,
+                               goal.has_geom_pixel, goal.flip, /*use_depth=*/true, tp))
+            return false;
+
+        if (!tableToBasePose(tp.pick, task.pick_pose) ||
+            !tableToBasePose(tp.pick_hover, task.pick_hover_pose) ||
+            !tableToBasePose(tp.place, task.place_pose) ||
+            !tableToBasePose(tp.place_hover, task.place_hover_pose))
+            return false;
+
+        task.shape = goal.shape_type;
+        task.way = goal.way;
+
+        ROS_INFO("[PATH][TASK] shape=%d flip=%d pick_table=(%.3f,%.3f,%.3f) place_table=(%.3f,%.3f,%.3f) "
+                 "yaw_pick=%.1f yaw_place=%.1f",
+                 goal.shape_type, (int)goal.flip,
+                 tp.pick.position.x, tp.pick.position.y, tp.pick.position.z,
+                 tp.place.position.x, tp.place.position.y, tp.place.position.z,
+                 tp.pick_yaw * 180.0 / M_PI, tp.place_yaw * 180.0 / M_PI);
+        return true;
     }
 
     void planCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
@@ -1250,6 +1846,9 @@ private:
         if (!getObservationTransforms())
             return;
 
+        updateToolTiltFromInitialPose();
+        runSelfCheckIfPossible();
+
         int total = msg->data[0];
         if (total <= 0)
             return;
@@ -1260,7 +1859,6 @@ private:
             return;
         }
 
-        // 解析全部任务（重排在全集上做，截断交给控制节点）。
         std::vector<TaskGoal> goals;
         goals.reserve(total);
         for (int i = 0; i < total; ++i)
@@ -1309,9 +1907,17 @@ private:
         }
 
         if (optimize_order_)
-            optimizePlan(goals);
+        {
+            if (!optimizePlan(goals))
+            {
+                ROS_ERROR("[PATH] Plan ABORTED (J6 infeasible). No MotionPlan published; awaiting re-plan.");
+                return; // fail-stop：不发布任何计划，控制器保持空闲，等待重规划
+            }
+        }
+        else
+            assignFlipsByYaw(goals); // 不重排也要定翻转（用 yaw 启发式，不跟踪关节序列）
 
-        // 1) 优化后的 17-int 计划（全集，供控制节点消费）：回填抓取字段后无损重排。
+        // 1) 调试用 17-int 计划（回填抓取字段后无损重排），不含翻转信息。
         std_msgs::Int32MultiArray opt;
         opt.data.reserve(1 + total * stride);
         opt.data.push_back(total);
@@ -1330,7 +1936,7 @@ private:
         }
         opt_plan_pub_.publish(opt);
 
-        // 2) /motion_cmds（调试对照，按优化后顺序；受 max_tasks_per_plan_ 限制）。
+        // 2) MotionPlan（控制路径，全集；截断交给执行器）。
         int exec_total = total;
         if (max_tasks_per_plan_ > 0 && exec_total > max_tasks_per_plan_)
             exec_total = max_tasks_per_plan_;
@@ -1341,15 +1947,16 @@ private:
         for (int i = 0; i < exec_total; ++i)
         {
             tly::MotionTask task;
-            if (buildTask(goals[i], task))
+            if (buildMotionTask(goals[i], task))
                 plan.tasks.push_back(task);
             else
                 ROS_WARN("[PATH] Skip task %d: failed to build pick/place pose.", i + 1);
         }
         motion_pub_.publish(plan);
 
-        ROS_INFO("[PATH] Published %s with %d task(s) + /motion_cmds with %lu task(s) (from %d plan task(s)).",
-                 optimized_plan_topic_.c_str(), total, plan.tasks.size(), total);
+        ROS_INFO("[PATH] Published %s with %lu task(s) + %s Int32(%d) [%s cost].",
+                 motion_topic_.c_str(), plan.tasks.size(), optimized_plan_topic_.c_str(),
+                 total, use_joint_cost_ ? "joint" : "xy");
     }
 };
 
