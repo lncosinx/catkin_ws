@@ -27,6 +27,9 @@
 roslaunch tly test_vision.launch vision_node:=vision_processor_node_dexined
 ```
 
+> 两个实现各配一套相机曝光/色彩档：DexiNed 用 `camera_config.yaml`、经典用
+> `camer_config_1.yaml`。**切换实现时相机档也要一并换**，详见 [§5.0](#50-两套曝光色彩档按视觉实现配对)。
+
 形状 ID 是跨节点共享的硬契约（见 `SHAPE_NAMES` / `BASE_SHAPES`）：
 `0` 一字、`1` 田、`2` T、`3` L_left、`4` L_right、`5` Z_left、`6` Z_right。
 改这个枚举必须同步 `strategy_node.cpp`、Python 视觉节点等所有使用方。
@@ -186,6 +189,27 @@ launch 要点：
 项目把相机参数固定下来存进 [config/camera_config.yaml](../src/tly/config/camera_config.yaml)，
 `test_vision.launch` 启动时自动加载。相机参数的 dynamic_reconfigure 命名空间是
 **`/camera/rgb_camera`**（深度/红外在 `stereo_module` 等其它分支，别选错）。
+
+### 5.0 两套曝光/色彩档（按视觉实现配对）
+
+两个视觉实现对图像风格的需求不同，因此各配**一份** `dynamic_reconfigure` 档，都灌进
+`/camera/rgb_camera`：
+
+| 档案 | 配套节点 | 风格取向（关键差异） |
+|------|----------|----------------------|
+| [config/camera_config.yaml](../src/tly/config/camera_config.yaml) | `vision_processor_node_dexined`（**默认**） | **保留色彩**：saturation 64、gamma 300、contrast 50、hue 0；供 DexiNed 边缘 + Lab 颜色边界切割用 |
+| [config/camer_config_1.yaml](../src/tly/config/camer_config_1.yaml) | `vision_processor_node_cpp` | **高对比去饱和**：contrast 100、saturation 0、sharpness 100、brightness −64、hue 180；突出明暗轮廓，适配经典灰度阈值 |
+
+> 文件名 `camer_config_1.yaml` 确实少了个 `a`，是磁盘上的真实名字，别当笔误改掉。
+
+两档的共同点：都**关自动曝光/自动白平衡**（`exposure=180`、`white_balance=6000`、
+`power_line_frequency=3`），保证亮度/色温稳定。
+
+> ⚠️ **切换视觉实现时，相机档也要一并换。** `test_vision.launch` / `tly.launch` 里
+> `load_rgb_cfg` 那行**硬编码加载 `camera_config.yaml`**（DexiNed 档）。改用经典节点
+> （`vision_node:=vision_processor_node_cpp`）时，需把该行的文件名换成
+> `camer_config_1.yaml`，或启动后手动 `dynparam load`（见 §5.3）——否则相机档与视觉
+> 实现不匹配，检测质量会明显变差。
 
 ### 5.1 实时调整（rqt_reconfigure）
 

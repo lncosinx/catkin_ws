@@ -10,7 +10,7 @@
          安全：默认 max_tasks_per_plan=1，仅执行一个任务；速度沿用慢速档。
          ⚠️ 确认工作区无人、急停可达后再运行。
          ========================================================= -->
-    <arg name="robot_ip" default="192.168.1.228" />
+    <arg name="robot_ip" default="192.168.1.216" />
 
     <param name="robot_description" command="$(find xacro)/xacro --inorder '$(find xarm_description)/urdf/xarm_device.urdf.xacro' robot_type:=xarm dof:=6 add_gripper:=false" />
 

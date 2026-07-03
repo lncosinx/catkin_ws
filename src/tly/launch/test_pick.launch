@@ -1,5 +1,5 @@
 <launch>
-    <arg name="robot_ip" default="192.168.1.228" />
+    <arg name="robot_ip" default="192.168.1.216" />
     <arg name="place_z_extra_margin" default="0.001" />
     <!-- 视觉实现: vision_processor_node_cpp (经典) 或 vision_processor_node_dexined -->
     <arg name="vision_node" default="vision_processor_node_dexined" />

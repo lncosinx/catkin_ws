@@ -5,7 +5,7 @@
          原地纯转姿态、多角度计时，斜率法消加减速斜坡后求 ω，再换算 ω/v_lin=ω·1000/mvvelo。
 
          用法（比值与 mvvelo 无关，任一档位测得的比值都可直接用）：
-           roslaunch tly measure_tcp_omega.launch robot_ip:=192.168.1.228 mvvelo:=200
+           roslaunch tly measure_tcp_omega.launch robot_ip:=192.168.1.216 mvvelo:=200
            （实测 ω=0.645@200mm/s → 比值≈3.23≈π。换个 mvvelo 复测比值应稳定即确认。）
 
          重测时机：改了 TCP 或关节的加速度/加加速度(jerk)后，斜坡/角速度上限可能变，重测本项。

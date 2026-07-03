@@ -2,7 +2,7 @@
     <!-- 手眼标定栈（MoveIt + easy_handeye 自动采样）。区别于纯原生的 xarm_calibration_setup.launch(freehand)。
          注意：标定用 MoveIt 没问题；生产抓放才必须走原生直线 move_line（避免规划出曲线把吸住的方块转向）。
          规划器用 OMPL —— 不用 Pilz（Pilz 偶发关节加速度突增）。 -->
-    <arg name="robot_ip" default="192.168.1.228" />
+    <arg name="robot_ip" default="192.168.1.216" />
 
     <!-- ChArUco 标定板参数 (calib.io: 列11 x 行8, 方格15mm, 标记11mm, DICT_4X4) -->
     <arg name="squares_x"     default="11" />
