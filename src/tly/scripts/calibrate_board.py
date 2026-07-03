@@ -2380,7 +2380,7 @@ def main():
     legacy_origin_x = float(origin[0])
     legacy_origin_y = float(origin[1])
     place_z_legacy = float(np.median(np.asarray(place_z_map)))
-    hover_z = place_z_legacy + 0.10
+    hover_z = place_z_legacy + 0.04
     pick_z = float(block_thickness)
 
     # Step 6: 波纹管长度补偿（可选）。所有几何标定都用硬吸嘴(link_tcp)完成；波纹管挂在

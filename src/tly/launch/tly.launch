@@ -2,7 +2,7 @@
     <!-- =========================
          Basic arguments
          ========================= -->
-    <arg name="robot_ip" default="192.168.1.228" />
+    <arg name="robot_ip" default="192.168.1.216" />
     <arg name="expected_blocks" default="35" />
     <arg name="place_z_extra_margin" default="0.005" />
     <!-- 视觉实现: vision_processor_node_cpp (经典轮廓+模板) 或
@@ -97,10 +97,10 @@
         <rosparam param="distance_pick_shapes">[3, 4]</rosparam>
 
         <!-- ROI -->
-        <param name="roi_x_min" value="348" />
-        <param name="roi_y_min" value="30" />
-        <param name="roi_x_max" value="965" />
-        <param name="roi_y_max" value="691" />
+        <param name="roi_x_min" value="225" />
+        <param name="roi_y_min" value="23" />
+        <param name="roi_x_max" value="756" />
+        <param name="roi_y_max" value="699" />
 
         <!-- 黑白分割 -->
         <param name="threshold_mode" value="otsu" />
@@ -183,18 +183,22 @@
 
     <!-- Speed: first test must be slow -->
     <!-- 保守 -->
-    <param name="transit_speed_mm_s" value="200.0" />
-    <param name="transit_acc_mm_s2" value="1000.0" />
-    <param name="loaded_transit_speed_mm_s" value="200.0" />
-    <param name="loaded_transit_acc_mm_s2" value="1000.0" />
-    <param name="pick_down_speed_mm_s" value="200" />
-    <param name="pick_down_acc_mm_s2" value="1000" />
-    <param name="place_down_speed_mm_s" value="200" />
-    <param name="place_down_acc_mm_s2" value="1000" />
-    <param name="lift_speed_mm_s" value="200" />
-    <param name="lift_acc_mm_s2" value="1000" />
+    <!-- ⚠️ 同步点：transit_speed_mm_s / loaded_transit_speed_mm_s 是控制器实际执行 move_line 的线速度，
+         必须与 path_planner 的 transit_lin_speed_m_s / loaded_lin_speed_m_s(见本文件下方 path_planner_node
+         节点，单位 m/s = 此处 mm/s ÷ 1000)保持一致——代价模型用它作"关节饱和"门槛的 v_lin，两处不同则算错。
+         注意：path_planner 的 omega_per_v_lin_rad_per_m 是"比值"，与线速度档位无关，改速度不用动它。 -->
+    <param name="transit_speed_mm_s" value="500.0" />
+    <param name="transit_acc_mm_s2" value="2000.0" />
+    <param name="loaded_transit_speed_mm_s" value="500.0" />
+    <param name="loaded_transit_acc_mm_s2" value="2000.0" />
+    <param name="pick_down_speed_mm_s" value="500" />
+    <param name="pick_down_acc_mm_s2" value="2000" />
+    <param name="place_down_speed_mm_s" value="500" />
+    <param name="place_down_acc_mm_s2" value="2000" />
+    <param name="lift_speed_mm_s" value="500" />
+    <param name="lift_acc_mm_s2" value="2000" />
 
-    <param name="enable_place_shake" value="true" />
+    <param name="enable_place_shake" value="false" />
     <param name="place_shake_cycles" value="1" />
     <param name="place_shake_dx_m" value="0.005" />
     <param name="place_shake_dy_m" value="0.005" />
@@ -258,18 +262,34 @@
         <param name="yaw_homography_v_sign" value="-1.0" />
 
         <!-- 关节空间路程优化：读 /xarm/joint_states 当前关节作起点 q；用 xArm6 闭式 FK/IK 把每个
-             TCP 位姿转 6 关节角，代价 Cost=Σwᵢ(Δqᵢ)²，联合优化放置顺序/同形状抓取分配/腕部翻转。
-             启动用 fk/ik 对照 base→link_tcp TF 自检，失败自动回退 XY 距离代价。 -->
+             TCP 位姿转 6 关节角，联合优化放置顺序/同形状抓取分配/腕部翻转。代价=沿 move_line 直线路径
+             积分的"真实时间"(见下)。启动用 fk/ik 对照 base→link_tcp TF 自检，失败自动回退 XY 距离代价。 -->
         <param name="joint_state_topic" value="/xarm/joint_states" />
-        <!-- 关节代价权重默认按各轴最大速度推导 wᵢ=1/vᵢ²(速度越大权重越小)。xArm6 六轴 URDF/MoveIt
-             限速均为 3.14rad/s → 权重均匀[1,1,1,1,1,1]。若实测各轴限速不同，取消下行注释填入；
-             或用 joint_cost_weights 手动覆盖。 -->
+        <!-- 代价模型(单位秒，仅作候选排序代理，勿当绝对耗时)：每段基准笛卡尔时间=max(Δd/v_lin, Δθ/ω)
+             (位置线速度/姿态角速度取瓶颈)，实际时间再对关节饱和取 max(基准, maxᵢ|Δq|/v_max,i)。
+             v_lin: 空载/载料转移的 TCP 线速度(m/s，对齐控制器 transit/loaded_transit)。
+             omega_per_v_lin_rad_per_m: TCP 姿态角速度上限与线速度的比值 ω/v_lin(rad/m)。move_line 的 ω 随
+                    mvvelo 线性变(Move.srv: 0~1000→0~3.14 rad/s)，实测 ω=0.645rad/s@200mm/s → 比值≈3.23≈π
+                    且与档位无关，故用比值逐段自适应(ω=此值×v_lin)。含义：多少 rad 转动≈1m 平移的时间当量。
+                    转动主导阈值 Δθ>此值·Δd，与速度无关。用 measure_tcp_omega.launch 复测可更新。
+             joint_max_vel_rad_s: 各轴关节限速(rad/s)，作轨迹的关节饱和阈值；实测不同则取消注释填入。 -->
+        <!-- ⚠️ 同步点：这两个 v_lin 必须等于控制器实际速度 transit_speed_mm_s / loaded_transit_speed_mm_s
+             (见本文件上方 xarm_controller_node 节点) ÷ 1000。改速度时两处一起改。
+             omega_per_v_lin_rad_per_m 是比值(rad/m)、与速度无关，改速度不用动；用 measure_tcp_omega.launch 复测更新。 -->
+        <param name="transit_lin_speed_m_s" value="0.500" />
+        <param name="loaded_lin_speed_m_s" value="0.500" />
+        <param name="omega_per_v_lin_rad_per_m" value="3.23" />
         <!-- <rosparam param="joint_max_vel_rad_s">[3.14,3.14,3.14,3.14,3.14,3.14]</rosparam> -->
-        <!-- J6 限位(rad)：软限位=优化偏好(越界加罚但仍可用)；硬限位=绝对拒发(留余量到±2π=6.283真硬限)。
-             转移段沿直线笛卡尔路径采样 J6(端点校验抓不到中途越限)：transit_j6_samples 为每段采样点数。
-             某就绪槽所有(块,翻转,重排)的转移峰值 J6 都越硬限 → 规划失败、不发布、报错待重规划。 -->
+        <!-- J6 限位(rad)：软限位=优化偏好(越界按秒尺度加罚但仍可用，least-bad)；硬限位=绝对拒发
+             (留余量到±2π=6.283真硬限)。转移段沿直线笛卡尔路径采样 J6(端点校验抓不到中途越限)：
+             transit_j6_samples 为每段采样点数。某就绪槽所有(块,翻转,重排)的转移峰值 J6 都越硬限 →
+             规划失败、不发布、报错待重规划。
+             wrist_soft_penalty_s_per_rad: 越软限位每 rad 的时间罚(秒尺度，压过真实时间差但仍有序)。
+             tie_break_weight_s_per_rad: 平局次级项 Σ|Δq| 的极小权重(不饱和平局时偏好腕部少甩)。 -->
         <param name="wrist_soft_limit_rad" value="4.7" />
         <param name="wrist_hard_limit_rad" value="6.10" />
+        <param name="wrist_soft_penalty_s_per_rad" value="1000.0" />
+        <param name="tie_break_weight_s_per_rad" value="0.001" />
         <param name="transit_j6_samples" value="8" />
         <param name="ik_selfcheck_tol_rad" value="0.05" />
 

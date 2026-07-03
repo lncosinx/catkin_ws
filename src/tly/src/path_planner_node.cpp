@@ -268,7 +268,17 @@ private:
     // 关节空间运动学 / 代价
     tly::XArm6Kinematics kin_;
     using Joints = tly::XArm6Kinematics::Joints;
-    std::array<double, 6> joint_cost_weights_ = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+    // 代价 = 沿 move_line 直线路径积分的"真实时间"：基准笛卡尔时间 = max(Δd/v_lin, Δθ/ω)（位置线/姿态角
+    // 取瓶颈），每段再对关节饱和取 max(Δt_nominal, maxᵢ|Δq|/v_max,i)。单位秒，仅作候选排序代理。
+    std::array<double, 6> joint_max_vel_ = {3.14, 3.14, 3.14, 3.14, 3.14, 3.14}; // 各轴关节限速 rad/s（轨迹关节饱和阈值）
+    double transit_lin_speed_m_s_ = 0.06;    // 空载转移 TCP 线速度（≈控制器 transit 60mm/s）
+    double loaded_lin_speed_m_s_ = 0.045;    // 载料转移 TCP 线速度（≈控制器 loaded_transit 45mm/s）
+    // TCP 姿态角速度上限 ω 随 mvvelo 线性变（Move.srv：mvvelo 0~1000 → 角速度 0~3.14 rad/s），实测
+    // ω=0.645rad/s@200mm/s → ω/v_lin≈3.14 rad/m≈π 且与档位无关。故按比值逐段自适应：ω=该值×v_lin。
+    // 后果：转动主导阈值 Δθ>ω/v_lin·Δd=π·Δd，与速度无关；一个 180° 翻转≈1m 平移的时间代价。
+    double omega_per_v_lin_rad_per_m_ = 3.14; // ω/v_lin，即"多少 rad 转动 ≈ 1m 平移"的时间当量
+    double wrist_soft_penalty_s_per_rad_ = 1000.0; // 越软限位每 rad 的时间罚（秒尺度，least-bad 仍有序）
+    double tie_break_weight_s_per_rad_ = 1e-3;     // 平局次级项：Σ|Δq| 极小权重（不饱和时区分等价候选，偏好腕部少甩）
     // J6 限位：软限位为优化偏好（越界加罚但仍可用）；硬限位为绝对拒发阈值（留余量到 ±2π 真硬限）。
     // 转移段沿直线笛卡尔路径采样 J6（J6≈heading−J1，J1 沿直线非线性摆动，中途可越过两端点值）。
     double wrist_soft_limit_rad_ = 4.7;     // ≈269°，偏好上界
@@ -439,7 +449,7 @@ private:
         pnh_.param("wrist_hard_limit_rad", wrist_hard_limit_rad_, wrist_hard_limit_rad_);
         pnh_.param("transit_j6_samples", transit_j6_samples_, transit_j6_samples_);
         pnh_.param("ik_selfcheck_tol_rad", ik_selfcheck_tol_rad_, ik_selfcheck_tol_rad_);
-        loadJointCostWeights();
+        loadJointCostParams();
 
         nh_.param("/tetris/GRID_SIZE", GRID_SIZE_, GRID_SIZE_);
         nh_.param("/tetris/BOARD_ORIGIN_X", BOARD_ORIGIN_X_, BOARD_ORIGIN_X_);
@@ -462,34 +472,28 @@ private:
                  pick_homography_loaded_ ? "loaded" : "off");
     }
 
-    void loadJointCostWeights()
+    void loadJointCostParams()
     {
-        // 权重默认按"各关节最大速度"推导：move_line 各轴同时到达，移动耗时≈maxᵢ|Δqᵢ|/vᵢ，故让二次
-        // 代价的每项 ∝ (Δqᵢ/vᵢ)² → wᵢ = 1/vᵢ²（速度越大权重越小）。按 vmin 归一(最慢轴权重=1)。
-        // xArm6 的 URDF/MoveIt 六轴限速均为 3.14 rad/s → 默认权重均匀[1,1,1,1,1,1]；若实测各轴限速
-        // 不同，用 joint_max_vel_rad_s 自动调权。
-        std::array<double, 6> vmax = {3.14, 3.14, 3.14, 3.14, 3.14, 3.14};
+        // 关节代价不再是"端点 Δq 的二次和"，而是沿 move_line 直线路径积分的真实时间（见 evalTransit）。
+        // 各轴关节限速 v_max：作为轨迹的关节饱和阈值（Δt_k' = max(基准笛卡尔时间, maxᵢ|Δq|/v_max,i)）。
+        // xArm6 六轴限速默认 3.14 rad/s；实测不同用 joint_max_vel_rad_s 覆盖。
         XmlRpc::XmlRpcValue vv;
         if (pnh_.getParam("joint_max_vel_rad_s", vv) && vv.getType() == XmlRpc::XmlRpcValue::TypeArray && vv.size() == 6)
             for (int i = 0; i < 6; ++i)
             {
-                double x = vmax[i];
+                double x = joint_max_vel_[i];
                 if (xmlToDouble(vv[i], x) && x > 1e-6)
-                    vmax[i] = x;
+                    joint_max_vel_[i] = x;
             }
-        double vmin = *std::min_element(vmax.begin(), vmax.end());
-        for (int i = 0; i < 6; ++i)
-            joint_cost_weights_[i] = (vmin * vmin) / (vmax[i] * vmax[i]);
+        pnh_.param("transit_lin_speed_m_s", transit_lin_speed_m_s_, transit_lin_speed_m_s_);
+        pnh_.param("loaded_lin_speed_m_s", loaded_lin_speed_m_s_, loaded_lin_speed_m_s_);
+        pnh_.param("omega_per_v_lin_rad_per_m", omega_per_v_lin_rad_per_m_, omega_per_v_lin_rad_per_m_);
+        pnh_.param("wrist_soft_penalty_s_per_rad", wrist_soft_penalty_s_per_rad_, wrist_soft_penalty_s_per_rad_);
+        pnh_.param("tie_break_weight_s_per_rad", tie_break_weight_s_per_rad_, tie_break_weight_s_per_rad_);
 
-        // 显式 joint_cost_weights 覆盖（手动调，绕过速度推导）。
-        XmlRpc::XmlRpcValue w;
-        if (pnh_.getParam("joint_cost_weights", w) && w.getType() == XmlRpc::XmlRpcValue::TypeArray && w.size() == 6)
-            for (int i = 0; i < 6; ++i)
-                xmlToDouble(w[i], joint_cost_weights_[i]);
-
-        ROS_INFO("[PATH] joint_cost_weights=[%.2f %.2f %.2f %.2f %.2f %.2f] (from vmax) wrist_soft=%.0f deg",
-                 joint_cost_weights_[0], joint_cost_weights_[1], joint_cost_weights_[2],
-                 joint_cost_weights_[3], joint_cost_weights_[4], joint_cost_weights_[5],
+        ROS_INFO("[PATH] joint cost=path-time: v_max=[%.2f..] v_lin(empty/loaded)=%.3f/%.3f m/s omega/v_lin=%.2f rad/m "
+                 "wrist_soft=%.0f deg",
+                 joint_max_vel_[0], transit_lin_speed_m_s_, loaded_lin_speed_m_s_, omega_per_v_lin_rad_per_m_,
                  wrist_soft_limit_rad_ * 180.0 / M_PI);
     }
 
@@ -1235,17 +1239,6 @@ private:
         return true;
     }
 
-    double jointCost(const Joints &a, const Joints &b) const
-    {
-        double s = 0.0;
-        for (int i = 0; i < 6; ++i)
-        {
-            double d = b[i] - a[i];
-            s += joint_cost_weights_[i] * d * d;
-        }
-        return s;
-    }
-
     geometry_msgs::Pose fkPose(const Joints &q) const
     {
         tf2::Transform t = kin_.fk(q);
@@ -1273,28 +1266,63 @@ private:
         return P;
     }
 
-    // 沿 A->B 直线笛卡尔路径采样（move_line 的几何），逐点 IK（连续 seed，复刻固件就近解），
-    // 返回路径上 max|J6| 与终点关节。任一采样 IK 失败返回 false。
-    // 这是端点校验抓不到的：J6≈heading−J1，直线平移里 J1 非线性摆动（过基座附近尤甚），
-    // 中途 J6 可越过两端点值撞 ±2π。
-    bool transitMaxAbsJ6(const geometry_msgs::Pose &A, const geometry_msgs::Pose &B,
-                         const Joints &seed, double &max_abs_j6, Joints &q_end) const
+    struct TransitEval
     {
+        bool ok = false;
+        double time_cost = 0.0;    // Σ Δt_k'（秒，排序代理，非绝对耗时）
+        double joint_travel = 0.0; // Σ|Δq|（平局次级项）
+        double max_abs_j6 = 0.0;   // 路径上 max|J6|（限位校验用）
+        Joints q_end{};            // 终点关节（作下段转移起点 seed）
+    };
+
+    // 沿 A->B 直线笛卡尔路径（move_line 的几何）逐点 IK（连续 seed，复刻固件就近解），积分"真实时间"代价。
+    // 每段基准笛卡尔时间 = max(Δd/v_lin, Δθ/ω)（位置线速度/姿态角速度取瓶颈——翻转造成的姿态差异经此
+    // 计入），实际时间再对关节饱和取 max：Δt_k' = max(Δt_nominal, maxᵢ|Δq_{k,i}|/v_max,i)。这既抓端点式
+    // 代价看不见的中途关节速度尖峰（J6≈heading−J1，直线平移里 J1 非线性摆动、过基座尤甚，中途 J6 可越两
+    // 端点值撞 ±2π），也让姿态扫掠正确进入代价。任一采样 IK 失败 → ok=false。
+    TransitEval evalTransit(const geometry_msgs::Pose &A, const geometry_msgs::Pose &B,
+                            const Joints &seed, double v_lin) const
+    {
+        TransitEval e;
+        e.max_abs_j6 = std::fabs(seed[5]);
+        const int N = std::max(1, transit_j6_samples_);
+
+        // 直线均匀采样：每段位置/姿态增量相同，基准时间逐段相等。
+        const double dx = B.position.x - A.position.x;
+        const double dy = B.position.y - A.position.y;
+        const double dz = B.position.z - A.position.z;
+        const double total_d = std::sqrt(dx * dx + dy * dy + dz * dz);
+        tf2::Quaternion qa, qb;
+        tf2::fromMsg(A.orientation, qa);
+        tf2::fromMsg(B.orientation, qb);
+        double dotq = std::min(1.0, std::max(-1.0, std::fabs(qa.dot(qb))));
+        const double total_theta = 2.0 * std::acos(dotq); // 两姿态夹角
+        const double v = std::max(v_lin, 1e-6);
+        const double w = std::max(omega_per_v_lin_rad_per_m_ * v, 1e-6); // ω 随该段线速度自适应（实测比值恒定）
+        const double dt_nominal = std::max(total_d / N / v, total_theta / N / w);
+
         Joints q = seed;
-        max_abs_j6 = std::fabs(seed[5]);
-        int N = std::max(1, transit_j6_samples_);
         for (int i = 1; i <= N; ++i)
         {
-            double t = static_cast<double>(i) / N;
+            const double t = static_cast<double>(i) / N;
             geometry_msgs::Pose P = interpPoseBase(A, B, t);
             Joints qi;
             if (!kin_.ik(poseToTf(P), q, qi))
-                return false;
+                return e; // ok 保持 false
+            double joint_time = 0.0;
+            for (int j = 0; j < 6; ++j)
+            {
+                const double dq = std::fabs(qi[j] - q[j]);
+                e.joint_travel += dq;
+                joint_time = std::max(joint_time, dq / std::max(joint_max_vel_[j], 1e-6));
+            }
+            e.time_cost += std::max(dt_nominal, joint_time); // Δt_k'
             q = qi;
-            max_abs_j6 = std::max(max_abs_j6, std::fabs(q[5]));
+            e.max_abs_j6 = std::max(e.max_abs_j6, std::fabs(q[5]));
         }
-        q_end = q;
-        return true;
+        e.q_end = q;
+        e.ok = true;
+        return e;
     }
 
     // 评估一对 (放置槽, 抓取候选) 的两套翻转。可行性 = 端点 + 两段大转移（cur->pick_hover、
@@ -1314,7 +1342,6 @@ private:
                            const Joints &q_cur, const geometry_msgs::Pose &cur_pose) const
     {
         PairEval best;
-        const double SOFT_PENALTY = 1e6;
         for (int f = 0; f < 2; ++f)
         {
             bool flip = (f == 1);
@@ -1326,35 +1353,38 @@ private:
                 !tableToBasePose(tp.place, place_base) || !tableToBasePose(tp.place_hover, place_hover_base))
                 continue;
 
-            // 端点关节（用于代价）。
+            // 端点关节（pick/place 下压点，供 J6 限位校验）。
             Joints q_p, q_pl;
             if (!kin_.ik(poseToTf(pick_base), q_cur, q_p))
                 continue;
             if (!kin_.ik(poseToTf(place_base), q_p, q_pl))
                 continue;
 
-            // 转移段 J6 路径校验：cur_pose -> pick_hover（接近，空载）-> place_hover（载料转移）。
-            double mjA = 0.0, mjB = 0.0;
-            Joints q_ph, q_plh;
-            if (!transitMaxAbsJ6(cur_pose, pick_hover_base, q_cur, mjA, q_ph))
+            // 转移段沿直线积分真实时间代价 + J6 路径校验：cur_pose -> pick_hover（接近，空载）
+            // -> place_hover（载料转移）。
+            TransitEval trA = evalTransit(cur_pose, pick_hover_base, q_cur, transit_lin_speed_m_s_);
+            if (!trA.ok)
                 continue;
-            if (!transitMaxAbsJ6(pick_hover_base, place_hover_base, q_ph, mjB, q_plh))
+            TransitEval trB = evalTransit(pick_hover_base, place_hover_base, trA.q_end, loaded_lin_speed_m_s_);
+            if (!trB.ok)
                 continue;
-            double path_max_j6 = std::max(std::max(mjA, mjB),
+            double path_max_j6 = std::max(std::max(trA.max_abs_j6, trB.max_abs_j6),
                                           std::max(std::fabs(q_p[5]), std::fabs(q_pl[5])));
 
             if (path_max_j6 > wrist_hard_limit_rad_)
                 continue; // 硬限位：直接排除该方案
 
-            double c = jointCost(q_cur, q_p) + jointCost(q_p, q_pl);
+            // 代价 = 两段 move_line 真实时间（基准笛卡尔时间 × 关节超速延时）+ 平局次级项（不饱和时偏好腕部少甩）。
+            double c = trA.time_cost + trB.time_cost +
+                       tie_break_weight_s_per_rad_ * (trA.joint_travel + trB.joint_travel);
             if (path_max_j6 > wrist_soft_limit_rad_)
-                c += SOFT_PENALTY * (path_max_j6 - wrist_soft_limit_rad_); // 软限位：加罚，least-bad
+                c += wrist_soft_penalty_s_per_rad_ * (path_max_j6 - wrist_soft_limit_rad_); // 软限位：秒尺度加罚，least-bad
             if (c < best.cost)
             {
                 best.ok = true;
                 best.cost = c;
                 best.flip = flip;
-                best.q_place = q_plh; // place_hover 的关节作下段转移起点 seed
+                best.q_place = trB.q_end; // place_hover 的关节作下段转移起点 seed
                 best.end_pose = place_hover_base;
                 best.max_j6 = path_max_j6;
             }
