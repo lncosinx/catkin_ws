@@ -278,8 +278,11 @@ vector<ShapeVariant> getUniqueRotations(vector<Point> base)
     return unique_rots;
 }
 
-bool solveForMask(const PlanConfig &plan, const vector<int> &sub_inv, const int current_board[14][10],
-                  vector<Action> &out_actions, vector<int> &out_best_sol, int &out_best_score)
+// 求解一个掩码，收集达到最高分的多个(去重)候选解，最多 max_candidates 个。out_candidates 中每个
+// 元素都是 out_actions 的行索引向量；它们同分(=out_best_score)，供下游按运动代价做二次择优。
+bool solveForMaskMulti(const PlanConfig &plan, const vector<int> &sub_inv, const int current_board[14][10],
+                       vector<Action> &out_actions, vector<vector<int>> &out_candidates,
+                       int &out_best_score, int max_candidates)
 {
     int total_pieces = plan.target_blocks;
 
@@ -372,6 +375,10 @@ bool solveForMask(const PlanConfig &plan, const vector<int> &sub_inv, const int 
     mt19937 rng(1337 + plan.target_blocks);
     int max_sols = (plan.target_blocks >= 34) ? 400 : 100;
     int global_best_score_internal = -1;
+    if (max_candidates < 1)
+        max_candidates = 1;
+    out_candidates.clear();
+    set<vector<int>> seen_candidates; // 去重键: 排序后的行索引
 
     for (int attempt = 0; attempt < plan.max_restarts; ++attempt)
     {
@@ -439,12 +446,24 @@ bool solveForMask(const PlanConfig &plan, const vector<int> &sub_inv, const int 
                 }
                 if (score > global_best_score_internal)
                 {
+                    // 出现更高分：清空旧候选，从该分数重新收集。
                     global_best_score_internal = score;
-                    out_best_sol = sol;
+                    out_candidates.clear();
+                    seen_candidates.clear();
+                }
+                if (score == global_best_score_internal &&
+                    (int)out_candidates.size() < max_candidates)
+                {
+                    vector<int> key = sol;
+                    sort(key.begin(), key.end());
+                    if (seen_candidates.insert(key).second)
+                        out_candidates.push_back(sol);
                 }
             }
 
-            if (global_best_score_internal >= plan.max_possible_score)
+            // 已凑满最高分候选且达理论上限：可提前结束(常见情况一次重启即满足)。
+            if (global_best_score_internal >= plan.max_possible_score &&
+                (int)out_candidates.size() >= max_candidates)
             {
                 out_actions = all_actions;
                 out_best_score = global_best_score_internal;
@@ -455,13 +474,24 @@ bool solveForMask(const PlanConfig &plan, const vector<int> &sub_inv, const int 
         delete dlx;
     }
 
-    if (global_best_score_internal != -1)
+    if (global_best_score_internal != -1 && !out_candidates.empty())
     {
         out_actions = all_actions;
         out_best_score = global_best_score_internal;
         return true;
     }
     return false;
+}
+
+// 兼容旧签名：仅取最高分单个候选(供离线单测/其它调用方)。
+bool solveForMask(const PlanConfig &plan, const vector<int> &sub_inv, const int current_board[14][10],
+                  vector<Action> &out_actions, vector<int> &out_best_sol, int &out_best_score)
+{
+    vector<vector<int>> cands;
+    if (!solveForMaskMulti(plan, sub_inv, current_board, out_actions, cands, out_best_score, 1))
+        return false;
+    out_best_sol = cands.front();
+    return true;
 }
 
 void generateSubInventories(int type, int current_sum, int target_sum, vector<int> &current_sub,

@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-像素→深度→base 与实际 TCP 触点对比诊断。
+像素→base 预测 与实际 TCP 触点对比诊断（两条预测路径 × 各自同系的触点尺子）。
+
+两条预测路径其实落在不同 base 系，故触点也分两把尺子记录、各比各的：
+  - 深度+手眼：像素→深度反投影→相机系→TF(base<-camera) 到 base（URDF/TF 系，感知粗核对）。
+  - 单应性+视差：复刻 xarm_controller 的抓取 XY（PICK_HOMOGRAPHY + BOARD_POSE_BASE）。这套标定由
+    calibrate_board 用固件位姿记录、move_line 也走固件系，故预测在【固件系】（生产真正用的路径）。
 
 流程：
   1) 在彩色图上手动点选 N 个物理点（默认 9 个）。
-  2) 脚本从 aligned_depth_to_color 取多帧中值深度，把每个像素反投影到相机系。
-  3) 用当前 TF(base <- camera_color_optical_frame) 转到 base 系。
-  4) 用户手动移动 link_tcp 到同一个物理点，按回车记录。
-  5) 打印并保存 touch_base - vision_base 误差。
+  2) 取多帧中值深度反投影 + 单应性两条各算一个 base 预测。
+  3) 用户手动移动吸嘴尖(link_tcp)到同一物理点，按回车：同时记录 ROS TF 触点(URDF 系，比深度+手眼)
+     与固件 /xarm/xarm_states.pose 触点(固件系，比单应性)。固件位姿不可用则单应性对照回退 TF。
+  4) 打印并保存两条误差 + URDF↔固件系统偏差。
 
 它不写 tetris_config.yaml，只把诊断结果保存到 /tmp。
 """
@@ -162,6 +167,97 @@ def load_pick_z(config_path, default=0.0):
         return float(default)
 
 
+# ---- 固件上报位姿（xArm 原生 /xarm/xarm_states.pose，单位 mm / rad）----
+# 与 calibrate_board 同源：URDF 名义运动学 ≠ 固件出厂逐台标定运动学（实测本机约 4~5mm）。
+# PICK_HOMOGRAPHY / BOARD_POSE_BASE 现在都由 calibrate_board 用固件位姿记录标定、move_line 也走固件系，
+# 所以「单应性+视差」预测落在固件系，touch 必须同样用固件位姿记录才是同一把尺子（否则凭空多出那 4~5mm
+# 偏差→假性不合格）；「深度+手眼」预测走 TF(base<-camera) 落在 URDF 系，则仍用 ROS TF 记录 touch。
+# 故本工具两条 touch 都记：固件位姿比单应性、ROS TF 比深度+手眼。固件位姿不可用时单应性对照回退 TF。
+_FW = {
+    "enabled": False,
+    "pose": None,      # 最新 [x,y,z(mm), r,p,y(rad)]
+    "offset": None,    # 固件当前 TCP 偏置 [x,y,z(mm), r,p,y(rad)]（RobotMsg.offset）
+    "stamp": None,
+    "max_age": 0.5,    # s；位姿过旧视为不可用，回退 TF
+}
+
+
+def _fw_state_cb(msg):
+    if len(msg.pose) >= 6:
+        _FW["pose"] = [float(v) for v in msg.pose[:6]]
+        _FW["stamp"] = rospy.Time.now()
+    if len(getattr(msg, "offset", [])) >= 3:
+        _FW["offset"] = [float(v) for v in msg.offset[:6]]
+
+
+def get_firmware_touch():
+    """返回新鲜的固件 TCP 位置 [x,y,z]（m，link_base 系）；未启用/过旧/缺失返回 None。"""
+    if not _FW["enabled"] or _FW["pose"] is None or _FW["stamp"] is None:
+        return None
+    if (rospy.Time.now() - _FW["stamp"]).to_sec() > _FW["max_age"]:
+        return None
+    p = _FW["pose"]
+    return np.array([p[0] / 1000.0, p[1] / 1000.0, p[2] / 1000.0], dtype=np.float64)
+
+
+def setup_firmware_pose(tf_buffer, base_frame, eef_frame):
+    """启用「用固件 /xarm/xarm_states.pose 记录单应性对照的触点」。纯被动，不命令机械臂运动、只读不改：
+    订阅状态话题→等首帧→读固件 TCP 偏置(RobotMsg.offset)与吸嘴尖(TF link_eef->eef_frame)核对(仅提示)→
+    打印固件位姿 vs ROS TF 偏差（即 URDF↔固件运动学差）。~use_firmware_pose:=false 可整体关闭退回 TF。
+    任一环节失败不致命：enabled 保持 False，单应性对照自动回退 TF 触点。返回 True 表示已启用固件位姿。"""
+    if not bool(rospy.get_param("~use_firmware_pose", True)):
+        print("ℹ️ ~use_firmware_pose=false：单应性对照也用 ROS TF 记录触点（URDF 系）。")
+        return False
+    try:
+        from xarm_msgs.msg import RobotMsg
+    except Exception as e:
+        print("⚠️ 无法导入 xarm_msgs（%s）；单应性对照回退 ROS TF 触点。" % e)
+        return False
+
+    rospy.Subscriber("/xarm/xarm_states", RobotMsg, _fw_state_cb)
+    try:
+        rospy.wait_for_message("/xarm/xarm_states", RobotMsg, timeout=6.0)
+    except Exception:
+        print("⚠️ 未收到 /xarm/xarm_states；单应性对照回退 ROS TF 触点。确认机器人在线、robot_ip 正确。")
+        return False
+
+    # 核对固件 TCP 偏置 = 吸嘴尖(TF link_eef->eef_frame)，一致则 xarm_states.pose 即吸嘴尖。只核对不改。
+    exp = None
+    try:
+        tr = tf_buffer.lookup_transform("link_eef", eef_frame, rospy.Time(0), rospy.Duration(3.0))
+        exp = np.array([tr.transform.translation.x, tr.transform.translation.y,
+                        tr.transform.translation.z]) * 1000.0
+    except Exception as e:
+        print("  ⚠️ 读 TF link_eef->%s 失败（%s）；无法核对固件 TCP，请自行确认=吸嘴尖。" % (eef_frame, e))
+    cur = _FW.get("offset")
+    if exp is not None and cur is not None:
+        d = float(np.linalg.norm(np.array(cur[:3]) - exp))
+        if d <= 1.0:   # 1mm 容差
+            print("  ✅ 固件当前 TCP 偏置=(%.2f,%.2f,%.2f)mm ≈ 吸嘴尖，xarm_states.pose 即吸嘴尖。"
+                  % tuple(cur[:3]))
+        else:
+            print("  ⚠️ 固件 TCP 偏置=(%.2f,%.2f,%.2f)mm 与吸嘴尖(%.2f,%.2f,%.2f)mm 差 %.2fmm！"
+                  % (cur[0], cur[1], cur[2], exp[0], exp[1], exp[2], d))
+            print("     → 请在 UF Studio 选中吸嘴尖那个 TCP，否则固件位姿测的不是吸嘴尖、单应性对照会偏。")
+
+    _FW["enabled"] = True
+    print("✅ 单应性对照 touch 源=固件位姿 /xarm/xarm_states.pose（与标定/move_line 同系）。")
+    # 启动自检：同一时刻固件位姿 vs ROS TF，打印偏差（即 verify 偏 4~5mm 的根源量）。
+    p = get_firmware_touch()
+    if p is not None:
+        try:
+            tr = tf_buffer.lookup_transform(base_frame, eef_frame, rospy.Time(0), rospy.Duration(2.0))
+            tfp = np.array([tr.transform.translation.x, tr.transform.translation.y,
+                            tr.transform.translation.z])
+            d = (p - tfp) * 1000.0
+            print("  🔎 固件 vs TF 偏差(mm): dx=%.2f dy=%.2f dz=%.2f | XY=%.2f mm"
+                  % (d[0], d[1], d[2], float(np.hypot(d[0], d[1]))))
+            print("     （即 URDF↔固件运动学差；下面单应性对照已用固件触点消掉这项）")
+        except Exception:
+            pass
+    return True
+
+
 def raw_to_rectified_px(u, v, K, D, P3x3):
     """把点选的 raw 像素去畸变到 rect 像素空间（控制器/单应性用的就是 rect 像素）。
     D≈0 时近似恒等；cv2 不可用时直接返回原值。"""
@@ -219,6 +315,7 @@ class PixelTouchCheck(object):
 
         self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(30.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+        self.fw_enabled = False
         self.board_R, self.board_P = load_board_pose(self.config_path)
         self.pick_H = load_pick_homography(self.config_path) if self.compare_homography else None
         self.pick_z = load_pick_z(self.config_path, 0.0)
@@ -420,7 +517,8 @@ class PixelTouchCheck(object):
 
     def collect_touch_points(self, rows):
         print("\n现在按刚才的 P1..P%d 顺序移动机械臂。" % self.num_points)
-        print("每次让 link_tcp/吸嘴尖对准同一个物理点，按回车记录；s 跳过；q 结束。\n")
+        print("每次让吸嘴尖(link_tcp)对准同一物理点，按回车：同时记录 TF 触点(比深度+手眼)与固件位姿触点(比单应性)。")
+        print("  s 跳过；q 结束。\n")
         out = []
         for row in rows:
             has_depth = bool(row.get("valid_depth")) and ("vision_base_m" in row)
@@ -437,32 +535,46 @@ class PixelTouchCheck(object):
                     row["skipped"] = True
                     out.append(row)
                     break
+                # 触点两把尺子：TF(URDF 系) 比深度+手眼；固件位姿(固件系) 比单应性。
                 try:
-                    p_touch = lookup_point(self.tf_buffer, self.base_frame, self.eef_frame)
+                    p_touch_tf = lookup_point(self.tf_buffer, self.base_frame, self.eef_frame)
                 except Exception as e:
-                    print("  读取 TCP 失败: %s" % e)
+                    print("  读取 TCP(TF) 失败: %s" % e)
                     continue
-                row["touch_base_m"] = [float(v) for v in p_touch]
+                p_touch_fw = get_firmware_touch()
+                fw_used = p_touch_fw is not None
+                if not fw_used:
+                    p_touch_fw = p_touch_tf
+                    if has_hom:
+                        print("  ⚠️ 固件位姿不可用，本点单应性对照回退 TF 触点（会带 URDF↔固件偏差）。")
+
+                row["touch_base_tf_m"] = [float(v) for v in p_touch_tf]
+                row["touch_base_fw_m"] = [float(v) for v in p_touch_fw]
+                row["touch_fw_used"] = bool(fw_used)
                 if self.board_R is not None:
-                    row["touch_board_m"] = [float(v) for v in self.board_R.T.dot(p_touch - self.board_P)]
+                    row["touch_board_tf_m"] = [float(v) for v in self.board_R.T.dot(p_touch_tf - self.board_P)]
+                    row["touch_board_fw_m"] = [float(v) for v in self.board_R.T.dot(p_touch_fw - self.board_P)]
 
                 parts = []
                 if has_depth:
-                    diff = p_touch - np.asarray(row["vision_base_m"], dtype=np.float64)
+                    # 深度+手眼预测在 URDF/TF 系 → 用 TF 触点比。
+                    diff = p_touch_tf - np.asarray(row["vision_base_m"], dtype=np.float64)
                     row["error_m"] = [float(v) for v in diff]
                     row["error_norm_m"] = float(np.linalg.norm(diff))
                     row["error_xy_m"] = float(np.linalg.norm(diff[:2]))
                     if self.board_R is not None:
                         row["error_board_m"] = [float(v) for v in self.board_R.T.dot(diff)]
-                    parts.append("深度+手眼 dx=%+.2f dy=%+.2f dz=%+.2f |xy|=%.2f mm" %
+                    parts.append("深度+手眼[TF] dx=%+.2f dy=%+.2f dz=%+.2f |xy|=%.2f mm" %
                                  (diff[0] * 1000.0, diff[1] * 1000.0, diff[2] * 1000.0,
                                   row["error_xy_m"] * 1000.0))
                 if has_hom:
-                    hdiff = p_touch - np.asarray(row["homography_base_m"], dtype=np.float64)
+                    # 单应性预测在固件系 → 用固件触点比（不可用已回退 TF）。
+                    hdiff = p_touch_fw - np.asarray(row["homography_base_m"], dtype=np.float64)
                     row["homography_error_m"] = [float(v) for v in hdiff]
                     row["homography_error_xy_m"] = float(np.linalg.norm(hdiff[:2]))
-                    parts.append("单应性 dx=%+.2f dy=%+.2f |xy|=%.2f mm" %
-                                 (hdiff[0] * 1000.0, hdiff[1] * 1000.0,
+                    parts.append("单应性[%s] dx=%+.2f dy=%+.2f |xy|=%.2f mm" %
+                                 ("固件" if fw_used else "TF回退",
+                                  hdiff[0] * 1000.0, hdiff[1] * 1000.0,
                                   row["homography_error_xy_m"] * 1000.0))
                 print("  P%d  " % pid + "  |  ".join(parts))
                 out.append(row)
@@ -487,29 +599,53 @@ class PixelTouchCheck(object):
             "max_3d_m": float(np.max(norms)),
         }
 
+    @staticmethod
+    def _fw_tf_offset(rows):
+        """固件触点 - TF 触点 的系统偏差（仅统计真正用到固件位姿的点）= URDF↔固件运动学差。"""
+        pairs = [(r["touch_base_fw_m"], r["touch_base_tf_m"]) for r in rows
+                 if r.get("touch_fw_used") and r.get("touch_base_fw_m") is not None
+                 and r.get("touch_base_tf_m") is not None]
+        if not pairs:
+            return None
+        D = np.asarray([np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64)
+                        for a, b in pairs], dtype=np.float64)
+        return {
+            "count": int(len(pairs)),
+            "mean_m": [float(v) for v in D.mean(axis=0)],
+            "rms_xy_m": float(np.sqrt(np.mean(np.linalg.norm(D[:, :2], axis=1) ** 2))),
+        }
+
     def summarize(self, rows):
         depth_s = self._err_stats(rows, "error_m")
         hom_s = self._err_stats(rows, "homography_error_m")
+        off = self._fw_tf_offset(rows)
         if depth_s is None and hom_s is None:
             print("\n没有有效对比点。")
             return {}
         print("\n========== 误差汇总（以实际 touch 为基准） ==========")
         if depth_s:
-            print("[深度+手眼 ] n=%d  mean dx/dy/dz=%+.2f/%+.2f/%+.2f mm  RMS xy=%.2f mm  MAX xy=%.2f mm" %
+            print("[深度+手眼·TF系 ] n=%d  mean dx/dy/dz=%+.2f/%+.2f/%+.2f mm  RMS xy=%.2f mm  MAX xy=%.2f mm" %
                   (depth_s["count"], depth_s["mean_error_m"][0] * 1000.0,
                    depth_s["mean_error_m"][1] * 1000.0, depth_s["mean_error_m"][2] * 1000.0,
                    depth_s["rms_xy_m"] * 1000.0, depth_s["max_xy_m"] * 1000.0))
         if hom_s:
-            print("[单应性+视差] n=%d  mean dx/dy   =%+.2f/%+.2f mm        RMS xy=%.2f mm  MAX xy=%.2f mm" %
-                  (hom_s["count"], hom_s["mean_error_m"][0] * 1000.0,
+            src = "固件系" if getattr(self, "fw_enabled", False) else "TF回退"
+            print("[单应性+视差·%s] n=%d  mean dx/dy   =%+.2f/%+.2f mm        RMS xy=%.2f mm  MAX xy=%.2f mm" %
+                  (src, hom_s["count"], hom_s["mean_error_m"][0] * 1000.0,
                    hom_s["mean_error_m"][1] * 1000.0,
                    hom_s["rms_xy_m"] * 1000.0, hom_s["max_xy_m"] * 1000.0))
         elif self.compare_homography:
             print("[单应性+视差] 无（缺 PICK_HOMOGRAPHY / BOARD_POSE_BASE？）")
-        print("提示：深度+手眼=感知路径；单应性+视差=控制器运行时真正用的 XY 路径。")
-        print("两者都小→抓偏在执行(move_line/xArm-TCP)；仅单应性大→标定/位姿/视差；都大→相机/手眼。")
+        if off:
+            print("[URDF↔固件偏差] n=%d  mean dx/dy/dz=%+.2f/%+.2f/%+.2f mm  RMS xy=%.2f mm （固件touch - TF touch）" %
+                  (off["count"], off["mean_m"][0] * 1000.0, off["mean_m"][1] * 1000.0,
+                   off["mean_m"][2] * 1000.0, off["rms_xy_m"] * 1000.0))
+        print("提示：单应性+视差(固件系)=控制器运行时真正用的 XY，与标定/move_line 同系→它小=生产抓放准。")
+        print("单应性大→标定/位姿/视差要查；深度+手眼(TF系)只是感知粗核对(本就~cm 级)，两系差见上行。")
         print("===================================================\n")
-        return {"depth_handeye": depth_s, "homography": hom_s}
+        return {"depth_handeye": depth_s, "homography": hom_s,
+                "urdf_vs_firmware_offset": off,
+                "firmware_pose_used": bool(getattr(self, "fw_enabled", False))}
 
     def save(self, rows, summary, K, D):
         if not self.save_path:
@@ -546,6 +682,7 @@ class PixelTouchCheck(object):
 
     def run(self):
         self.wait_ready()
+        self.fw_enabled = setup_firmware_pose(self.tf_buffer, self.base_frame, self.eef_frame)
         if not self.select_pixels():
             print("已取消。")
             return

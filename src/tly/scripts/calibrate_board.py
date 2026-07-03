@@ -125,7 +125,51 @@ def _clear_step3_progress(path):
         pass
 
 
+# ---- 固件上报位姿（xArm 原生 /xarm/xarm_states.pose，单位 mm / rad）----
+# 为什么默认用它替代 ROS TF：URDF 名义运动学与固件【出厂逐台标定】运动学有 ~mm 级差异，
+# 而执行(move_line)走的是固件系。标定若用 ROS TF 记录、控制器用 move_line 执行，就会带一个
+# 系统性偏差（实测本机约 4~5mm）。改成用固件位姿记录 → 记录源=执行源，偏差归零。
+# 前提：固件 TCP 偏置=吸嘴尖(link_tcp)，故 pose[0:3] 即吸嘴尖在固件 base 系坐标。默认【只读+核对】，
+# 不主动改固件 TCP（避免上报位姿跳变+save_conf 覆盖你 UF Studio 的 TCP 配置）。任一时刻固件位姿
+# 不可用则自动回退 ROS TF。
+_FW = {
+    "enabled": False,      # ~use_firmware_pose 主开关
+    "base": "link_base",   # 仅当请求 (parent,child)==(base,eef) 时才用固件位姿
+    "eef": "link_tcp",
+    "pose": None,          # 最新 [x,y,z(mm), roll,pitch,yaw(rad)]
+    "offset": None,        # 固件当前 TCP 偏置 [x,y,z(mm), r,p,y(rad)]（RobotMsg.offset）
+    "stamp": None,
+    "max_age": 0.5,        # s；位姿过旧视为不可用，回退 TF
+}
+
+
+def _fw_state_cb(msg):
+    if len(msg.pose) >= 6:
+        _FW["pose"] = [float(v) for v in msg.pose[:6]]
+        _FW["stamp"] = rospy.Time.now()
+    if len(getattr(msg, "offset", [])) >= 3:
+        _FW["offset"] = [float(v) for v in msg.offset[:6]]
+
+
+def _fw_pose_fresh():
+    """返回新鲜的固件位姿 [x,y,z(mm),r,p,y(rad)]；未启用/过旧/缺失返回 None。"""
+    if not _FW["enabled"] or _FW["pose"] is None or _FW["stamp"] is None:
+        return None
+    if (rospy.Time.now() - _FW["stamp"]).to_sec() > _FW["max_age"]:
+        return None
+    return _FW["pose"]
+
+
+def _fw_use(parent, child):
+    return _FW["enabled"] and parent == _FW["base"] and child == _FW["eef"]
+
+
 def get_eef_pose(tf_buffer, parent="link_base", child="link_eef"):
+    if _fw_use(parent, child):
+        fp = _fw_pose_fresh()
+        if fp is not None:
+            return np.array([fp[0] / 1000.0, fp[1] / 1000.0, fp[2] / 1000.0], dtype=float)
+        rospy.logwarn_throttle(5.0, "固件位姿(/xarm/xarm_states)暂不可用，本点回退 ROS TF 记录。")
     try:
         trans = tf_buffer.lookup_transform(parent, child, rospy.Time(0), rospy.Duration(3.0))
         return np.array([
@@ -140,6 +184,11 @@ def get_eef_pose(tf_buffer, parent="link_base", child="link_eef"):
 
 def get_eef_rotmat(tf_buffer, parent="link_base", child="link_eef"):
     """读 parent<-child 的旋转矩阵(3x3)。失败返回 None。"""
+    if _fw_use(parent, child):
+        fp = _fw_pose_fresh()
+        if fp is not None:
+            return euler_matrix(fp[3], fp[4], fp[5], axes="sxyz")[:3, :3]
+        rospy.logwarn_throttle(5.0, "固件姿态(/xarm/xarm_states)暂不可用，回退 ROS TF。")
     try:
         trans = tf_buffer.lookup_transform(parent, child, rospy.Time(0), rospy.Duration(3.0))
         q = trans.transform.rotation
@@ -147,6 +196,90 @@ def get_eef_rotmat(tf_buffer, parent="link_base", child="link_eef"):
     except Exception as e:
         rospy.logerr("TF 朝向获取失败，请确认机械臂状态: %s", e)
         return None
+
+
+def setup_firmware_pose(tf_buffer, base_frame, eef_frame):
+    """启用"用固件 /xarm/xarm_states.pose 记录触点"（消除 URDF↔固件运动学系统偏差）。
+    【纯被动，不命令机械臂运动】：订阅状态话题 → 等首帧 → 读固件当前 TCP 偏置(RobotMsg.offset)与
+    吸嘴尖(TF link_eef->eef_frame)核对，一致即 pose=吸嘴尖可用、不一致仅提示 → 打印固件位姿 vs ROS TF
+    偏差供核对。仅当 ~set_tcp_offset_for_record:=true(默认 false)才主动设固件 TCP（仍不动臂，但会让上报
+    位姿跳变且 save_conf 持久化）。~use_firmware_pose:=false 可整体关闭退回 TF。任一环节失败不致命：
+    置 enabled=False，全流程自动回退 ROS TF。"""
+    if not bool(rospy.get_param("~use_firmware_pose", True)):
+        print("ℹ️ ~use_firmware_pose=false：仍用 ROS TF 记录触点（URDF 系）。")
+        return
+    try:
+        from xarm_msgs.msg import RobotMsg
+        from xarm_msgs.srv import TCPOffset
+    except Exception as e:
+        print(f"⚠️ 无法导入 xarm_msgs（{e}）；退回 ROS TF 记录。")
+        return
+
+    _FW["base"] = base_frame
+    _FW["eef"] = eef_frame
+    rospy.Subscriber("/xarm/xarm_states", RobotMsg, _fw_state_cb)
+
+    # 先等首帧（拿到 pose + 当前固件 TCP 偏置 offset）。
+    try:
+        rospy.wait_for_message("/xarm/xarm_states", RobotMsg, timeout=6.0)
+    except Exception:
+        print("⚠️ 未收到 /xarm/xarm_states；退回 ROS TF 记录。确认机器人在线、robot_ip 正确。")
+        return
+
+    # 期望的吸嘴尖偏置 = TF(link_eef->eef_frame)。默认【只核对不改】：读固件当前 TCP 偏置与它比对，
+    # 一致则 xarm_states.pose 即吸嘴尖、可直接用；不一致才提示。绝不默认调 set_tcp_offset
+    # （那会让上报位姿跳变，且驱动会 save_conf 覆盖你 UF Studio 的 TCP 配置）。
+    exp = None
+    try:
+        tr = tf_buffer.lookup_transform("link_eef", eef_frame, rospy.Time(0), rospy.Duration(3.0))
+        exp = np.array([tr.transform.translation.x, tr.transform.translation.y,
+                        tr.transform.translation.z]) * 1000.0
+    except Exception as e:
+        print(f"  ⚠️ 读 TF link_eef->{eef_frame} 失败（{e}）；无法核对固件 TCP，请自行确认=吸嘴尖。")
+
+    cur = _FW.get("offset")
+    tcp_ok = False
+    if exp is not None and cur is not None:
+        d = np.array(cur[:3]) - exp
+        if float(np.linalg.norm(d)) <= 1.0:   # 1mm 容差
+            tcp_ok = True
+            print("  ✅ 固件当前 TCP 偏置=({:.2f},{:.2f},{:.2f})mm ≈ 吸嘴尖，xarm_states.pose 即吸嘴尖。"
+                  .format(*cur[:3]))
+        else:
+            print("  ⚠️ 固件当前 TCP 偏置=({:.2f},{:.2f},{:.2f})mm 与吸嘴尖({:.2f},{:.2f},{:.2f})mm 差 {:.2f}mm！"
+                  .format(cur[0], cur[1], cur[2], exp[0], exp[1], exp[2], float(np.linalg.norm(d))))
+            print("     → 请在 UF Studio 选中吸嘴尖那个 TCP，或用 ~set_tcp_offset_for_record:=true 让本工具设置")
+            print("       （注意：set 会让上报位姿跳变、且驱动 save_conf 会持久化覆盖 UF Studio 的 TCP）。")
+
+    # 仅当【显式】要求时才主动设固件 TCP（默认 False）。不会命令机械臂运动，但会改上报位姿+save_conf。
+    if not tcp_ok and exp is not None and bool(rospy.get_param("~set_tcp_offset_for_record", False)):
+        try:
+            rospy.wait_for_service("/xarm/set_tcp_offset", timeout=5.0)
+            set_tcp = rospy.ServiceProxy("/xarm/set_tcp_offset", TCPOffset)
+            resp = set_tcp(float(exp[0]), float(exp[1]), float(exp[2]), 0.0, 0.0, 0.0)
+            if getattr(resp, "ret", 0) != 0:
+                print(f"  ⚠️ set_tcp_offset 返回 ret={resp.ret}；沿用固件内已存工具偏置。")
+            else:
+                print("  已设固件工具偏置(TCP)=({:.2f},{:.2f},{:.2f})mm（不动臂；上报位姿会跳变；已 save_conf 持久化）。"
+                      .format(*exp))
+        except Exception as e:
+            print(f"  ⚠️ 设固件 TCP 失败（{e}）；沿用固件内已存工具偏置。")
+
+    _FW["enabled"] = True
+    fp = _fw_pose_fresh()
+    print("✅ 记录源=固件位姿 /xarm/xarm_states.pose（消除 URDF↔固件运动学偏差；执行 move_line 可精确复现）。")
+    # 启动自检：同一时刻固件位姿 vs ROS TF，打印偏差（即之前 verify 偏 4~5mm 的根源量）。
+    if fp is not None:
+        try:
+            tr = tf_buffer.lookup_transform(base_frame, eef_frame, rospy.Time(0), rospy.Duration(2.0))
+            tfp = np.array([tr.transform.translation.x, tr.transform.translation.y,
+                            tr.transform.translation.z]) * 1000.0
+            d = np.array(fp[:3]) - tfp
+            print("  🔎 固件 vs TF 偏差(mm): dx={:.2f} dy={:.2f} dz={:.2f} | XY={:.2f} mm"
+                  .format(d[0], d[1], d[2], float(np.hypot(d[0], d[1]))))
+            print("     （即 URDF↔固件运动学差；用固件记录后此偏差不再进入标定→执行链路）")
+        except Exception:
+            pass
 
 
 def require_pose(tf_buffer, message, parent="link_base", child="link_eef", allow_undo=False):
@@ -772,8 +905,10 @@ def place_homography_from_clicks(color_img, origin, row_vec, col_vec, rows, cols
     return H
 
 
-def click_pixels(color_img, num_points, title="click points (Left=add Right=undo Enter=ok q=cancel)"):
-    """带放大镜在彩色图上点选 num_points 个像素点。左键加、右键撤销、回车确认、q 取消。返回 [(u,v),...] 或 None。"""
+def click_pixels(color_img, num_points, title="click points (Left=add Right=undo Enter=ok q=cancel)", min_points=None):
+    """带放大镜在彩色图上点选像素点。左键加、右键撤销、回车确认、q 取消。返回 [(u,v),...] 或 None。
+    min_points 为 None：须恰好点 num_points 个才可回车。否则为【可选点数】模式——num_points 作为上限，
+    点够 min_points 个后即可回车结束（用于步骤7单应性：点数可变、仅要求 >=4）。"""
     if cv2 is None:
         return None
     clicks = []
@@ -826,11 +961,14 @@ def click_pixels(color_img, num_points, title="click points (Left=add Right=undo
             if ox > 0 and zh + 10 < disp.shape[0]:
                 disp[10:10 + zh, ox:ox + zw] = z
                 cv2.rectangle(disp, (ox, 10), (ox + zw, 10 + zh), (0, 255, 0), 2)
-        cv2.putText(disp, f"{len(clicks)}/{num_points}  Left=add Right=undo i=type(u,v) Enter=ok q=cancel",
+        hud = (f"{len(clicks)} pts (min {min_points} max {num_points})" if min_points is not None
+               else f"{len(clicks)}/{num_points}")
+        cv2.putText(disp, hud + "  Left=add Right=undo i=type(u,v) Enter=ok q=cancel",
                     (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.imshow(title, disp)
         k = cv2.waitKey(30) & 0xFF
-        if k in (13, 10) and len(clicks) == num_points:
+        enough = (len(clicks) >= min_points) if min_points is not None else (len(clicks) == num_points)
+        if k in (13, 10) and enough:
             break
         if k == ord("q"):
             cv2.destroyWindow(title)
@@ -1580,6 +1718,10 @@ def main():
         print(tf_buffer.all_frames_as_string())
         sys.exit(1)
 
+    # 触点记录源：默认改用固件 /xarm/xarm_states.pose（消除 URDF↔固件运动学系统偏差）。
+    # 对所有走 require_pose 的模式生效（步骤1/3/5/6/7、depth_offset_check、edit_cells）。
+    setup_firmware_pose(tf_buffer, base_frame, eef_frame)
+
     config_path = rospy.get_param("~config_path", DEFAULT_CONFIG_PATH)
     block_samples = int(rospy.get_param("~block_samples", 3))
 
@@ -2308,7 +2450,10 @@ def main():
     # ⚠️ 单应性绑定相机【拍照位姿】——标定时相机摆在生产视觉那个机位；改坐标系(步骤3)后必须重标本步。
     if 7 in run:
         print("\n--- 步骤 7：抓取单应性标定 (发光板 pixel->board-XY → PICK_HOMOGRAPHY) ---")
-        nph = int(rospy.get_param("~pick_homography_points", 9))
+        # 点数可变：max_ph 为上限，min_ph 为下限；findHomography 至少要 4 点，故 min_ph 强制 >=4。
+        max_ph = int(rospy.get_param("~pick_homography_points", 9))
+        min_ph = max(4, int(rospy.get_param("~pick_homography_min_points", 4)))
+        max_ph = max(min_ph, max_ph)
         rect_topic = rospy.get_param("~rect_color_topic", "/camera/color/image_rect_color")
         if cv2 is None:
             print("  ⚠️ cv2 不可用，跳过步骤7。")
@@ -2324,8 +2469,8 @@ def main():
                 tool_R_base = get_eef_rotmat(tf_buffer, base_frame, eef_frame)
                 if tool_R_base is None:
                     print("  ⚠️ 读取初始点工具朝向失败，本次将不写 PICK_TOOL_RPY_BOARD。")
-                print(f"  在【发光板/标定纸】上点选 {nph} 个黑点(带放大镜)。")
-                clicks = click_pixels(img, nph, "pick homography: click black dots (zoom)")
+                print(f"  在【发光板/标定纸】上点选黑点(带放大镜)：点数可变，至少 {min_ph} 个、至多 {max_ph} 个，点够后回车结束。")
+                clicks = click_pixels(img, max_ph, "pick homography: click black dots (zoom)", min_points=min_ph)
                 if not clicks:
                     print("  已取消，跳过步骤7。")
                 else:

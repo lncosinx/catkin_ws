@@ -28,6 +28,9 @@ find_package(catkin REQUIRED COMPONENTS
 # 建议修改为显式查找 dnn 模块
 find_package(OpenCV REQUIRED COMPONENTS core imgproc dnn)
 
+# 线程库：path_planner_node 用 std::async 并行评估多候选计划
+find_package(Threads REQUIRED)
+
 # /motion_cmds 消息：路径节点 -> 控制节点 (base 系抓放位姿队列)
 add_message_files(
   FILES
@@ -106,8 +109,9 @@ target_link_libraries(vision_processor_node_dexined
 # 发布 /motion_cmds (base 系抓放位姿队列) 供控制节点执行。
 # =========================================================
 add_executable(path_planner_node src/path_planner_node.cpp)
-add_dependencies(path_planner_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+add_dependencies(path_planner_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS} xarm_msgs_gencpp)
 target_link_libraries(path_planner_node
   ${catkin_LIBRARIES}
   ${OpenCV_LIBRARIES}
+  Threads::Threads
 )

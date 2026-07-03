@@ -1,5 +1,5 @@
 <launch>
-    <arg name="robot_ip" default="192.168.1.228" />
+    <arg name="robot_ip" default="192.168.1.216" />
 
     <!-- 板面法向/放置面由对齐深度采集（替代旧触点）。空 board_roi=首次交互框选并存盘复用 -->
     <arg name="board_capture_frames" default="50" />
@@ -41,6 +41,14 @@
     <!-- 白板标定模式：A=9点，B=25点，C=140点。白板翘曲明显建议 C -->
     <arg name="board_mode" default="A" />
 
+    <!-- 触点记录源：true=用固件 /xarm/xarm_states.pose 记录（记录源=执行源，消除 URDF 名义运动学与
+         固件出厂标定运动学之间的 ~4-5mm 系统偏差；move_line 可精确复现）；false=用 ROS TF（URDF 系）。
+         该过程纯被动、不命令机械臂运动。默认只【读+核对】固件当前 TCP 偏置是否=吸嘴尖(link_tcp)。 -->
+    <arg name="use_firmware_pose" default="true" />
+    <!-- 仅当固件 TCP 不是吸嘴尖、又懒得去 UF Studio 改时才设 true：本工具会 set_tcp_offset(仍不动臂，
+         但会让上报位姿跳变、且驱动 save_conf 会持久化覆盖 UF Studio 的 TCP)。默认 false=绝不主动改。 -->
+    <arg name="set_tcp_offset_for_record" default="false" />
+
     <!-- 白板高度插值：C 模式建议 idw；A/B 可用 quadratic 或 idw -->
     <arg name="height_interpolation" default="idw" />
 
@@ -74,7 +82,7 @@
 
     <!-- 【核心新增】：在空间点标定阶段，也必须发布精确的吸盘 TCP 坐标系！ -->
     <node pkg="tf2_ros" type="static_transform_publisher" name="suction_tcp_broadcaster"
-          args="0.0007 -0.00027 0.06706 0 0 0 link6 link_tcp" />
+          args="0.00075 0.0004 0.068 0 0 0 link6 link_tcp" />
 
     <!-- 2. 启动 RealSense，相机内参来自 /camera/color/camera_info（滤波与手眼标定时一致） -->
     <arg name="depth_filters" default="spatial,temporal,hole_filling" />
@@ -100,7 +108,11 @@
         
         <!-- 【核心修改】：让 Python 工具读取真实的吸盘尖端，而不是法兰盘 -->
         <param name="eef_frame" value="link_tcp" />
-        
+
+        <!-- 触点记录源（固件位姿 vs ROS TF），见上文 arg 说明 -->
+        <param name="use_firmware_pose" value="$(arg use_firmware_pose)" />
+        <param name="set_tcp_offset_for_record" value="$(arg set_tcp_offset_for_record)" />
+
         <param name="config_path" value="$(arg config_path)" />
 
         <param name="depth_offset_check" value="$(arg depth_offset_check)" />
@@ -146,9 +158,10 @@
         <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw" />
         <param name="color_topic" value="/camera/color/image_raw" />
 
-        <!-- 步骤7 抓取单应性：整流彩色图 + 点数 -->
+        <!-- 步骤7 抓取单应性：整流彩色图 + 点数（可变，至少 min 个、至多 points 个；min 强制 >=4） -->
         <param name="rect_color_topic" value="/camera/color/image_rect_color" />
-        <param name="pick_homography_points" value="9" />
+        <param name="pick_homography_points" value="4" />
+        <param name="pick_homography_min_points" value="4" />
 
         <param name="block_samples" value="3" />
     </node>

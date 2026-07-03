@@ -16,6 +16,10 @@ using namespace std;
 // ROS 节点逻辑
 // ==============================================================================
 ros::Publisher plan_pub;
+ros::Publisher candidates_pub; // 同分多候选集 (/tetris_plan_candidates)
+std::string plan_candidates_topic = "/tetris_plan_candidates";
+// 非进阶任务：策略节点保留的同分最优候选布局数（>1 时交规划节点按运动代价择优）。
+int num_strategy_candidates = 8;
 bool is_planning = false;
 bool is_robot_busy = false;
 bool task_completed = false;
@@ -54,6 +58,219 @@ struct BlockInfo
     int geom_u = 0, geom_v = 0; // 几何中心，用于控制节点补偿 hybrid 吸点偏移
     bool has_geom = false;
 }; // 统一存放每个积木的物理属性
+
+// 把若干份 17-int 计划打包成候选集消息并发布: [K, len0, plan0..., len1, plan1...]。
+static void publishCandidateSet(ros::Publisher &pub,
+                                const vector<std_msgs::Int32MultiArray> &plans)
+{
+    std_msgs::Int32MultiArray msg;
+    msg.data.push_back((int)plans.size());
+    for (const auto &p : plans)
+    {
+        msg.data.push_back((int)p.data.size());
+        msg.data.insert(msg.data.end(), p.data.begin(), p.data.end());
+    }
+    pub.publish(msg);
+}
+
+// 由一个候选解(行索引序列) + 其 action 表 + 棋盘 + 库存，构建一份 17-int 抓放计划：
+// 复刻原单解流程(提取放置 + 补余块填充 + 放置依赖拓扑排序 + 扁平打包)。
+// available_blocks 为按形状分组的视觉散块，函数内部拷贝后 pop_back，不影响调用方；
+// 多个候选因此可各自独立回填抓取像素。verbose 仅对首选候选打印逐块日志，避免刷屏。
+static bool buildPlanMsgFromSolution(const vector<int> &solution,
+                                     const vector<Action> &actions,
+                                     const int board[14][10],
+                                     const vector<int> &inventory,
+                                     const vector<BlockInfo> available_blocks[7],
+                                     std_msgs::Int32MultiArray &plan_msg,
+                                     bool verbose)
+{
+    vector<BlockInfo> avail[7];
+    for (int s = 0; s < 7; ++s)
+        avail[s] = available_blocks[s];
+
+    vector<Action> final_actions;
+    int used_count[7] = {0};
+    for (int r : solution)
+    {
+        if (actions[r].rot_idx == -1)
+            continue;
+        final_actions.push_back(actions[r]);
+        used_count[actions[r].shape_type]++;
+    }
+
+    int board_piece[14][10];
+    for (int i = 0; i < 14; ++i)
+        for (int j = 0; j < 10; ++j)
+            board_piece[i][j] = board[i][j] > 0 ? -2 : -1;
+    for (const auto &act : final_actions)
+        for (auto pt : act.absolute_coords)
+            board_piece[pt.x][pt.y] = act.piece_id;
+
+    int next_piece_id = 100;
+    for (int type = 0; type < 7; ++type)
+    {
+        int leftover = inventory[type] - used_count[type];
+        for (int k = 0; k < leftover; ++k)
+        {
+            auto unique_rots = getUniqueRotations(BASE_SHAPES[type]);
+            bool placed = false;
+            for (int r = 13; r >= 0 && !placed; --r)
+                for (int c = 0; c < 10 && !placed; ++c)
+                    for (int rot_idx = 0; rot_idx < unique_rots.size() && !placed; ++rot_idx)
+                    {
+                        auto &variant = unique_rots[rot_idx];
+                        auto &shape = variant.coords;
+                        bool valid = true, fully_supported = true;
+                        vector<Point> abs_coords;
+                        for (auto &p : shape)
+                        {
+                            int nr = r + p.y, nc = c + p.x;
+                            if (nr < 0 || nr >= 14 || nc < 0 || nc >= 10 || board_piece[nr][nc] != -1)
+                            {
+                                valid = false;
+                                break;
+                            }
+                            if (nr < 13 && board_piece[nr + 1][nc] == -1)
+                                fully_supported = false;
+                            abs_coords.push_back({nr, nc});
+                        }
+                        if (valid && fully_supported)
+                        {
+                            Action act = {next_piece_id++, type, rot_idx, variant.real_way, r, c, abs_coords};
+                            final_actions.push_back(act);
+                            for (auto &pt : abs_coords)
+                                board_piece[pt.x][pt.y] = act.piece_id;
+                            placed = true;
+                        }
+                    }
+        }
+    }
+
+    vector<int> adj[200];
+    int in_degree[200] = {0};
+    for (int r = 0; r < 13; ++r)
+        for (int c = 0; c < 10; ++c)
+        {
+            int curr = board_piece[r][c];
+            int below = board_piece[r + 1][c];
+            if (curr >= 0 && below >= 0 && curr != below)
+            {
+                bool exist = false;
+                for (int t : adj[below])
+                    if (t == curr)
+                        exist = true;
+                if (!exist)
+                {
+                    adj[below].push_back(curr);
+                    in_degree[curr]++;
+                }
+            }
+        }
+
+    int p_bottom[200] = {0};
+    int p_left[200] = {0};
+    for (const auto &act : final_actions)
+    {
+        int pid = act.piece_id;
+        int max_r = -1;
+        int min_c = 999;
+        for (auto &pt : act.absolute_coords)
+        {
+            if (pt.x > max_r)
+                max_r = pt.x;
+            if (pt.y < min_c)
+                min_c = pt.y;
+        }
+        p_bottom[pid] = max_r;
+        p_left[pid] = min_c;
+    }
+
+    auto cmp = [&](int a, int b)
+    {
+        if (p_bottom[a] != p_bottom[b])
+            return p_bottom[a] < p_bottom[b];
+        return p_left[a] > p_left[b];
+    };
+
+    priority_queue<int, vector<int>, decltype(cmp)> pq(cmp);
+    for (const auto &act : final_actions)
+        if (in_degree[act.piece_id] == 0)
+            pq.push(act.piece_id);
+
+    vector<int> seq;
+    while (!pq.empty())
+    {
+        int u = pq.top();
+        pq.pop();
+        seq.push_back(u);
+        for (int v : adj[u])
+            if (--in_degree[v] == 0)
+                pq.push(v);
+    }
+
+    if (seq.empty())
+        return false;
+
+    static const char *SHAPE_NAMES[] = {
+        "linear_red", "grid_orange", "T_shape_brown",
+        "L_left_purple", "L_right_yellow", "Z_left_blue", "Z_right_green"};
+
+    plan_msg.data.clear();
+    plan_msg.data.push_back(seq.size()); // 每个动作使用扩展 17-int 格式
+
+    for (size_t i = 0; i < seq.size(); ++i)
+    {
+        for (const auto &act : final_actions)
+        {
+            if (act.piece_id != seq[i])
+                continue;
+            int pu = 0, pv = 0, p_ang = 0, geom_u = 0, geom_v = 0;
+            bool has_geom = false;
+            if (!avail[act.shape_type].empty())
+            {
+                BlockInfo b = avail[act.shape_type].back();
+                pu = b.u;
+                pv = b.v;
+                p_ang = b.ang;
+                geom_u = b.geom_u;
+                geom_v = b.geom_v;
+                has_geom = b.has_geom;
+                avail[act.shape_type].pop_back();
+            }
+
+            int sum_r = 0, sum_c = 0;
+            for (auto &pt : act.absolute_coords)
+            {
+                sum_r += pt.x;
+                sum_c += pt.y;
+            }
+
+            plan_msg.data.push_back(act.shape_type);
+            plan_msg.data.push_back(act.real_way);
+            plan_msg.data.push_back(sum_r);
+            plan_msg.data.push_back(sum_c);
+            plan_msg.data.push_back(pu);
+            plan_msg.data.push_back(pv);
+            plan_msg.data.push_back(p_ang);
+            plan_msg.data.push_back(geom_u);
+            plan_msg.data.push_back(geom_v);
+            for (auto &pt : act.absolute_coords)
+            {
+                plan_msg.data.push_back(pt.x); // row
+                plan_msg.data.push_back(pt.y); // col
+            }
+
+            if (verbose)
+                ROS_INFO("action [%2zu/%lu]: select block => %-18s | center=(%.2f, %.2f) | rotation => %3d degree | pick=(%d,%d,%d) geom=(%d,%d) has_geom=%s",
+                         i + 1, seq.size(), SHAPE_NAMES[act.shape_type],
+                         sum_r / 4.0, sum_c / 4.0, act.real_way * 90, pu, pv, p_ang,
+                         geom_u, geom_v, has_geom ? "true" : "false");
+            break;
+        }
+    }
+    return true;
+}
 
 void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
 {
@@ -276,6 +493,8 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
         }
         ROS_INFO("===============================================================");
         plan_pub.publish(plan_msg);
+        // 进阶模式只有一个确定解：以单候选集形式同时发往候选话题，供规划节点统一消费。
+        publishCandidateSet(candidates_pub, {plan_msg});
         ROS_INFO("[ADVANCED][SUCCESS] score=%d! Sent %lu blocks to execution.", res.score, res.placements.size());
         task_completed = true;
         is_planning = false;
@@ -301,7 +520,7 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
 
     int global_best_score = -1;
     vector<Action> global_best_actions;
-    vector<int> global_best_solution;
+    vector<vector<int>> global_best_candidates; // 同分最优的多个布局(去重)，交规划节点按运动代价择优
     PlanConfig optimal_plan;
 
     for (const auto &plan : plans)
@@ -316,16 +535,17 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
         for (int i = 0; i < eval_limit; ++i)
         {
             vector<Action> temp_actions;
-            vector<int> temp_sol;
+            vector<vector<int>> temp_cands;
             int current_score = 0;
 
-            if (solveForMask(plan, valid_subs[i], current_board, temp_actions, temp_sol, current_score))
+            if (solveForMaskMulti(plan, valid_subs[i], current_board, temp_actions, temp_cands,
+                                  current_score, num_strategy_candidates))
             {
                 if (current_score > global_best_score)
                 {
                     global_best_score = current_score;
                     global_best_actions = temp_actions;
-                    global_best_solution = temp_sol;
+                    global_best_candidates = temp_cands;
                     optimal_plan = plan;
                     if (global_best_score >= plan.max_possible_score)
                         break;
@@ -334,220 +554,44 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
         }
         if (global_best_score != -1)
         {
-            ROS_INFO("Strategic Lock-on! Successfully found the perfect solution with a score of %d points.", global_best_score);
+            ROS_INFO("Strategic Lock-on! score=%d with %lu candidate layout(s).",
+                     global_best_score, global_best_candidates.size());
             break;
         }
     }
 
     if (global_best_score != -1)
     {
-        vector<Action> final_actions;
-        int used_count[7] = {0};
-        for (int r : global_best_solution)
+        // 为每个同分候选布局各打一份 17-int 计划(独立回填抓取像素)。
+        ROS_INFO("====== Packing %lu candidate plan(s) for path planner ======",
+                 global_best_candidates.size());
+        vector<std_msgs::Int32MultiArray> plan_msgs;
+        plan_msgs.reserve(global_best_candidates.size());
+        for (size_t ci = 0; ci < global_best_candidates.size(); ++ci)
         {
-            if (global_best_actions[r].rot_idx == -1)
-                continue;
-            final_actions.push_back(global_best_actions[r]);
-            used_count[global_best_actions[r].shape_type]++;
+            std_msgs::Int32MultiArray pm;
+            if (buildPlanMsgFromSolution(global_best_candidates[ci], global_best_actions, current_board,
+                                         current_inventory, available_blocks, pm, /*verbose=*/(ci == 0)))
+                plan_msgs.push_back(std::move(pm));
         }
 
-        int board_piece[14][10];
-        for (int i = 0; i < 14; ++i)
-            for (int j = 0; j < 10; ++j)
-                board_piece[i][j] = current_board[i][j] > 0 ? -2 : -1;
-        for (const auto &act : final_actions)
+        if (plan_msgs.empty())
         {
-            for (auto pt : act.absolute_coords)
-                board_piece[pt.x][pt.y] = act.piece_id;
+            ROS_WARN("Failed to pack any candidate plan from %lu solution(s).",
+                     global_best_candidates.size());
+            is_planning = false;
+            return;
         }
 
-        int next_piece_id = 100;
-        for (int type = 0; type < 7; ++type)
-        {
-            int leftover = current_inventory[type] - used_count[type];
-            for (int k = 0; k < leftover; ++k)
-            {
-                auto unique_rots = getUniqueRotations(BASE_SHAPES[type]);
-                bool placed = false;
-                for (int r = 13; r >= 0 && !placed; --r)
-                {
-                    for (int c = 0; c < 10 && !placed; ++c)
-                    {
-                        for (int rot_idx = 0; rot_idx < unique_rots.size() && !placed; ++rot_idx)
-                        {
-                            auto &variant = unique_rots[rot_idx];
-                            auto &shape = variant.coords;
-                            bool valid = true, fully_supported = true;
-                            vector<Point> abs_coords;
-                            for (auto &p : shape)
-                            {
-                                int nr = r + p.y, nc = c + p.x;
-                                if (nr < 0 || nr >= 14 || nc < 0 || nc >= 10 || board_piece[nr][nc] != -1)
-                                {
-                                    valid = false;
-                                    break;
-                                }
-                                if (nr < 13 && board_piece[nr + 1][nc] == -1)
-                                    fully_supported = false;
-                                abs_coords.push_back({nr, nc});
-                            }
-                            if (valid && fully_supported)
-                            {
-                                Action act = {next_piece_id++, type, rot_idx, variant.real_way, r, c, abs_coords};
-                                final_actions.push_back(act);
-                                for (auto &pt : abs_coords)
-                                    board_piece[pt.x][pt.y] = act.piece_id;
-                                placed = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        vector<int> adj[200];
-        int in_degree[200] = {0};
-        for (int r = 0; r < 13; ++r)
-        {
-            for (int c = 0; c < 10; ++c)
-            {
-                int curr = board_piece[r][c];
-                int below = board_piece[r + 1][c];
-                if (curr >= 0 && below >= 0 && curr != below)
-                {
-                    bool exist = false;
-                    for (int t : adj[below])
-                        if (t == curr)
-                            exist = true;
-                    if (!exist)
-                    {
-                        adj[below].push_back(curr);
-                        in_degree[curr]++;
-                    }
-                }
-            }
-        }
-
-        int p_bottom[200] = {0};
-        int p_left[200] = {0};
-        for (const auto &act : final_actions)
-        {
-            int pid = act.piece_id;
-            int max_r = -1;
-            int min_c = 999;
-            for (auto &pt : act.absolute_coords)
-            {
-                if (pt.x > max_r)
-                    max_r = pt.x;
-                if (pt.y < min_c)
-                    min_c = pt.y;
-            }
-            p_bottom[pid] = max_r;
-            p_left[pid] = min_c;
-        }
-
-        auto cmp = [&](int a, int b)
-        {
-            if (p_bottom[a] != p_bottom[b])
-                return p_bottom[a] < p_bottom[b];
-            return p_left[a] > p_left[b];
-        };
-
-        priority_queue<int, vector<int>, decltype(cmp)> pq(cmp);
-        for (const auto &act : final_actions)
-        {
-            int pid = act.piece_id;
-            if (in_degree[pid] == 0)
-                pq.push(pid);
-        }
-
-        vector<int> seq;
-        while (!pq.empty())
-        {
-            int u = pq.top();
-            pq.pop();
-            seq.push_back(u);
-            for (int v : adj[u])
-                if (--in_degree[v] == 0)
-                    pq.push(v);
-        }
-
-        std_msgs::Int32MultiArray plan_msg;
-        plan_msg.data.push_back(seq.size()); // 每个动作使用扩展 17-int 格式
-
-        const char *SHAPE_NAMES[] = {
-            "linear_red", "grid_orange", "T_shape_brown",
-            "L_left_purple", "L_right_yellow", "Z_left_blue", "Z_right_green"};
-
-        ROS_INFO("====== Starting output of detailed pick-and-place sequence ======");
-        for (int i = 0; i < seq.size(); ++i)
-        {
-            for (const auto &act : final_actions)
-            {
-                if (act.piece_id == seq[i])
-                {
-                    int pu = 0, pv = 0, p_ang = 0, geom_u = 0, geom_v = 0;
-                    bool has_geom = false;
-                    if (!available_blocks[act.shape_type].empty())
-                    {
-                        BlockInfo b = available_blocks[act.shape_type].back();
-                        pu = b.u;
-                        pv = b.v;
-                        p_ang = b.ang;
-                        geom_u = b.geom_u;
-                        geom_v = b.geom_v;
-                        has_geom = b.has_geom;
-                        available_blocks[act.shape_type].pop_back();
-                    }
-                    else
-                    {
-                        ROS_WARN("No pixel coordinate found for shape %d! Using 0,0.", act.shape_type);
-                    }
-
-                    // 替换为求 4 个积木坐标的绝对总和：
-                    int sum_r = 0, sum_c = 0;
-                    for (auto &pt : act.absolute_coords)
-                    {
-                        sum_r += pt.x;
-                        sum_c += pt.y;
-                    }
-
-                    // 扩展版发送格式：每个动作 17 个整数
-                    // [shape, way, sum_r, sum_c, pick_u, pick_v, pick_angle, geom_u, geom_v,
-                    //  cell0_r, cell0_c, cell1_r, cell1_c, cell2_r, cell2_c, cell3_r, cell3_c]
-                    // pick_u/v 用于吸取；geom_u/v 用于控制节点补偿 hybrid 吸点偏离几何中心造成的放置平移误差。
-                    plan_msg.data.push_back(act.shape_type);
-                    plan_msg.data.push_back(act.real_way);
-                    plan_msg.data.push_back(sum_r);
-                    plan_msg.data.push_back(sum_c);
-                    plan_msg.data.push_back(pu);
-                    plan_msg.data.push_back(pv);
-                    plan_msg.data.push_back(p_ang);
-                    plan_msg.data.push_back(geom_u);
-                    plan_msg.data.push_back(geom_v);
-
-                    std::string cell_str;
-                    for (auto &pt : act.absolute_coords)
-                    {
-                        plan_msg.data.push_back(pt.x); // row
-                        plan_msg.data.push_back(pt.y); // col
-
-                        char buf[32];
-                        snprintf(buf, sizeof(buf), "(%d,%d) ", pt.x, pt.y);
-                        cell_str += buf;
-                    }
-
-                    ROS_INFO("action [%2d/%lu]: select block => %-18s | cells => %s| center=(%.2f, %.2f) | rotation => %3d degree | pick=(%d,%d,%d) geom=(%d,%d) has_geom=%s",
-                             i + 1, seq.size(), SHAPE_NAMES[act.shape_type], cell_str.c_str(),
-                             sum_r / 4.0, sum_c / 4.0, act.real_way * 90, pu, pv, p_ang,
-                             geom_u, geom_v, has_geom ? "true" : "false");
-                    break;
-                }
-            }
-        }
         ROS_INFO("===============================================================");
-        plan_pub.publish(plan_msg);
-        ROS_INFO("[SUCCESS] Max Score Achieved: %d points! Sent %lu blocks to execution.", global_best_score, seq.size());
+        // 1) 向后兼容：/tetris_plan 仍发最优(首个)候选，供 test_path/test_controller 单解流程使用。
+        plan_pub.publish(plan_msgs.front());
+        // 2) 候选集：/tetris_plan_candidates 帧格式 [K, len0, plan0..., len1, plan1...]，
+        //    规划节点对每个候选求关节代价后取最小者执行。
+        publishCandidateSet(candidates_pub, plan_msgs);
+        ROS_INFO("[SUCCESS] Max Score=%d. Published %lu candidate plan(s); first has %d task(s).",
+                 global_best_score, plan_msgs.size(),
+                 plan_msgs.front().data.empty() ? 0 : plan_msgs.front().data[0]);
         task_completed = true;
         is_planning = false;
     }
@@ -570,6 +614,12 @@ int main(int argc, char **argv)
     pnh.param("inventory_stable_required_frames", inventory_stable_required_frames, inventory_stable_required_frames);
     pnh.param("min_usable_stable_required_frames", min_usable_stable_required_frames, min_usable_stable_required_frames);
 
+    // 非进阶任务：同分最优候选数（>1 时由规划节点按运动代价择优）。
+    pnh.param("num_strategy_candidates", num_strategy_candidates, num_strategy_candidates);
+    if (num_strategy_candidates < 1)
+        num_strategy_candidates = 1;
+    pnh.param("plan_candidates_topic", plan_candidates_topic, plan_candidates_topic);
+
     pnh.param("advanced_mode", advanced_mode, advanced_mode);
     pnh.param("seq_cyclic", seq_cyclic, seq_cyclic);
     pnh.param("seq_require_support", seq_require_support, seq_require_support);
@@ -581,6 +631,9 @@ int main(int argc, char **argv)
                  (int)seq_reward_four_colors);
 
     plan_pub = nh.advertise<std_msgs::Int32MultiArray>("/tetris_plan", 10, true);
+    candidates_pub = nh.advertise<std_msgs::Int32MultiArray>(plan_candidates_topic, 10, true);
+    ROS_INFO("[STRATEGY] num_strategy_candidates=%d, candidates topic='%s'",
+             num_strategy_candidates, plan_candidates_topic.c_str());
 
     // 【核心修复3】：把订阅频道改回正确的 /vision/board_state ！！！
     ros::Subscriber vision_sub = nh.subscribe("/vision/board_state", 1, visionCallback);

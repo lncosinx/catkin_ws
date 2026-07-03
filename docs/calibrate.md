@@ -19,7 +19,7 @@
 | 阶段 | 工具 launch | 产物 | 何时重跑 |
 |------|-------------|------|----------|
 | 1. 相机内参验证（可选自检） | `verify_camera.launch` | 仅打印/校验，不写盘 | 换相机或怀疑内参时 |
-| 2. 手眼标定 | `xarm_calibration_setup_moveit.launch`（自动采样，推荐）或 `xarm_calibration_setup.launch`（手动 freehand） | `xarm6_realsense_calibration_eye_on_hand`（base↔camera） | 换相机/重装相机支架/移动相机后 |
+| 2. 手眼标定 | `xarm_calibration_setup_moveit.launch`（自动采样，不推荐）或 `xarm_calibration_setup.launch`（手动 freehand） | `xarm6_realsense_calibration_eye_on_hand`（base↔camera） | 换相机/重装相机支架/移动相机后 |
 | 3. 白板标定（含抓取单应性） | `calibrate_tool.launch` → `calibrate_board.py`（7 步） | `BOARD_POSE_BASE`、网格几何、放置 Z 图、`PICK_HOMOGRAPHY` 等 | 手眼变了、白板/发光板移动后 |
 | 辅助 | `align_tool.launch` | 吸嘴对齐/手眼漂移诊断 | 怀疑吸嘴轴与板面不垂直时 |
 

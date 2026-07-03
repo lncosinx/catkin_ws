@@ -1,7 +1,7 @@
 <launch>
-    <arg name="robot_ip" default="192.168.1.228" />
-    <arg name="num_points" default="9" />
-    <arg name="capture_frames" default="30" />
+    <arg name="robot_ip" default="192.168.1.216" />
+    <arg name="num_points" default="4" />
+    <arg name="capture_frames" default="50" />
     <arg name="sample_win_half" default="4" />
     <arg name="sample_min_valid" default="8" />
     <arg name="save_path" default="" />
@@ -10,6 +10,9 @@
          预测同一点并各自与 touch 比对，定位抓偏到底出在感知还是单应性/视差/执行。 -->
     <arg name="compare_homography" default="true" />
     <arg name="use_parallax" default="true" />
+    <!-- 单应性对照的 touch 用固件 /xarm/xarm_states.pose 记录（与 calibrate_board / move_line 同系，
+         消除 URDF↔固件运动学 ~4-5mm 系统差）。false 则退回 ROS TF（URDF 系）。深度+手眼那条恒用 TF。 -->
+    <arg name="use_firmware_pose" default="true" />
 
     <!-- Keep this launch's TF chain identical to calibrate_tool.launch. -->
     <include file="$(find xarm6_moveit_config)/launch/realMove_exec.launch">
@@ -17,7 +20,7 @@
     </include>
 
     <node pkg="tf2_ros" type="static_transform_publisher" name="suction_tcp_broadcaster"
-          args="0.0007 -0.00027 0.06706 0 0 0 link6 link_tcp" />
+          args="0.00075 0.0004 0.068 0 0 0 link6 link_tcp" />
 
     <include file="$(find realsense2_camera)/launch/rs_camera.launch">
         <arg name="align_depth" value="true" />
@@ -45,5 +48,6 @@
         <param name="save_path" value="$(arg save_path)" />
         <param name="compare_homography" value="$(arg compare_homography)" />
         <param name="use_parallax" value="$(arg use_parallax)" />
+        <param name="use_firmware_pose" value="$(arg use_firmware_pose)" />
     </node>
 </launch>

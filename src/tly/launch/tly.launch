@@ -10,6 +10,9 @@
     <arg name="vision_node" default="vision_processor_node_dexined" />
     <!-- 进阶任务模式: true 则策略按 shape_sequence 求解(详见 strategy_node) -->
     <arg name="advanced_mode" default="false" />
+    <!-- 非进阶任务: 策略节点保留的同分最优候选布局数(>1 时由 path_planner 按关节运动代价择优)。
+         1=旧行为(单解直发)。 roslaunch tly tly.launch num_candidates:=10 -->
+    <arg name="num_candidates" default="8" />
     <param name="robot_description" command="$(find xacro)/xacro --inorder '$(find xarm_description)/urdf/xarm_device.urdf.xacro' robot_type:=xarm dof:=6 add_gripper:=false" />
 
     <!-- =========================
@@ -172,7 +175,7 @@
          本节点不加载任何标定、不做坐标/腕部计算；几何/标定/深度全部由 path_planner 负责。 -->
     <param name="plan_topic" value="/motion_cmds" />
 
-    <param name="verify_native_xyz_after_motion" value="true" />
+    <param name="verify_native_xyz_after_motion" value="false" />
     <param name="native_xyz_tolerance_mm" value="6.0" />
     <!-- 到位校验：轮询等"运动后的新鲜上报"进入容差，取代固定 sleep -->
     <param name="native_verify_timeout_s" value="1.0" />
@@ -180,18 +183,18 @@
 
     <!-- Speed: first test must be slow -->
     <!-- 保守 -->
-    <param name="transit_speed_mm_s" value="100.0" />
-    <param name="transit_acc_mm_s2" value="5000.0" />
-    <param name="loaded_transit_speed_mm_s" value="100.0" />
-    <param name="loaded_transit_acc_mm_s2" value="5000.0" />
-    <param name="pick_down_speed_mm_s" value="100" />
-    <param name="pick_down_acc_mm_s2" value="5000" />
-    <param name="place_down_speed_mm_s" value="100" />
-    <param name="place_down_acc_mm_s2" value="5000" />
-    <param name="lift_speed_mm_s" value="100" />
-    <param name="lift_acc_mm_s2" value="5000" />
+    <param name="transit_speed_mm_s" value="200.0" />
+    <param name="transit_acc_mm_s2" value="1000.0" />
+    <param name="loaded_transit_speed_mm_s" value="200.0" />
+    <param name="loaded_transit_acc_mm_s2" value="1000.0" />
+    <param name="pick_down_speed_mm_s" value="200" />
+    <param name="pick_down_acc_mm_s2" value="1000" />
+    <param name="place_down_speed_mm_s" value="200" />
+    <param name="place_down_acc_mm_s2" value="1000" />
+    <param name="lift_speed_mm_s" value="200" />
+    <param name="lift_acc_mm_s2" value="1000" />
 
-    <param name="enable_place_shake" value="false" />
+    <param name="enable_place_shake" value="true" />
     <param name="place_shake_cycles" value="1" />
     <param name="place_shake_dx_m" value="0.005" />
     <param name="place_shake_dy_m" value="0.005" />
@@ -298,6 +301,12 @@
              false=保持策略节点顺序(比赛若有方块相邻等 DAG 外约束)，仅选代价最小的同形状块+翻转。 -->
         <param name="allow_reorder" value="true" />
         <param name="plan_topic" value="/tetris_plan" />
+        <!-- 多候选择优：消费 strategy 的同分候选集，逐个求关节代价后取最小者执行(节点内多线程并行)。
+             true → 订阅 /tetris_plan_candidates；false → 退回订阅单计划 /tetris_plan(旧行为)。
+             与策略节点的 num_candidates 配套使用。 -->
+        <param name="use_plan_candidates" value="true" />
+        <param name="plan_candidates_topic" value="/tetris_plan_candidates" />
+        <param name="parallel_candidate_eval" value="true" />
         <param name="optimized_plan_topic" value="/tetris_plan_opt" />
         <param name="board_state_topic" value="/vision/board_state" />
         <param name="eef_frame" value="link_tcp" />
@@ -313,6 +322,11 @@
         <param name="inventory_stable_required_frames" value="5" />
         <param name="min_usable_total_blocks" value="35" />
         <param name="min_usable_stable_required_frames" value="3" />
+
+        <!-- 非进阶任务：保留的同分最优候选布局数，发往 /tetris_plan_candidates 供 path_planner
+             按关节运动代价择优。1=旧行为(单解)。进阶任务不受此影响(只发单候选)。 -->
+        <param name="num_strategy_candidates" value="$(arg num_candidates)" />
+        <param name="plan_candidates_topic" value="/tetris_plan_candidates" />
 
         <!-- 进阶任务：默认关闭。开启则按 shape_sequence(下方)求解；
              进阶时只放一部分方块，不要求库存达 34/35。

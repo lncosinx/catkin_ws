@@ -42,11 +42,13 @@
 #include <tly/MotionTask.h>
 #include <tly/depth_sampler.hpp>
 #include <tly/xarm6_kinematics.hpp>
+#include <xarm_msgs/RobotMsg.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <future>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -123,6 +125,9 @@ public:
 
         camera_info_sub_ = nh_.subscribe(camera_info_topic_, 1, &PathPlanner::cameraInfoCallback, this);
         joint_state_sub_ = nh_.subscribe(joint_state_topic_, 1, &PathPlanner::jointStateCallback, this);
+        // 初始位姿工具朝向改用固件姿态时，订阅 xArm 原生状态话题缓存 base<-eef 朝向。
+        if (tool_tilt_from_firmware_)
+            robot_state_sub_ = nh_.subscribe(robot_state_topic_, 1, &PathPlanner::robotStateCallback, this);
 
         ROS_INFO("[PATH] Waiting for CameraInfo on %s ...", camera_info_topic_.c_str());
         sensor_msgs::CameraInfoConstPtr cam_msg =
@@ -138,23 +143,33 @@ public:
         if (optimize_order_)
             board_state_sub_ = nh_.subscribe(board_state_topic_, 1, &PathPlanner::boardStateCallback, this);
 
-        plan_sub_ = nh_.subscribe(plan_topic_, 1, &PathPlanner::planCallback, this);
+        // 二选一订阅，避免对同一计划重复执行：候选集模式只订阅候选话题，单计划模式只订阅 /tetris_plan。
+        if (use_plan_candidates_)
+            plans_sub_ = nh_.subscribe(plan_candidates_topic_, 1, &PathPlanner::plansCallback, this);
+        else
+            plan_sub_ = nh_.subscribe(plan_topic_, 1, &PathPlanner::planCallback, this);
         motion_pub_ = nh_.advertise<tly::MotionPlan>(motion_topic_, 1, true);
         opt_plan_pub_ = nh_.advertise<std_msgs::Int32MultiArray>(optimized_plan_topic_, 1, true);
 
         ROS_INFO("[PATH] ready: in=%s motion_out=%s opt_out=%s optimize=%s joint_cost=%s pool=%s depth_z=%s",
-                 plan_topic_.c_str(), motion_topic_.c_str(), optimized_plan_topic_.c_str(),
+                 use_plan_candidates_ ? plan_candidates_topic_.c_str() : plan_topic_.c_str(),
+                 motion_topic_.c_str(), optimized_plan_topic_.c_str(),
                  optimize_order_ ? "on" : "off", use_joint_cost_ ? "on" : "off",
                  board_state_topic_.c_str(), use_depth_pick_z_ ? "on" : "off");
+        if (use_plan_candidates_)
+            ROS_INFO("[PATH] multi-candidate selection ON (parallel=%s): pick min joint-cost plan.",
+                     parallel_candidate_eval_ ? "on" : "off");
     }
 
 private:
     ros::NodeHandle nh_;
     ros::NodeHandle pnh_;
     ros::Subscriber plan_sub_;
+    ros::Subscriber plans_sub_;
     ros::Subscriber camera_info_sub_;
     ros::Subscriber board_state_sub_;
     ros::Subscriber joint_state_sub_;
+    ros::Subscriber robot_state_sub_;
     ros::Publisher motion_pub_;
     ros::Publisher opt_plan_pub_;
 
@@ -162,9 +177,15 @@ private:
     tf2_ros::TransformListener tf_listener_;
 
     std::string plan_topic_ = "/tetris_plan";
+    std::string plan_candidates_topic_ = "/tetris_plan_candidates";
     std::string motion_topic_ = "/motion_cmds";
     std::string optimized_plan_topic_ = "/tetris_plan_opt";
     std::string board_state_topic_ = "/vision/board_state";
+
+    // 多候选：消费 strategy 的同分候选集，逐个求关节代价后取最小者执行。
+    // true → 订阅 plan_candidates_topic_ 走 plansCallback；false → 订阅 plan_topic_ 走 planCallback。
+    bool use_plan_candidates_ = false;
+    bool parallel_candidate_eval_ = true; // 候选评估用节点内多线程(共享 const 运动学/标定)
     std::string camera_info_topic_ = "/camera/color/camera_info";
     std::string joint_state_topic_ = "/xarm/joint_states";
     std::string base_frame_ = "link_base";
@@ -228,6 +249,11 @@ private:
     double fixed_roll_rad_ = M_PI;
     double fixed_pitch_rad_ = 0.0;
     bool read_tool_tilt_from_initial_pose_ = true;
+    // 初始位姿工具朝向的来源：true=固件上报姿态 /xarm/xarm_states.pose（与 move_line 执行同一运动学系，
+    // 消除 URDF↔固件 ~1° 差），缺失/过旧回退 ROS TF；false=一律用 ROS TF(URDF 系)。
+    bool tool_tilt_from_firmware_ = true;
+    std::string robot_state_topic_ = "/xarm/xarm_states";
+    double fw_pose_max_age_s_ = 0.5;
 
     int max_tasks_per_plan_ = 0; // 0 = 不限制，发布策略给的全部任务
 
@@ -256,6 +282,12 @@ private:
     bool joint_state_ready_ = false;
     std::array<double, 6> q_meas_ = {0, 0, 0, 0, 0, 0};
     std::mutex joint_mutex_;
+
+    // 固件上报的 base<-eef 姿态（/xarm/xarm_states.pose 的 rpy；TCP 旋转偏置为 0，故=法兰/link_tcp 朝向）。
+    bool fw_pose_ready_ = false;
+    tf2::Quaternion fw_base_eef_q_;
+    ros::Time fw_pose_stamp_;
+    std::mutex fw_mutex_;
 
     bool camera_info_ready_ = false;
     cv::Mat K_, D_, P_;
@@ -345,6 +377,9 @@ private:
     void loadParams()
     {
         pnh_.param("plan_topic", plan_topic_, plan_topic_);
+        pnh_.param("plan_candidates_topic", plan_candidates_topic_, plan_candidates_topic_);
+        pnh_.param("use_plan_candidates", use_plan_candidates_, use_plan_candidates_);
+        pnh_.param("parallel_candidate_eval", parallel_candidate_eval_, parallel_candidate_eval_);
         pnh_.param("motion_topic", motion_topic_, motion_topic_);
         pnh_.param("optimized_plan_topic", optimized_plan_topic_, optimized_plan_topic_);
         pnh_.param("board_state_topic", board_state_topic_, board_state_topic_);
@@ -385,6 +420,9 @@ private:
         pnh_.param("read_tool_tilt_from_initial_pose", read_tool_tilt_from_initial_pose_, read_tool_tilt_from_initial_pose_);
         pnh_.param("fixed_roll_rad", fixed_roll_rad_, fixed_roll_rad_);
         pnh_.param("fixed_pitch_rad", fixed_pitch_rad_, fixed_pitch_rad_);
+        pnh_.param("tool_tilt_from_firmware", tool_tilt_from_firmware_, tool_tilt_from_firmware_);
+        pnh_.param("robot_state_topic", robot_state_topic_, robot_state_topic_);
+        pnh_.param("fw_pose_max_age_s", fw_pose_max_age_s_, fw_pose_max_age_s_);
 
         pnh_.param("max_tasks_per_plan", max_tasks_per_plan_, max_tasks_per_plan_);
 
@@ -723,29 +761,62 @@ private:
     // 抓放下压的 roll/pitch 取自"初始位姿"(臂此刻所在 = 单应性标定位姿)的工具朝向，
     // 换算到 board 系后固定；yaw 仍每任务计算。读不到 base<-eef TF 则保留现 fixed_*(默认π,0)。
     // 注意：依赖处理 plan 时臂确在初始/观测位姿；生产单发流程满足，手动喂 plan 的测试需关闭本项。
+    // 缓存固件上报的 base<-eef 朝向。pose=[x,y,z(mm),roll,pitch,yaw(rad)]；TCP 旋转偏置=0，
+    // 故 pose 的 rpy 即法兰/link_tcp 在固件 base 系的朝向（与 move_line 执行同一运动学系）。
+    void robotStateCallback(const xarm_msgs::RobotMsg::ConstPtr &msg)
+    {
+        if (msg->pose.size() < 6)
+            return;
+        tf2::Quaternion q;
+        q.setRPY(msg->pose[3], msg->pose[4], msg->pose[5]);
+        std::lock_guard<std::mutex> lk(fw_mutex_);
+        fw_base_eef_q_ = q;
+        fw_pose_stamp_ = ros::Time::now();
+        fw_pose_ready_ = true;
+    }
+
     void updateToolTiltFromInitialPose()
     {
         if (!read_tool_tilt_from_initial_pose_ || !board_pose_loaded_)
             return;
-        try
+
+        // 优先用固件上报姿态（/xarm/xarm_states.pose 的 rpy），与 move_line 执行同一运动学系，
+        // 消除 URDF↔固件 ~1° 差；缺失/过旧回退 ROS TF(URDF 系)。
+        tf2::Quaternion q_be; // base <- eef
+        const char *src = nullptr;
+        if (tool_tilt_from_firmware_)
         {
-            geometry_msgs::TransformStamped tf =
-                tf_buffer_.lookupTransform(base_frame_, eef_frame_, ros::Time(0), ros::Duration(0.5));
-            tf2::Quaternion q_be; // base <- eef
-            tf2::fromMsg(tf.transform.rotation, q_be);
-            tf2::Quaternion q_board = base_to_board_.getRotation() * q_be; // board <- eef
-            double r, p, y;
-            tf2::Matrix3x3(q_board).getRPY(r, p, y);
-            fixed_roll_rad_ = r;
-            fixed_pitch_rad_ = p;
-            ROS_INFO("[PATH] tool tilt from initial pose (board): roll=%.2f pitch=%.2f deg (yaw per-task).",
-                     r * 180.0 / M_PI, p * 180.0 / M_PI);
+            std::lock_guard<std::mutex> lk(fw_mutex_);
+            if (fw_pose_ready_ && (ros::Time::now() - fw_pose_stamp_).toSec() <= fw_pose_max_age_s_)
+            {
+                q_be = fw_base_eef_q_;
+                src = "firmware";
+            }
         }
-        catch (const tf2::TransformException &ex)
+        if (src == nullptr)
         {
-            ROS_WARN("[PATH] read initial-pose tool tilt failed (%s); keep roll=%.1f pitch=%.1f deg.",
-                     ex.what(), fixed_roll_rad_ * 180.0 / M_PI, fixed_pitch_rad_ * 180.0 / M_PI);
+            try
+            {
+                geometry_msgs::TransformStamped tf =
+                    tf_buffer_.lookupTransform(base_frame_, eef_frame_, ros::Time(0), ros::Duration(0.5));
+                tf2::fromMsg(tf.transform.rotation, q_be);
+                src = tool_tilt_from_firmware_ ? "tf(firmware stale)" : "tf";
+            }
+            catch (const tf2::TransformException &ex)
+            {
+                ROS_WARN("[PATH] read initial-pose tool tilt failed (%s); keep roll=%.1f pitch=%.1f deg.",
+                         ex.what(), fixed_roll_rad_ * 180.0 / M_PI, fixed_pitch_rad_ * 180.0 / M_PI);
+                return;
+            }
         }
+
+        tf2::Quaternion q_board = base_to_board_.getRotation() * q_be; // board <- eef
+        double r, p, y;
+        tf2::Matrix3x3(q_board).getRPY(r, p, y);
+        fixed_roll_rad_ = r;
+        fixed_pitch_rad_ = p;
+        ROS_INFO("[PATH] tool tilt from initial pose (board, src=%s): roll=%.2f pitch=%.2f deg (yaw per-task).",
+                 src, r * 180.0 / M_PI, p * 180.0 / M_PI);
     }
 
     bool pixelToNormalizedRay(const PixelPoint &px, cv::Vec3d &ray) const
@@ -1378,8 +1449,9 @@ private:
     // 联合优化：放置顺序（DAG 内重排）+ 抓取分配（同形状互换）+ 腕部翻转，最小化总代价。
     // 关节代价可用时用关节空间 + 翻转 + 转移段 J6 路径校验；否则回退 XY 直线距离 + 事后 yaw 启发式。
     // 返回 false 表示规划失败（关节模式下某就绪槽无任何 J6 可行方案）——调用方应放弃发布、待重规划。
-    bool optimizePlan(std::vector<TaskGoal> &goals)
+    bool optimizePlan(std::vector<TaskGoal> &goals, double &total_cost)
     {
+        total_cost = 0.0;
         const int n = static_cast<int>(goals.size());
         if (n == 0)
             return true;
@@ -1537,6 +1609,8 @@ private:
                     q_cur = best_qplace;
                     cur_pose = best_endpose;
                 }
+                if (best < std::numeric_limits<double>::max())
+                    total_cost += best;
                 cur_x = place_x[i];
                 cur_y = place_y[i];
                 has_cur = true;
@@ -1719,6 +1793,8 @@ private:
                 q_cur = best_qplace;
                 cur_pose = best_endpose;
             }
+            if (best < std::numeric_limits<double>::max())
+                total_cost += best;
             placed[best_goal] = 1;
             order.push_back(best_goal);
             cur_x = place_x[best_goal];
@@ -1826,57 +1902,38 @@ private:
         return true;
     }
 
-    void planCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
+    // 解析一份 17-int(或兼容长度) 计划为 TaskGoal 列表。纯解析、无成员状态，可并发调用。
+    static bool parseGoals(const std::vector<int> &data, std::vector<TaskGoal> &goals,
+                           int &total, int &stride)
     {
-        if (msg->data.empty() || !camera_info_ready_)
-        {
-            ROS_WARN("[PATH] Drop plan: empty or CameraInfo not ready.");
-            return;
-        }
-        if (require_board_map_ && !board_centers_loaded_)
-        {
-            ROS_ERROR("[PATH] Refuse plan: required BOARD_CENTERS_14x10_BOARD missing.");
-            return;
-        }
-        if (require_place_z_map_ && !place_z_map_loaded_)
-        {
-            ROS_ERROR("[PATH] Refuse plan: required PLACE_Z_MAP_14x10 missing.");
-            return;
-        }
-        if (!getObservationTransforms())
-            return;
-
-        updateToolTiltFromInitialPose();
-        runSelfCheckIfPossible();
-
-        int total = msg->data[0];
+        goals.clear();
+        if (data.empty())
+            return false;
+        total = data[0];
         if (total <= 0)
-            return;
-        int stride = (msg->data.size() - 1) / total;
+            return false;
+        stride = (static_cast<int>(data.size()) - 1) / total;
         if (stride < 7)
-        {
-            ROS_ERROR("[PATH] Invalid plan stride=%d", stride);
-            return;
-        }
-
-        std::vector<TaskGoal> goals;
+            return false;
         goals.reserve(total);
         for (int i = 0; i < total; ++i)
         {
             int base = 1 + i * stride;
+            if (base + stride > static_cast<int>(data.size()))
+                return false;
             TaskGoal goal;
-            goal.shape_type = msg->data[base + 0];
-            goal.way = msg->data[base + 1];
-            goal.place_grid_center.row = msg->data[base + 2] / 4.0;
-            goal.place_grid_center.col = msg->data[base + 3] / 4.0;
-            goal.pick_pixel.u = msg->data[base + 4];
-            goal.pick_pixel.v = msg->data[base + 5];
-            goal.pick_angle_deg = msg->data[base + 6];
+            goal.shape_type = data[base + 0];
+            goal.way = data[base + 1];
+            goal.place_grid_center.row = data[base + 2] / 4.0;
+            goal.place_grid_center.col = data[base + 3] / 4.0;
+            goal.pick_pixel.u = data[base + 4];
+            goal.pick_pixel.v = data[base + 5];
+            goal.pick_angle_deg = data[base + 6];
 
             if (stride >= 9)
             {
-                goal.geom_pixel.u = msg->data[base + 7];
-                goal.geom_pixel.v = msg->data[base + 8];
+                goal.geom_pixel.u = data[base + 7];
+                goal.geom_pixel.v = data[base + 8];
                 goal.has_geom_pixel = true;
             }
             else
@@ -1896,27 +1953,47 @@ private:
                 for (int k = 0; k < 4; ++k)
                 {
                     GridCell cell;
-                    cell.row = msg->data[cell_start + 2 * k];
-                    cell.col = msg->data[cell_start + 2 * k + 1];
+                    cell.row = data[cell_start + 2 * k];
+                    cell.col = data[cell_start + 2 * k + 1];
                     goal.target_cells.push_back(cell);
                 }
             }
 
-            goal.raw.assign(msg->data.begin() + base, msg->data.begin() + base + stride);
+            goal.raw.assign(data.begin() + base, data.begin() + base + stride);
             goals.push_back(goal);
         }
+        return true;
+    }
 
-        if (optimize_order_)
+    // 计划处理前置：就绪检查 + 观测 TF / 工具 tilt / IK 自检。必须在并行评估前完成
+    // （它会写入 fixed_roll/pitch_、use_joint_cost_ 等共享成员，之后被各候选只读使用）。
+    bool preparePlanContext()
+    {
+        if (!camera_info_ready_)
         {
-            if (!optimizePlan(goals))
-            {
-                ROS_ERROR("[PATH] Plan ABORTED (J6 infeasible). No MotionPlan published; awaiting re-plan.");
-                return; // fail-stop：不发布任何计划，控制器保持空闲，等待重规划
-            }
+            ROS_WARN("[PATH] Drop plan: CameraInfo not ready.");
+            return false;
         }
-        else
-            assignFlipsByYaw(goals); // 不重排也要定翻转（用 yaw 启发式，不跟踪关节序列）
+        if (require_board_map_ && !board_centers_loaded_)
+        {
+            ROS_ERROR("[PATH] Refuse plan: required BOARD_CENTERS_14x10_BOARD missing.");
+            return false;
+        }
+        if (require_place_z_map_ && !place_z_map_loaded_)
+        {
+            ROS_ERROR("[PATH] Refuse plan: required PLACE_Z_MAP_14x10 missing.");
+            return false;
+        }
+        if (!getObservationTransforms())
+            return false;
+        updateToolTiltFromInitialPose();
+        runSelfCheckIfPossible();
+        return true;
+    }
 
+    // 由优化后的 goals 构建并发布调试 17-int 计划 + 可执行 MotionPlan。
+    void buildAndPublishMotion(std::vector<TaskGoal> &goals, int total, int stride)
+    {
         // 1) 调试用 17-int 计划（回填抓取字段后无损重排），不含翻转信息。
         std_msgs::Int32MultiArray opt;
         opt.data.reserve(1 + total * stride);
@@ -1924,10 +2001,13 @@ private:
         for (const auto &g : goals)
         {
             std::vector<int> blk = g.raw;
-            blk[4] = g.pick_pixel.u;
-            blk[5] = g.pick_pixel.v;
-            blk[6] = g.pick_angle_deg;
-            if (static_cast<int>(blk.size()) >= 9)
+            if (blk.size() >= 7)
+            {
+                blk[4] = g.pick_pixel.u;
+                blk[5] = g.pick_pixel.v;
+                blk[6] = g.pick_angle_deg;
+            }
+            if (blk.size() >= 9)
             {
                 blk[7] = g.geom_pixel.u;
                 blk[8] = g.geom_pixel.v;
@@ -1937,7 +2017,7 @@ private:
         opt_plan_pub_.publish(opt);
 
         // 2) MotionPlan（控制路径，全集；截断交给执行器）。
-        int exec_total = total;
+        int exec_total = static_cast<int>(goals.size());
         if (max_tasks_per_plan_ > 0 && exec_total > max_tasks_per_plan_)
             exec_total = max_tasks_per_plan_;
 
@@ -1957,6 +2037,158 @@ private:
         ROS_INFO("[PATH] Published %s with %lu task(s) + %s Int32(%d) [%s cost].",
                  motion_topic_.c_str(), plan.tasks.size(), optimized_plan_topic_.c_str(),
                  total, use_joint_cost_ ? "joint" : "xy");
+    }
+
+    void planCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
+    {
+        if (msg->data.empty())
+        {
+            ROS_WARN("[PATH] Drop plan: empty.");
+            return;
+        }
+        if (!preparePlanContext())
+            return;
+
+        std::vector<TaskGoal> goals;
+        int total = 0, stride = 0;
+        if (!parseGoals(std::vector<int>(msg->data.begin(), msg->data.end()), goals, total, stride))
+        {
+            ROS_ERROR("[PATH] Invalid plan (parse failed).");
+            return;
+        }
+
+        if (optimize_order_)
+        {
+            double cost = 0.0;
+            if (!optimizePlan(goals, cost))
+            {
+                ROS_ERROR("[PATH] Plan ABORTED (J6 infeasible). No MotionPlan published; awaiting re-plan.");
+                return; // fail-stop：不发布任何计划，控制器保持空闲，等待重规划
+            }
+        }
+        else
+            assignFlipsByYaw(goals); // 不重排也要定翻转（用 yaw 启发式，不跟踪关节序列）
+
+        buildAndPublishMotion(goals, total, stride);
+    }
+
+    // 候选集回调：解析 [K, len0, plan0..., len1, plan1...]，对每个候选做坐标解算 + 路程优化，
+    // 取「总运动代价」最小的可行候选执行。候选间相互独立(各自局部 goals/池占用)，故可节点内多线程
+    // 并行评估——并行期间主 spin 线程阻塞在 future.get() 上，无其它 ROS 回调改写共享成员；运动学
+    // ik/fk 为无状态 const，标定/观测均在 preparePlanContext 后只读，安全。
+    void plansCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
+    {
+        if (msg->data.empty())
+        {
+            ROS_WARN("[PATH] Drop candidate set: empty.");
+            return;
+        }
+        if (!preparePlanContext())
+            return;
+
+        const std::vector<int> &d = msg->data;
+        int idx = 0;
+        int K = d[idx++];
+        if (K <= 0)
+        {
+            ROS_WARN("[PATH] Candidate set K=%d invalid.", K);
+            return;
+        }
+        std::vector<std::vector<int>> raw_plans;
+        raw_plans.reserve(K);
+        for (int k = 0; k < K; ++k)
+        {
+            if (idx >= static_cast<int>(d.size()))
+                break;
+            int len = d[idx++];
+            if (len <= 0 || idx + len > static_cast<int>(d.size()))
+            {
+                ROS_ERROR("[PATH] Candidate set framing broken at k=%d (len=%d).", k, len);
+                return;
+            }
+            raw_plans.emplace_back(d.begin() + idx, d.begin() + idx + len);
+            idx += len;
+        }
+        if (raw_plans.empty())
+        {
+            ROS_WARN("[PATH] Candidate set parsed 0 plans.");
+            return;
+        }
+
+        struct Eval
+        {
+            bool ok = false;
+            double cost = std::numeric_limits<double>::max();
+            std::vector<TaskGoal> goals;
+            int total = 0;
+            int stride = 0;
+        };
+        std::vector<Eval> evals(raw_plans.size());
+
+        auto work = [&](int k)
+        {
+            Eval &e = evals[k];
+            std::vector<TaskGoal> goals;
+            int total = 0, stride = 0;
+            if (!parseGoals(raw_plans[k], goals, total, stride))
+                return;
+            double cost = 0.0;
+            if (optimize_order_)
+            {
+                if (!optimizePlan(goals, cost))
+                    return; // 该候选 J6 不可行，淘汰
+            }
+            else
+            {
+                assignFlipsByYaw(goals);
+                cost = 0.0; // 无重排/代价：所有候选并列，取第一个可行
+            }
+            e.ok = true;
+            e.cost = cost;
+            e.goals = std::move(goals);
+            e.total = total;
+            e.stride = stride;
+        };
+
+        const int M = static_cast<int>(raw_plans.size());
+        if (parallel_candidate_eval_ && M > 1)
+        {
+            std::vector<std::future<void>> futs;
+            futs.reserve(M);
+            for (int k = 0; k < M; ++k)
+                futs.push_back(std::async(std::launch::async, work, k));
+            for (auto &f : futs)
+                f.get();
+        }
+        else
+        {
+            for (int k = 0; k < M; ++k)
+                work(k);
+        }
+
+        int best = -1;
+        double best_cost = std::numeric_limits<double>::max();
+        int feasible = 0;
+        for (int k = 0; k < M; ++k)
+        {
+            if (!evals[k].ok)
+                continue;
+            ++feasible;
+            if (evals[k].cost < best_cost)
+            {
+                best_cost = evals[k].cost;
+                best = k;
+            }
+        }
+        if (best < 0)
+        {
+            ROS_ERROR("[PATH] All %d candidate plan(s) infeasible (J6). No MotionPlan published; awaiting re-plan.", M);
+            return;
+        }
+
+        ROS_INFO("[PATH] Candidate selection: %d/%d feasible; chose #%d cost=%.4f (%s cost).",
+                 feasible, M, best, best_cost, use_joint_cost_ ? "joint" : "xy");
+        buildAndPublishMotion(evals[best].goals, evals[best].total, evals[best].stride);
     }
 };
 

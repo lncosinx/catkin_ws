@@ -181,3 +181,16 @@ J6 绕圈 DP `assignYaws` 因此被撤除）；(2) **一旦 J6 越过约 ±180°
 - `scripts/vision_processor_node.py` 是同一节点/话题/服务契约的 Python 重实现
   （与 `strategy_node.cpp` 保持形状 ID 兼容，见其模块 docstring），仅供
   `affine.launch` 使用。生产（`tly.launch`）用 C++ 节点。
+- **启动 MoveIt/realMove_exec 前，±360° 关节（J1/J4/J6）必须远离 ±360° 边界**
+  （**重要踩坑**）：凡包含 `xarm6_moveit_config/realMove_exec.launch` 的 launch
+  （如 `calibrate_tool.launch`、旧的 `test_pick.launch`），在打印
+  `Started controllers: xarm6_traj_controller, joint_state_controller` 那一刻，
+  MoveIt 会把臂从 UF Studio 位姿模式切到 **SERVO 关节伺服模式**
+  （`xarm_driver.cpp` `set_mode(SERVO)+set_state(START)`）。若某个 ±2π 关节此时
+  绕在接近 ±360° 处（实测 J4=-358.4°，距 -360° 硬限仅 1.6°），**固件会在切模式
+  瞬间对这个绕到边界的关节做"就近解"重解算、朝规范角解缠**，触发一次未经 MoveIt
+  规划的大幅摆动（实测 J4 甩约 180° 后触发保护停止 state 5，停在解缠行程中点
+  ≈-178°）。这不是 ROS 层命令的（已核实 `xarm_hw` 初始 `position_cmds_=当前角`、
+  SDK `set_servo_angle_j` 不归一化、URDF J4 限位 ±2π 不裁剪），而是固件行为，与上文
+  腕部"圈数/就近解" lore 同源。**规避**：启动前在 UF Studio 把 J1/J4/J6 摇到中段
+  （规范区间正中、远离 ±360°）再 launch；关节停在规范区间内启动则不跳。

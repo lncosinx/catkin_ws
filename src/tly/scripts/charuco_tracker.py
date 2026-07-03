@@ -56,6 +56,19 @@ class CharucoTracker(object):
             self.square_length, self.marker_length, self.dictionary)
         self.detector_params = cv2.aruco.DetectorParameters_create()
 
+        # 亚像素级标记角点细化：默认 CORNER_REFINE_NONE 只到整像素，标记角点
+        # 是 interpolateCornersCharuco 局部单应的种子，整像素误差会直接污染
+        # 棋盘格角点与板位姿。开 CORNER_REFINE_SUBPIX 把标记角点细化到亚像素，
+        # 手眼标定精度更高。(ChArUco 棋盘格角点本身在不传内参时已由
+        # interpolateCornersCharuco 内部 cornerSubPix 细化。)
+        self.detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        self.detector_params.cornerRefinementWinSize = rospy.get_param(
+            "~corner_refine_win_size", 5)
+        self.detector_params.cornerRefinementMaxIterations = rospy.get_param(
+            "~corner_refine_max_iterations", 30)
+        self.detector_params.cornerRefinementMinAccuracy = rospy.get_param(
+            "~corner_refine_min_accuracy", 0.01)
+
         # 可选：导出本节点生成的板图，便于和 calib.io PDF 目视核对排布是否一致
         save_path = rospy.get_param("~save_board_image", "")
         if save_path:
