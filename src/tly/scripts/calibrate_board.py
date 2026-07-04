@@ -23,8 +23,10 @@ config，控制/路径/单应性节点直接在 base 系用它换算（全量 ba
 
 主要输出（写入 tetris_config.yaml）：
   BOARD_POSE_BASE, BOARD_CENTERS_14x10_BOARD, PLACE_Z_MAP_14x10, BOARD_PLACE_TOP_MAP_14x10,
-  BOARD_BUMP_HEIGHT_MAP_14x10, BOARD_SURFACE_PLANE(board 系), BOARD_SURFACE_NORMAL_BASE,
+  BOARD_BUMP_HEIGHT_MAP_14x10, BOARD_SURFACE_PLANE(board 系, 步骤2/5 深度拟合), BOARD_SURFACE_NORMAL_BASE,
   PICK_Z(=block_thickness, 仅作 path 的平面回退), HOVER_Z 等。
+  步骤7 另产出 PICK_HOMOGRAPHY(pixel→board-XY) 与 PICK_SURFACE_PLANE_BASE(base 系 point+normal，
+  由触点物理拟合的发光板面，供 path_planner 置 use_true_pick_plane 时算抓取 Z，可与深度相机对比)。
 
 另两类标定：手眼(easy_handeye)、单应性(pick_affine_calibration_tool.py)。
 ⚠️ 坐标系由网格派生后，必须重跑 pick_affine 重标单应性（pixel→board-XY），再上机核对。
@@ -2455,6 +2457,8 @@ def main():
         min_ph = max(4, int(rospy.get_param("~pick_homography_min_points", 4)))
         max_ph = max(min_ph, max_ph)
         rect_topic = rospy.get_param("~rect_color_topic", "/camera/color/image_rect_color")
+        # 触点顺便拟合发光板平面写 PICK_SURFACE_PLANE_BASE（供 path_planner 算抓取 Z）；默认开。
+        write_pick_plane = bool(rospy.get_param("~write_pick_surface_plane", True))
         if cv2 is None:
             print("  ⚠️ cv2 不可用，跳过步骤7。")
         else:
@@ -2488,20 +2492,51 @@ def main():
                             print("  ↩️ 已撤销，重记上一个点。")
                             continue
                         bxy = to_table(R_mat, P, p)
-                        rows.append({"u": int(u), "v": int(v), "board": [float(bxy[0]), float(bxy[1])]})
+                        # 存全量 3D board 坐标：board[:2] 供单应性；board3 的 Z 供发光板平面拟合。
+                        rows.append({"u": int(u), "v": int(v),
+                                     "board": [float(bxy[0]), float(bxy[1])],
+                                     "board3": [float(bxy[0]), float(bxy[1]), float(bxy[2])]})
                         i += 1
-                    src = np.array([[r["u"], r["v"]] for r in rows], dtype=np.float64)
-                    dst = np.array([r["board"] for r in rows], dtype=np.float64)
-                    Hpk, _ = cv2.findHomography(src, dst)   # pixel -> board-XY
-                    if Hpk is None:
-                        print("  ⚠️ 单应性拟合失败，未写入。")
-                    else:
-                        res = []
-                        for r in rows:
-                            q = Hpk.dot([r["u"], r["v"], 1.0])
+                    # 拟合 pixel->board-XY 单应性并算逐点残差；抽成小函数，供【可选重标循环】反复调用。
+                    def _fit_pick_homography(rows_):
+                        src_ = np.array([[r["u"], r["v"]] for r in rows_], dtype=np.float64)
+                        dst_ = np.array([r["board"] for r in rows_], dtype=np.float64)
+                        H_, _ = cv2.findHomography(src_, dst_)   # pixel -> board-XY
+                        if H_ is None:
+                            return None, None, None
+                        res_ = []
+                        for r in rows_:
+                            q = H_.dot([r["u"], r["v"], 1.0])
                             q = q / q[2]
-                            res.append(((q[0] - r["board"][0]) ** 2 + (q[1] - r["board"][1]) ** 2) ** 0.5)
-                        rms = float(np.sqrt(np.mean(np.square(res))))
+                            res_.append(((q[0] - r["board"][0]) ** 2 + (q[1] - r["board"][1]) ** 2) ** 0.5)
+                        rms_ = float(np.sqrt(np.mean(np.square(res_))))
+                        return H_, res_, rms_
+
+                    # 触点物理压在【发光板面】上，其 board-Z 就是板面高度；拟合一张平面（board 系
+                    # z=a*x+b*y+c）再换算成 base 系 point+normal，写 PICK_SURFACE_PLANE_BASE，供
+                    # path_planner 用【射线-真实板面求交】算抓取 Z（替代拍平的 PICK_Z / 不准的深度相机）。
+                    # 触碰是物理真值，通常比深度相机准；写盘后可用 use_true_pick_plane / use_depth_pick_z
+                    # 在 平面 / 深度 / 拍平 三挡间切换对比抓取 Z 效果。返回 (point_base, normal_base, (a,b,c,std,cz))。
+                    def _fit_pick_surface_plane(rows_):
+                        board_pts = np.array([r["board3"] for r in rows_], dtype=np.float64)
+                        a, b, c, std = fit_plane_xyz(board_pts)          # z = a*x + b*y + c（board 系）
+                        cx, cy = float(board_pts[:, 0].mean()), float(board_pts[:, 1].mean())
+                        cz = a * cx + b * cy + c                          # 板面在采点中心处的 board-Z
+                        pt_board = np.array([cx, cy, cz], dtype=np.float64)
+                        n_board = np.array([-a, -b, 1.0], dtype=np.float64)
+                        n_board = n_board / np.linalg.norm(n_board)
+                        pt_base = R_mat.dot(pt_board) + P                 # board→base：base = R·board + P
+                        n_base = R_mat.dot(n_board)                       # 法向只旋转
+                        n_base = n_base / np.linalg.norm(n_base)
+                        return pt_base, n_base, (a, b, c, std, cz)
+
+                    # 拟合→写盘→打印残差→(可选)重标指定点→重拟合……循环，直到用户空回车结束。
+                    # 重标只重记该点【物理触点】(像素点选保持不变，是主要误差源)；点号与打印的 #N 一致。
+                    while not rospy.is_shutdown():
+                        Hpk, res, rms = _fit_pick_homography(rows)
+                        if Hpk is None:
+                            print("  ⚠️ 单应性拟合失败，未写入。")
+                            break
                         updates = {"PICK_HOMOGRAPHY": {
                             "enabled": True,
                             "model": "x = (H00*u + H01*v + H02)/W; y = (H10*u + H11*v + H12)/W; W = H20*u + H21*v + H22",
@@ -2524,8 +2559,35 @@ def main():
                             paff = dict(paff)
                             paff["enabled"] = False
                             updates["PICK_AFFINE_CORRECTION"] = paff
+                        # 顺便用触点拟合真实发光板平面 → PICK_SURFACE_PLANE_BASE（path_planner 抓取 Z 用）。
+                        plane_rep = None
+                        if write_pick_plane:
+                            try:
+                                pt_base, n_base, plane_rep = _fit_pick_surface_plane(rows)
+                                updates["PICK_SURFACE_PLANE_BASE"] = {
+                                    "model": "plane through 'point' with unit 'normal' in link_base; board_plane_abc: z=a*x+b*y+c in board_frame",
+                                    "point": [float(x) for x in pt_base],
+                                    "normal": [float(x) for x in n_base],
+                                    "board_plane_abc": [float(plane_rep[0]), float(plane_rep[1]), float(plane_rep[2])],
+                                    "residual_std_m": float(plane_rep[3]),
+                                    "sample_count": int(len(rows)),
+                                    "source": "step7_touch",
+                                }
+                            except Exception as e:
+                                plane_rep = None
+                                print(f"  ⚠️ 发光板平面拟合失败({e})，本轮不写 PICK_SURFACE_PLANE_BASE。")
                         existing_cfg = write_config_merge(config_path, existing_cfg, updates)
                         print(f"  ✅ 抓取单应性拟合完成，RMS={rms*1000:.3f} mm，已写入 PICK_HOMOGRAPHY。")
+                        # 触点拟合的发光板平面：打印并与深度拟合板面(步骤2/5)对比，供选平面还是深度做抓取 Z。
+                        if plane_rep is not None:
+                            pa, pb, pc, pstd, pcz = plane_rep
+                            print("  🩹 触点拟合发光板面(board 系): z={:.5f}*x+{:.5f}*y+{:.5f}；残差std={:.2f} mm，中心板高={:.2f} mm。".format(
+                                pa, pb, pc, pstd * 1000.0, pcz * 1000.0))
+                            print("     已写 PICK_SURFACE_PLANE_BASE；path_planner 置 use_true_pick_plane:=true 即用它算抓取 Z（vs use_depth_pick_z 深度）。")
+                            depth_c = (tcfg.get("BOARD_SURFACE_PLANE", {}) or {}).get("c")
+                            if depth_c is not None:
+                                print("     对比深度拟合板面 c={:.2f} mm(BOARD_SURFACE_PLANE)，触点-深度差={:+.2f} mm。".format(
+                                    float(depth_c) * 1000.0, (pcz - float(depth_c)) * 1000.0))
                         # 逐点残差(mm)：findHomography 用最小二乘、不剔离群点，单个坏点会同时抬高 RMS
                         # 并带歪 H；打印每点残差与最大点(点号与触点顺序 7.N 一致)，便于定位是否需重标某点。
                         res_mm = [x * 1000.0 for x in res]
@@ -2534,7 +2596,34 @@ def main():
                             f"#{j+1}={e:.2f}" for j, e in enumerate(res_mm)))
                         print("  最大残差 #{} = {:.2f} mm（像素({},{})）；若明显离群于其余点，建议重标该点。".format(
                             imax + 1, res_mm[imax], rows[imax]["u"], rows[imax]["v"]))
-                        print("  💾 步骤7参数已保存到 config（控制节点抓取 XY 用它；改坐标系后须重标）。")
+                        # 可选重标：输入要重压触点的点号(1基，与上面 #N 一致)，支持点序列(如 "3" 或 "3,5")；
+                        # 只重记该点物理触点(像素点选不变)，随后自动重拟合+重写盘+重打印残差。空回车结束步骤7。
+                        try:
+                            sel = input("  🔧 要重标哪些点?输入点号(如 3 或 3,5；空回车结束步骤7): ").strip()
+                        except EOFError:
+                            sel = ""
+                        if not sel:
+                            print("  💾 步骤7参数已保存到 config（控制节点抓取 XY 用它；改坐标系后须重标）。")
+                            break
+                        try:
+                            idxs = [int(t) - 1 for t in sel.replace(",", " ").split()]
+                        except ValueError:
+                            print("  ⚠️ 格式无效，示例：3 或 3,5；本轮忽略。")
+                            continue
+                        bad = [k + 1 for k in idxs if k < 0 or k >= len(rows)]
+                        if bad:
+                            print(f"  ⚠️ 点号越界: {bad}（有效范围 1..{len(rows)}）；本轮忽略。")
+                            continue
+                        for k in idxs:
+                            u, v = rows[k]["u"], rows[k]["v"]
+                            p = require_pose(
+                                tf_buffer, f"[重标 #{k+1}] 吸嘴尖压到像素({u},{v})对应的物理黑点",
+                                base_frame, eef_frame)
+                            bxy = to_table(R_mat, P, p)
+                            rows[k]["board"] = [float(bxy[0]), float(bxy[1])]
+                            rows[k]["board3"] = [float(bxy[0]), float(bxy[1]), float(bxy[2])]
+                            print(f"  ↻ 点 #{k+1} 已重记 board-XY=({bxy[0]:.4f}, {bxy[1]:.4f})，board-Z={bxy[2]*1000:.2f} mm。")
+                        # 回到循环开头，用更新后的 rows 重拟合。
 
     inl_all = first["inliers_base"]
     if len(inl_all) > 300:

@@ -30,5 +30,8 @@
         <param name="seq_reward_four_colors" value="$(arg seq_reward_four_colors)" />
         <!-- 形状放置顺序 (0线/1田/2T/3L左/4L右/5Z左/6Z右)，按现场抽签填写 -->
         <rosparam param="shape_sequence">[0, 1, 2, 3, 4, 5, 6]</rosparam>
+        <!-- 可选：每种形状“可吸取上限”，长度 7 对应形状 id；<0=不限制(默认)。
+             例：只允许吸 2 个 id=0，其余不限 -> [2,-1,-1,-1,-1,-1,-1]。缺省则整行删掉。 -->
+        <!-- <rosparam param="shape_pick_limits">[-1, -1, -1, -1, -1, -1, -1]</rosparam> -->
     </node>
 </launch>

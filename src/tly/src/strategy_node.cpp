@@ -42,6 +42,10 @@ bool seq_cyclic = false;        // 是否按序列循环放置
 bool seq_require_support = true; // true=竞赛规则③(下方支撑)；false=宽松实验
 bool seq_reward_four_colors = false; // 满行且≥4色额外 +10(竞赛规则②)。默认 false：
                                      // 实际比赛可能没有此配色加分，关掉只追求满行。
+// 进阶模式：每种形状“可吸取上限”。即使场上识别到更多，也只允许吸取指定数量的该形状；
+// 例如场上有 4 个 id=0，设 shape_pick_limits[0]=2 则最多只放/吸 2 个。<0=不限制(默认，
+// 用视觉全部库存)。长度 7，一一对应 7 种形状 id。仅进阶模式生效。
+vector<int> shape_pick_limits(7, -1);
 
 void statusCallback(const std_msgs::Bool::ConstPtr &msg)
 {
@@ -414,10 +418,30 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
             return;
         }
 
+        // 可选“可吸取上限”：某形状即使场上识别到更多，也只允许吸取指定数量。
+        // shape_pick_limits[s] < 0 表示不限制(用视觉全部库存)；否则对该形状取 min。
+        vector<int> effective_inventory = current_inventory;
+        bool limits_applied = false;
+        for (int s = 0; s < 7; ++s)
+        {
+            int lim = (s < (int)shape_pick_limits.size()) ? shape_pick_limits[s] : -1;
+            if (lim >= 0 && lim < effective_inventory[s])
+            {
+                effective_inventory[s] = lim;
+                limits_applied = true;
+            }
+        }
+        if (limits_applied)
+            ROS_INFO("[ADVANCED] pick limits applied: vision inv=[%d,%d,%d,%d,%d,%d,%d] -> capped=[%d,%d,%d,%d,%d,%d,%d]",
+                     current_inventory[0], current_inventory[1], current_inventory[2], current_inventory[3],
+                     current_inventory[4], current_inventory[5], current_inventory[6],
+                     effective_inventory[0], effective_inventory[1], effective_inventory[2], effective_inventory[3],
+                     effective_inventory[4], effective_inventory[5], effective_inventory[6]);
+
         SeqConfig cfg;
         cfg.sequence = shape_sequence;
         cfg.cyclic = seq_cyclic;
-        cfg.inventory = current_inventory;
+        cfg.inventory = effective_inventory;
         cfg.require_support = seq_require_support;
         cfg.reward_four_colors = seq_reward_four_colors;
         cfg.board_rows = 14;
@@ -625,10 +649,26 @@ int main(int argc, char **argv)
     pnh.param("seq_require_support", seq_require_support, seq_require_support);
     pnh.param("seq_reward_four_colors", seq_reward_four_colors, seq_reward_four_colors);
     pnh.getParam("shape_sequence", shape_sequence); // 形状 id 列表，例如 [0,1,2,3]
+
+    // 可选“可吸取上限”：list<int>，长度≤7，一一对应形状 id；<0=该形状不限制。
+    // 缺省(不传)则保持默认全 -1(不限制)。传入不足 7 项时其余保持 -1。
+    {
+        vector<int> user_limits;
+        if (pnh.getParam("shape_pick_limits", user_limits))
+        {
+            for (size_t i = 0; i < user_limits.size() && i < 7; ++i)
+                shape_pick_limits[i] = user_limits[i];
+            if (user_limits.size() > 7)
+                ROS_WARN("[ADVANCED] shape_pick_limits has %lu entries; only first 7 used.", user_limits.size());
+        }
+    }
+
     if (advanced_mode)
-        ROS_INFO("[ADVANCED] mode ON: seq_len=%lu cyclic=%d require_support=%d reward_four_colors=%d",
+        ROS_INFO("[ADVANCED] mode ON: seq_len=%lu cyclic=%d require_support=%d reward_four_colors=%d pick_limits=[%d,%d,%d,%d,%d,%d,%d]",
                  shape_sequence.size(), (int)seq_cyclic, (int)seq_require_support,
-                 (int)seq_reward_four_colors);
+                 (int)seq_reward_four_colors,
+                 shape_pick_limits[0], shape_pick_limits[1], shape_pick_limits[2], shape_pick_limits[3],
+                 shape_pick_limits[4], shape_pick_limits[5], shape_pick_limits[6]);
 
     plan_pub = nh.advertise<std_msgs::Int32MultiArray>("/tetris_plan", 10, true);
     candidates_pub = nh.advertise<std_msgs::Int32MultiArray>(plan_candidates_topic, 10, true);
