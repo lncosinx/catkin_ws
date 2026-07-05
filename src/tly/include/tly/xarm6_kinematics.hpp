@@ -1,7 +1,8 @@
 // xArm6 正/逆运动学（仅依赖 tf2，无 MoveIt）。
 //
-// 用途：path_planner_node 把每个 base 系 TCP 位姿转成 6 个关节角 q，用于关节空间加权
-// 代价 Cost = Σ wᵢ(q_B,i − q_A,i)²，并据此联合优化抓放顺序、同形状抓取分配与腕部 180° 翻转。
+// 用途：path_planner_node 把每个 base 系 TCP 位姿转成 6 个关节角 q，用于沿 move_line 直线
+// 路径积分的"运动时间"代价（见 path_planner 的 evalTransit），并据此联合优化抓放顺序、同形状
+// 抓取分配与腕部 180° 翻转。
 //
 // 连杆几何取自 xarm_description/xarm6_full.urdf 的关节原点/轴（已核对）：
 //   j1 z=0.267 | j2 rpy=(-π/2) | j3 xyz=(0.0535,-0.2845) | j4 xyz=(0.0775,0.3425) rpy=(-π/2)

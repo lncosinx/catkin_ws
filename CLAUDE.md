@@ -27,8 +27,8 @@ ROS 1 (Noetic) catkin 工作区，用于一台 xArm6 机械臂：用 RealSense �
 `vision_opencv`、`easy_handeye`）都是引入的第三方依赖——`.gitignore` 已把
 `src/xarm_ros`、`src/realsense-ros`、`src/easy_handeye`、`OpenCV_Source/`、
 `build/`、`devel/` 排除在本仓库历史之外。一般不需要改它们，当作已安装的包对待。
-根目录的 `plan.md` / `test_schedule.md` 是当前维护的规划/验证文档；旧的 `docs/`
-已过时，别依赖。
+根目录的 `docs/`为各个部分的介绍
+
 
 ## 构建 / 运行
 
