@@ -1,8 +1,0 @@
-# Request: 告诉视觉节点当前期望抓取的积木形状（用于容错校验）
-int32 target_shape_type
----
-# Response: 返回精调数据
-bool success
-int32 dx       # 目标物理重心与画面正中心的 X 像素偏差
-int32 dy       # 目标物理重心与画面正中心的 Y 像素偏差
-int32 angle    # 重新计算出的高精度绝对角度

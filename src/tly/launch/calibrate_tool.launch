@@ -1,17 +1,77 @@
 <launch>
-    <arg name="robot_ip" default="192.168.1.228" />
+    <arg name="robot_ip" default="192.168.1.216" />
 
-    <!-- 可选：9 或 16。建议 16，用于拟合散落/抓取区域真实平面 -->
-    <arg name="pick_surface_samples" default="16" />
+    <!-- 板面法向/放置面由对齐深度采集（替代旧触点）。空 board_roi=首次交互框选并存盘复用 -->
+    <arg name="board_capture_frames" default="50" />
+    <arg name="board_roi" default="" />
+    <arg name="board_roi_force_interactive" default="false" />
+    <!-- ROI 框选底图：true=彩色图(深度已对齐到彩色,坐标通用,更易看清板面)，false=深度伪彩 -->
+    <arg name="board_roi_use_color" default="true" />
+    <arg name="board_roi_z" default="[0.10, 1.50]" />
+    <arg name="board_ransac_thresh_m" default="0.004" />
+    <arg name="board_min_inliers_frac" default="0.3" /><!-- 主平面最小占比安全闸；宁可调小 ROI 也别轻易降 -->
+    <arg name="board_verify_scale" default="true" />
+
+    <!-- 触点↔深度 Z 偏置自检：true=只触几点空发光板、与步骤2深度平面比偏移、存 DEPTH_TOUCH_Z_OFFSET 后退出 -->
+    <arg name="depth_offset_check" default="false" />
+    <arg name="check_points" default="5" />
+
+    <!-- 单独修改白板放置格心：true=进入交互模式，选 (col,row) 用吸嘴触碰逐格覆盖 BOARD_CENTERS_14x10_BOARD
+         的 XY（覆盖存 BOARD_CELL_OVERRIDES_BOARD），不重标整块网格；需已有步骤2/3结果。改完即退出。 -->
+    <arg name="edit_cells" default="false" />
+
+    <!-- 步骤8 白板格心巡检（验证标定准不准，⚠️会自动驱动真机）：true=驱动机械臂依次悬停到白板各格
+         中心【上方设定高度】，按回车走下一个格；与生产控制器同一路径(原生 move_line + BOARD_POSE_BASE)。
+         需已有步骤2/3结果；只读不写配置；走完即退出。 -->
+    <arg name="verify_cells" default="false" />
+    <!-- 选哪些格：all=全部140格(蛇形); 也可 r3(整行)/c5(整列)/'0,0;9,13'(指定格,col,row) -->
+    <arg name="verify_cells_spec" default="all" />
+    <!-- 每格悬停高度(距该格基准面，米)；巡检中输入 'h' 可改 -->
+    <arg name="verify_height" default="0.05" />
+    <!-- 基准面：bump=格心凸起顶面(查 XY 对准用)；place=放置面 PLACE_Z_MAP(查放置高度用) -->
+    <arg name="verify_z_ref" default="bump" />
+    <!-- move_line 速度/加速度(mm/s, mm/s^2)，巡检宜慢 -->
+    <arg name="verify_speed" default="60" />
+    <arg name="verify_acc" default="300" />
+    <!-- 横移安全平面相对最高格顶的抬升余量(米)，up-over-down 走位用 -->
+    <arg name="verify_travel_clearance" default="0.08" />
+    <!-- true=巡检前把 xArm 工具偏置设为吸盘尖 link_tcp(从 TF 读, 让 move_line 控制 link_tcp, 已存盘) -->
+    <arg name="verify_set_tcp_offset" default="true" />
 
     <!-- 白板标定模式：A=9点，B=25点，C=140点。白板翘曲明显建议 C -->
-    <arg name="board_mode" default="B" />
+    <arg name="board_mode" default="A" />
+
+    <!-- 触点记录源：true=用固件 /xarm/xarm_states.pose 记录（记录源=执行源，消除 URDF 名义运动学与
+         固件出厂标定运动学之间的 ~4-5mm 系统偏差；move_line 可精确复现）；false=用 ROS TF（URDF 系）。
+         该过程纯被动、不命令机械臂运动。默认只【读+核对】固件当前 TCP 偏置是否=吸嘴尖(link_tcp)。 -->
+    <arg name="use_firmware_pose" default="true" />
+    <!-- 仅当固件 TCP 不是吸嘴尖、又懒得去 UF Studio 改时才设 true：本工具会 set_tcp_offset(仍不动臂，
+         但会让上报位姿跳变、且驱动 save_conf 会持久化覆盖 UF Studio 的 TCP)。默认 false=绝不主动改。 -->
+    <arg name="set_tcp_offset_for_record" default="false" />
 
     <!-- 白板高度插值：C 模式建议 idw；A/B 可用 quadratic 或 idw -->
     <arg name="height_interpolation" default="idw" />
 
     <!-- 放置高度额外余量，单位 m；默认 0，需要防刮蹭时可设 0.001 -->
     <arg name="place_z_margin" default="0.001" />
+
+    <!-- 步骤5放置Z：分批摆方块按格心采深度方块顶面。基准=逐格白板凸起顶面(步骤3)。
+         有方块 ⟺ 顶面高出该格凸起 [cover_min_m, top_z_span_m]（绝对窗口，不依赖方块厚）；
+         top_z_span_m 上限只为排除飞点/叠放；win_half=格心采样半窗(px) -->
+    <arg name="place_cover_min_m" default="0.005" />
+    <arg name="place_top_z_span_m" default="0.040" />
+    <arg name="place_sample_win_half" default="1" />
+    <arg name="place_sample_min_valid" default="3" />
+    <!-- true=步骤5先采空白板深度作逐格基准(纯深度对深度,免疫触点零点偏差)；false=用步骤3触点凸起 -->
+    <arg name="place_empty_baseline" default="true" />
+    <!-- true=步骤5开始先【现场点白板四角】当场拟合投影单应性(当前机位+白板本身,最准,免手眼/抓取单应性外推)。
+         这是首选；关掉则按下面 place_use_homography 走 PICK_HOMOGRAPHY 或手眼。 -->
+    <arg name="place_corner_clicks" default="true" />
+    <!-- 点角关掉时的次选：true=用 PICK_HOMOGRAPHY(抓取区标的,用到白板是外推,可能偏)；false/无→手眼3D投影。 -->
+    <arg name="place_use_homography" default="true" />
+    <!-- 每批采完弹彩色覆盖调试图(绿=新增/青=既有/红=未覆盖)并存盘；false=纯文本进度 -->
+    <arg name="place_show_overlay" default="true" />
+    <arg name="place_overlay_save_dir" default="/tmp" />
 
     <arg name="config_path" default="$(find tly)/config/tetris_config.yaml" />
 
@@ -21,30 +81,88 @@
     </include>
 
     <!-- 【核心新增】：在空间点标定阶段，也必须发布精确的吸盘 TCP 坐标系！ -->
-    <node pkg="tf2_ros" type="static_transform_publisher" name="suction_tcp_broadcaster" 
-          args="0.00046 -0.00026 0.06962 0 0 0 link6 link_tcp" />
+    <node pkg="tf2_ros" type="static_transform_publisher" name="suction_tcp_broadcaster"
+          args="0.0008 0.0003 0.068 0 0 0 link6 link_tcp" />
 
-    <!-- 2. 启动 RealSense，相机内参来自 /camera/color/camera_info -->
+    <!-- 2. 启动 RealSense，相机内参来自 /camera/color/camera_info（滤波与手眼标定时一致） -->
+    <arg name="depth_filters" default="spatial,temporal,hole_filling" />
     <include file="$(find realsense2_camera)/launch/rs_camera.launch">
         <arg name="align_depth" value="true" />
+        <arg name="filters" value="$(arg depth_filters)" />
     </include>
 
-    <!-- 3. 启动增强标定工具 -->
-    <node pkg="tly" type="calibration_tool.py" name="calibration_tool" output="screen"
+    <!-- 2.5 手眼 TF：base <- camera_color_optical_frame。
+         步骤2 深度拟板面要把法向从相机系换到 base 系，必须有这段（旧触点版不需要，故此前漏了）。 -->
+    <include file="$(find easy_handeye)/launch/publish.launch">
+        <arg name="eye_on_hand" value="true" />
+        <arg name="namespace_prefix" value="xarm6_realsense_calibration" />
+    </include>
+
+    <!-- 2.6 整流彩色图 -> /camera/color/image_rect_color（步骤7 抓取单应性在它上面点选黑点） -->
+    <node pkg="image_proc" type="image_proc" name="image_proc" ns="/camera/color" output="screen" />
+
+    <!-- 3. 启动白板标定工具 (calibrate_board.py) -->
+    <node pkg="tly" type="calibrate_board.py" name="calibrate_board" output="screen"
           launch-prefix="bash -c 'sleep 5; exec $0 $@'">
         <param name="base_frame" value="link_base" />
         
         <!-- 【核心修改】：让 Python 工具读取真实的吸盘尖端，而不是法兰盘 -->
         <param name="eef_frame" value="link_tcp" />
-        
+
+        <!-- 触点记录源（固件位姿 vs ROS TF），见上文 arg 说明 -->
+        <param name="use_firmware_pose" value="$(arg use_firmware_pose)" />
+        <param name="set_tcp_offset_for_record" value="$(arg set_tcp_offset_for_record)" />
+
         <param name="config_path" value="$(arg config_path)" />
 
-        <param name="pick_surface_samples" value="$(arg pick_surface_samples)" />
+        <param name="depth_offset_check" value="$(arg depth_offset_check)" />
+        <param name="check_points" value="$(arg check_points)" />
+
+        <param name="edit_cells" value="$(arg edit_cells)" />
+
+        <!-- 步骤8 白板格心巡检（验证模式） -->
+        <param name="verify_cells" value="$(arg verify_cells)" />
+        <param name="verify_cells_spec" value="$(arg verify_cells_spec)" />
+        <param name="verify_height" value="$(arg verify_height)" />
+        <param name="verify_z_ref" value="$(arg verify_z_ref)" />
+        <param name="verify_speed" value="$(arg verify_speed)" />
+        <param name="verify_acc" value="$(arg verify_acc)" />
+        <param name="verify_travel_clearance" value="$(arg verify_travel_clearance)" />
+        <param name="verify_set_tcp_offset" value="$(arg verify_set_tcp_offset)" />
+
         <param name="board_mode" value="$(arg board_mode)" />
         <param name="height_interpolation" value="$(arg height_interpolation)" />
         <param name="place_z_margin" value="$(arg place_z_margin)" />
 
+        <!-- 步骤5放置Z（方块顶面深度）参数 -->
+        <param name="place_cover_min_m" value="$(arg place_cover_min_m)" />
+        <param name="place_top_z_span_m" value="$(arg place_top_z_span_m)" />
+        <param name="place_sample_win_half" value="$(arg place_sample_win_half)" />
+        <param name="place_sample_min_valid" value="$(arg place_sample_min_valid)" />
+        <param name="place_empty_baseline" value="$(arg place_empty_baseline)" />
+        <param name="place_corner_clicks" value="$(arg place_corner_clicks)" />
+        <param name="place_use_homography" value="$(arg place_use_homography)" />
+        <param name="place_show_overlay" value="$(arg place_show_overlay)" />
+        <param name="place_overlay_save_dir" value="$(arg place_overlay_save_dir)" />
+
+        <!-- 深度采板面参数 -->
+        <param name="board_capture_frames" value="$(arg board_capture_frames)" />
+        <param name="board_roi" value="$(arg board_roi)" />
+        <param name="board_roi_force_interactive" value="$(arg board_roi_force_interactive)" />
+        <param name="board_roi_use_color" value="$(arg board_roi_use_color)" />
+        <rosparam param="board_roi_z" subst_value="true">$(arg board_roi_z)</rosparam>
+        <param name="board_ransac_thresh_m" value="$(arg board_ransac_thresh_m)" />
+        <param name="board_min_inliers_frac" value="$(arg board_min_inliers_frac)" />
+        <param name="board_verify_scale" value="$(arg board_verify_scale)" />
+        <param name="camera_frame" value="camera_color_optical_frame" />
+        <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw" />
+        <param name="color_topic" value="/camera/color/image_raw" />
+
+        <!-- 步骤7 抓取单应性：整流彩色图 + 点数（可变，至少 min 个、至多 points 个；min 强制 >=4） -->
+        <param name="rect_color_topic" value="/camera/color/image_rect_color" />
+        <param name="pick_homography_points" value="9" />
+        <param name="pick_homography_min_points" value="4" />
+
         <param name="block_samples" value="3" />
-        <param name="board_surface_samples" value="5" />
     </node>
 </launch>

@@ -1,5 +1,5 @@
-// 视觉处理节点（经典版）：轮廓提取 + 模板匹配。
-// 神经网络边缘检测版见 vision_processor_node_dexined.cpp，两者话题/消息契约一致。
+// 视觉处理节点（DexiNed 版）：用 DexiNed ONNX (CUDA) 做边缘检测，再模板匹配。
+// 经典轮廓版见 vision_processor_node.cpp，两者话题/消息契约一致。
 #include <ros/ros.h>
 #include <image_transport/image_transport.h>
 #include <cv_bridge/cv_bridge.h>
@@ -14,6 +14,8 @@
 #include <tf2/LinearMath/Matrix3x3.h>
 
 #include <opencv2/opencv.hpp>
+#include <opencv2/dnn.hpp> // 引入 DNN 模块以支持 DexiNed
+
 #include <vector>
 #include <deque>
 #include <map>
@@ -72,7 +74,7 @@ struct PreprocessDebugImages
     Mat gray;        // 灰度图
     Mat gaussian;    // 高斯模糊后灰度图
     Mat otsu_binary; // OTSU 反二值图参考
-    Mat morphology;  // 经典流程生成的最终掩码
+    Mat morphology;  // DexiNed/传统流程生成的最终掩码
 };
 
 // --- 数学与辅助工具 ---
@@ -174,12 +176,26 @@ public:
 
     void update(const Detection &det)
     {
-        shape_id = det.shape_id;
-        name = det.name;
         if (history.size() >= history_len)
             history.pop_front();
         history.push_back(det);
         missed = 0;
+
+        // 形状多帧【多数投票】：某块偶尔单帧闪成别的形状、或被切两半给出错形状，
+        // 只要多数帧是对的，输出形状就保持正确稳定（不再跟着单帧抖）。
+        int counts[7] = {0, 0, 0, 0, 0, 0, 0};
+        for (auto &d : history)
+            if (d.shape_id >= 0 && d.shape_id < 7)
+                counts[d.shape_id]++;
+        int best = det.shape_id, bestc = -1;
+        for (int s = 0; s < 7; ++s)
+            if (counts[s] > bestc)
+            {
+                bestc = counts[s];
+                best = s;
+            }
+        shape_id = best;
+        name = SHAPE_NAMES.count(best) ? SHAPE_NAMES.at(best) : det.name;
     }
 
     void mark_missed() { missed++; }
@@ -227,39 +243,8 @@ public:
         return 360.0;
     }
 
-    // T(2)/L_left(3)/L_right(4)：无旋转对称，朝向需 mod-360。这些形状的“柄/缺口方向”
-    // 容易因个别帧分割噪声判反 180°；故方向不锁首帧，而由历史各帧独立测量投票决定。
-    static bool is_directed_shape(int sid) { return sid == 2 || sid == 3 || sid == 4; }
-
-    // 先用 mod-180 主轴的稳健圆均值定轴，再用各帧相对该轴的 ±180 偏差多数表决定朝向。
-    // 单帧误判会被多数正确帧覆盖，不会像“吸附首帧参考”那样把整条 track 锁死在错误 180°。
-    double directed_stable_angle() const
-    {
-        vector<double> angs;
-        for (auto &d : history)
-            angs.push_back(d.angle_deg);
-        double axis180 = vision_utils::meanPeriodicAnglePeriod(angs, 180.0);
-        int vote_flip = 0, vote_keep = 0;
-        for (double a : angs)
-        {
-            double diff = a - axis180;
-            while (diff < -180.0)
-                diff += 360.0;
-            while (diff >= 180.0)
-                diff -= 360.0;
-            if (std::abs(diff) > 90.0)
-                vote_flip++;
-            else
-                vote_keep++;
-        }
-        double directed = (vote_flip > vote_keep) ? axis180 + 180.0 : axis180;
-        return fmod(directed + 360.0, 360.0);
-    }
-
     double stable_angle() const
     {
-        if (is_directed_shape(shape_id))
-            return directed_stable_angle();
         vector<double> angs;
         for (auto &d : history)
             angs.push_back(d.angle_deg);
@@ -298,10 +283,7 @@ public:
         vector<double> angs;
         for (auto &d : history)
             angs.push_back(d.angle_deg);
-        // T/L 的朝向交给多数表决；稳定性只衡量 mod-180 主轴抖动，
-        // 避免方向 180° 翻转把本应稳定的块误判为“不稳定”而永不发布。
-        double period = is_directed_shape(shape_id) ? 180.0 : angle_period_for_shape(shape_id);
-        return vision_utils::angleStdDevDegPeriod(angs, period);
+        return vision_utils::angleStdDevDegPeriod(angs, angle_period_for_shape(shape_id));
     }
 
     bool is_stable(int min_frames, double max_px_std, double max_angle_std, int allowed_missed = 0) const
@@ -738,6 +720,7 @@ private:
     string threshold_mode;
     int manual_dark_threshold, blur_kernel, close_kernel, open_kernel;
     double min_area, max_area, min_template_iou, min_fill, max_fill;
+    double poly_approx_eps_ratio; // 匹配前轮廓多边形近似的 eps 比例(占周长)，0=不近似
     bool use_lightboard_mask;
     double lightboard_min_area_ratio;
     int lightboard_close_kernel;
@@ -750,6 +733,19 @@ private:
     bool publish_angle_in_table_frame;
     double angle_axis_probe_px;
     bool publish_preprocess_debug;
+
+    // DexiNed 参数
+    bool use_dexined_;
+    string dexined_model_path_;
+    double dexined_thresh_;
+    double nms_center_dist_px_; // 同帧 NMS：两检测质心距(全分辨率 px)小于此 → 视为同块，留高分
+    double color_edge_thresh_;  // Lab a/b 色度梯度的"颜色边界"阈值(0-255)，切异色贴碰块
+    int color_edge_min_area_;   // 颜色边连通域最小面积：滤掉掉漆/划痕的零碎小边
+    bool use_dexined_for_split_; // true=或上 DexiNed 强边切同色贴碰块；false=纯颜色(最稳)
+    double temporal_alpha_;      // 输入帧时间平均(EMA)系数，0=关；静止场景抑噪/抗背光闪烁
+    Mat avg_frame_;              // EMA 累积帧(CV_32FC3)
+    bool avg_init_ = false;
+    cv::dnn::Net dexined_net_;
 
     string pick_point_mode;
     vector<int> distance_pick_shapes;
@@ -789,7 +785,7 @@ public:
         pnh_.param("image_topic", image_topic, string("/camera/color/image_rect_color"));
         pnh_.param("camera_info_topic", camera_info_topic, string("/camera/color/camera_info"));
         pnh_.param("assume_image_rectified", assume_rectified, true);
-        // table_frame 已废弃（全量 base 化）。这里仅用于 debug 投影/PoseArray，默认 link_base；
+        // table_frame 已废弃（全量 base 化）。仅用于 debug 投影/PoseArray，默认 link_base；
         // board_state 契约只用像素+图像角，不依赖此 TF。
         pnh_.param("table_frame", table_frame, string("link_base"));
         pnh_.param("camera_frame", camera_frame_override, string(""));
@@ -819,9 +815,20 @@ public:
         pnh_.param("use_contour_axis_yaw", use_contour_axis_yaw, true);
         pnh_.param("contour_axis_probe_px", contour_axis_probe_px, 50.0);
 
+        // DexiNed 模块参数配置
+        pnh_.param("use_dexined", use_dexined_, true);
+        pnh_.param("dexined_model_path", dexined_model_path_, string("/root/catkin_ws/src/tly/module/dexined.onnx"));
+        pnh_.param("dexined_thresh", dexined_thresh_, 100.0);
+
         pnh_.param("min_area", min_area, 900.0);
         pnh_.param("max_area", max_area, 50000.0);
         pnh_.param("min_template_iou", min_template_iou, 0.42);
+        pnh_.param("poly_approx_eps_ratio", poly_approx_eps_ratio, 0.02);
+        pnh_.param("nms_center_dist_px", nms_center_dist_px_, 35.0);
+        pnh_.param("color_edge_thresh", color_edge_thresh_, 20.0);
+        pnh_.param("color_edge_min_area", color_edge_min_area_, 40);
+        pnh_.param("use_dexined_for_split", use_dexined_for_split_, true);
+        pnh_.param("temporal_alpha", temporal_alpha_, 0.3);
         pnh_.param("max_contour_fill_ratio", max_fill, 0.98);
         pnh_.param("min_contour_fill_ratio", min_fill, 0.18);
 
@@ -852,6 +859,26 @@ public:
         // 对齐深度在“彩色原图(带畸变)”坐标系；采样前把 rect 像素映射回 raw 像素。
         pnh_.param("depth_sample_in_raw_color", depth_sample_in_raw_color_, true);
 
+        // 初始化强制加载 CUDA 版的 DexiNed 模型
+        if (use_dexined_)
+        {
+            try
+            {
+                dexined_net_ = cv::dnn::readNet(dexined_model_path_);
+                // 强制只允许使用 CUDA 执行网络推理！
+                dexined_net_.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
+                dexined_net_.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA);
+                ROS_INFO("DexiNed model loaded successfully from %s. STRICTLY bounded to CUDA GPU processing.", dexined_model_path_.c_str());
+            }
+            catch (const cv::Exception &e)
+            {
+                ROS_ERROR("CRITICAL ERROR: Failed to configure DexiNed to use CUDA. Error: %s", e.what());
+                ROS_ERROR("Ensure your OpenCV build explicitly enabled WITH_CUDA=ON and WITH_CUDNN=ON.");
+                ROS_WARN("Falling back to classical CPU CV pipeline.");
+                use_dexined_ = false;
+            }
+        }
+
         templates = new TemplateBank(template_size, template_angle_step, template_refine_step);
 
         info_sub = nh_.subscribe(camera_info_topic, 1, &VisionProcessorNode::info_cb, this);
@@ -872,7 +899,7 @@ public:
         if (use_depth_pick_z_)
             depth_sampler_.init(nh_, depth_topic_);
 
-        ROS_INFO("C++ Vision node (classical contour + template matching) ready. depth_pick_z=%s topic=%s",
+        ROS_INFO("C++ Vision node (DexiNed edge detection, CUDA) ready. depth_pick_z=%s topic=%s",
                  use_depth_pick_z_ ? "on" : "off", depth_topic_.c_str());
     }
 
@@ -1243,9 +1270,112 @@ public:
 
         Mat mask_roi, edges_roi;
 
-        // 经典轮廓 + 模板匹配流程：阈值分割（OTSU/自适应/手动）+ 可选饱和度前景
-        // + 发光板掩码 + 形态学，再 Canny 出边缘。
+        if (use_dexined_ && !dexined_net_.empty())
         {
+            try
+            {
+                // DexiNed 要求输入长宽最好是 16 的倍数，进行 Padding 规避 shape 问题
+                int pad_w = (16 - (roi.cols % 16)) % 16;
+                int pad_h = (16 - (roi.rows % 16)) % 16;
+                Mat roi_padded;
+                copyMakeBorder(roi, roi_padded, 0, pad_h, 0, pad_w, BORDER_REFLECT);
+
+                // BGR 均值扣除 (ImageNet 标准) - blobFromImage 在执行 forward 时，底层 CUDA 引擎会负责 host->device
+                Mat blob = cv::dnn::blobFromImage(roi_padded, 1.0, Size(), Scalar(103.939, 116.779, 123.68), false, false);
+                dexined_net_.setInput(blob);
+
+                vector<String> outNames = dexined_net_.getUnconnectedOutLayersNames();
+                // 这一步彻底在 GPU 上执行，依赖我们在初始化声明的 backend/target!
+                Mat out = dexined_net_.forward(outNames[0]);
+
+                // 提取第一通道的边缘热力图 (大小为 1x1xHxW)
+                Mat edge_map(out.size[2], out.size[3], CV_32F, out.ptr<float>());
+
+                // 裁剪回原 ROI 大小
+                edge_map = edge_map(Rect(0, 0, roi.cols, roi.rows));
+
+                // 归一化并转成 0-255 灰度图 (在 CPU 层面进行极简操作，速度足够快)
+                normalize(edge_map, edge_map, 0, 255, NORM_MINMAX);
+                edge_map.convertTo(edges_roi, CV_8UC1);
+
+                // 块前景：暗块(灰度OTSU) ∪ 彩色块(HSV高饱和)，兼顾黑块与彩色块。
+                Mat fg;
+                threshold(gray, fg, 0, 255, THRESH_BINARY_INV | THRESH_OTSU);
+                if (use_saturation_foreground)
+                {
+                    Mat hsv, sat_mask, val_mask, sat_fg;
+                    cvtColor(roi, hsv, COLOR_BGR2HSV);
+                    vector<Mat> hsv_ch;
+                    split(hsv, hsv_ch);
+                    threshold(hsv_ch[1], sat_mask, saturation_min, 255, THRESH_BINARY);
+                    threshold(hsv_ch[2], val_mask, saturation_value_min, 255, THRESH_BINARY);
+                    bitwise_and(sat_mask, val_mask, sat_fg);
+                    morphologyEx(sat_fg, sat_fg, MORPH_OPEN, getStructuringElement(MORPH_RECT, Size(3, 3)));
+                    bitwise_or(fg, sat_fg, fg);
+                }
+
+                // 核心（彩色版）：用 Lab 色度(a,b)梯度作“颜色边界”切割线，替代逐帧抖动、
+                // 会被块内眩光过切的 DexiNed 边缘。块内均匀色→a/b 无梯度→不内部过切；
+                // 眩光只改亮度 L→不动 a/b→对眩光免疫；异色块边界色度突变→强梯度→切开。
+                // 同色贴碰块仍会并(少数，后续可在同色区内再用 DexiNed 边缘切)。
+                Mat lab;
+                cvtColor(roi, lab, COLOR_BGR2Lab);
+                vector<Mat> lab_ch;
+                split(lab, lab_ch);
+                Mat k3 = getStructuringElement(MORPH_RECT, Size(3, 3));
+                Mat ga, gb, color_edge;
+                morphologyEx(lab_ch[1], ga, MORPH_GRADIENT, k3);
+                morphologyEx(lab_ch[2], gb, MORPH_GRADIENT, k3);
+                max(ga, gb, color_edge);
+                threshold(color_edge, color_edge, color_edge_thresh_, 255, THRESH_BINARY);
+
+                // 混合：或上 DexiNed 几何强边，专门切【同色】贴碰块（颜色无边界处）。
+                // 用高阈值只取强边滤掉眩光；大部分块仍靠稳定颜色分开，DexiNed 只补同色残活。
+                if (use_dexined_for_split_)
+                {
+                    Mat dex_bin; // 此刻 edges_roi 仍是 DexiNed 归一化边图（末尾才被 color_edge 覆盖）
+                    threshold(edges_roi, dex_bin, dexined_thresh_, 255, THRESH_BINARY);
+                    bitwise_or(color_edge, dex_bin, color_edge);
+                }
+
+                // 去掉“掉漆/划痕”等块内小斑点产生的零碎颜色边：真边界是成片连续的长线，
+                // 掉漆是孤立小斑点 → 按连通域面积一筛即分开。这样阈值能压低分开贴碰块，
+                // 又不会被块内掉漆切碎。
+                if (color_edge_min_area_ > 0)
+                {
+                    Mat ce_lbl, ce_stats, ce_cent;
+                    int ne = connectedComponentsWithStats(color_edge, ce_lbl, ce_stats, ce_cent, 8, CV_32S);
+                    vector<uchar> keep(ne, 0);
+                    for (int i = 1; i < ne; ++i)
+                        keep[i] = (ce_stats.at<int>(i, CC_STAT_AREA) >= color_edge_min_area_) ? 255 : 0;
+                    for (int y = 0; y < ce_lbl.rows; ++y)
+                    {
+                        const int *lr = ce_lbl.ptr<int>(y);
+                        uchar *cr = color_edge.ptr<uchar>(y);
+                        for (int x = 0; x < ce_lbl.cols; ++x)
+                            cr[x] = keep[lr[x]];
+                    }
+                }
+
+                dilate(color_edge, color_edge, k3); // 加粗确保切透 findContours 8连通
+
+                subtract(fg, color_edge, mask_roi);
+                if (open_kernel > 1)
+                    morphologyEx(mask_roi, mask_roi, MORPH_OPEN, Mat::ones(open_kernel, open_kernel, CV_8UC1));
+
+                edges_roi = color_edge; // debug_edges 显示颜色边界（替代原 DexiNed 边）
+            }
+            catch (const cv::Exception &e)
+            {
+                ROS_ERROR_THROTTLE(2.0, "DexiNed inference failed on CUDA GPU! Msg: %s", e.what());
+                // 防御性生成空掩码防止段错误，保持节点活在状态
+                mask_roi = Mat::zeros(roi.size(), CV_8UC1);
+                edges_roi = Mat::zeros(roi.size(), CV_8UC1);
+            }
+        }
+        else
+        {
+            // 作为安全退路代码保留：仅当 use_dexined 在 launch 里设为 false 时才会进来
             Mat otsu_roi;
             threshold(gray, otsu_roi, 0, 255, THRESH_BINARY_INV | THRESH_OTSU);
 
@@ -1343,12 +1473,32 @@ public:
         }
 
         double stamp = msg->header.stamp.toSec();
+
+        // 时间平均(EMA)：静止料堆下抑制传感器噪声/背光闪烁带来的逐帧抖动，分割更稳。
+        // 块在动时会有拖影(但动着本就不稳)；扫描阶段静止，正好用。
+        Mat proc_frame;
+        if (temporal_alpha_ > 0.0 && temporal_alpha_ < 1.0)
+        {
+            Mat f32;
+            frame.convertTo(f32, CV_32FC3);
+            if (!avg_init_ || avg_frame_.size() != f32.size())
+            {
+                avg_frame_ = f32.clone();
+                avg_init_ = true;
+            }
+            else
+                addWeighted(avg_frame_, 1.0 - temporal_alpha_, f32, temporal_alpha_, 0.0, avg_frame_);
+            avg_frame_.convertTo(proc_frame, CV_8UC3);
+        }
+        else
+            proc_frame = frame;
+
         Mat small_frame, fg_mask, edges_mask;
         double scale;
         PreprocessDebugImages preprocess_dbg;
 
-        // 1. 预处理：经典阈值分割 + 发光板掩码 + 形态学，生成前景掩码
-        process_foreground(frame, small_frame, fg_mask, edges_mask, scale, publish_preprocess_debug ? &preprocess_dbg : nullptr);
+        // 1. CPU/GPU 预处理 (强制启用 CUDA 的 DexiNed 边缘提取 & 掩码生成)
+        process_foreground(proc_frame, small_frame, fg_mask, edges_mask, scale, publish_preprocess_debug ? &preprocess_dbg : nullptr);
 
         // 2. 轮廓提取与分类
         double inv_scale = 1.0 / scale;
@@ -1366,8 +1516,12 @@ public:
             if (fill < min_fill || fill > max_fill || bb.width < 10 || bb.height < 10)
                 continue;
 
+            // 匹配前用 approxPolyDP 把分水岭波纹边拉直再光栅化（只影响分类，不动几何）。
             Mat c_mask = Mat::zeros(fg_mask.size(), CV_8UC1);
-            vector<vector<Point>> tmp_cnt = {cnt};
+            vector<Point> cnt_poly;
+            if (poly_approx_eps_ratio > 0.0)
+                approxPolyDP(cnt, cnt_poly, poly_approx_eps_ratio * arcLength(cnt, true), true);
+            vector<vector<Point>> tmp_cnt = {cnt_poly.size() >= 3 ? cnt_poly : cnt};
             drawContours(c_mask, tmp_cnt, 0, Scalar(255), FILLED);
             Mat norm = TemplateBank::normalize_binary_mask(c_mask(bb), template_size);
 
@@ -1422,6 +1576,33 @@ public:
             d.score = iou;
             d.stamp = stamp;
             detections.push_back(d);
+        }
+
+        // 2.5 同帧 NMS：分水岭过切 + 无去重会让一个块出多个框。按分数降序贪心，
+        //     新检测若质心离已保留的某个太近，判为同块、抑制掉。
+        if (nms_center_dist_px_ > 0.0 && detections.size() > 1)
+        {
+            std::sort(detections.begin(), detections.end(),
+                      [](const Detection &a, const Detection &b) { return a.score > b.score; });
+            double gate2 = nms_center_dist_px_ * nms_center_dist_px_;
+            vector<Detection> kept;
+            for (const auto &d : detections)
+            {
+                bool dup = false;
+                for (const auto &k : kept)
+                {
+                    double dx = d.geom_px.x - k.geom_px.x;
+                    double dy = d.geom_px.y - k.geom_px.y;
+                    if (dx * dx + dy * dy < gate2)
+                    {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup)
+                    kept.push_back(d);
+            }
+            detections.swap(kept);
         }
 
         // 3. TF 坐标转换优化
@@ -1571,6 +1752,36 @@ public:
         return numeric_limits<double>::infinity();
     }
 
+    static double angleDiffDeg(double a, double b) { return fmod(a - b + 540.0, 360.0) - 180.0; }
+    static double norm360(double a)
+    {
+        double r = fmod(a, 360.0);
+        return r < 0 ? r + 360.0 : r;
+    }
+
+    Detection make_angle_consistent_with_track(const BlockTrack &tr, const Detection &det) const
+    {
+        Detection out = det;
+        if (!(det.shape_id == 2 || det.shape_id == 3 || det.shape_id == 4))
+            return out;
+        if (tr.count() < 2)
+            return out;
+        double prev = tr.stable_angle();
+        double candidates[3] = {det.angle_deg, det.angle_deg + 180.0, det.angle_deg - 180.0};
+        double best = candidates[0], best_abs = std::abs(angleDiffDeg(candidates[0], prev));
+        for (double c : candidates)
+        {
+            double e = std::abs(angleDiffDeg(c, prev));
+            if (e < best_abs)
+            {
+                best_abs = e;
+                best = c;
+            }
+        }
+        out.angle_deg = norm360(best);
+        return out;
+    }
+
     void update_tracks(const vector<Detection> &detections)
     {
         vector<int> unmatched_t(tracks.size()), unmatched_d(detections.size());
@@ -1600,9 +1811,7 @@ public:
             auto it_d = find(unmatched_d.begin(), unmatched_d.end(), p.di);
             if (it_t != unmatched_t.end() && it_d != unmatched_d.end())
             {
-                // 直接存入各帧“独立”朝向测量；T/L 的 180° 由 stable_angle 多帧投票解析，
-                // 不再吸附首帧参考（避免首帧误判被永久锁死）。
-                tracks[p.ti].update(detections[p.di]);
+                tracks[p.ti].update(make_angle_consistent_with_track(tracks[p.ti], detections[p.di]));
                 unmatched_t.erase(it_t);
                 unmatched_d.erase(it_d);
             }
@@ -1722,7 +1931,7 @@ public:
 
 int main(int argc, char **argv)
 {
-    ros::init(argc, argv, "vision_processor_node_cpp");
+    ros::init(argc, argv, "vision_processor_node_dexined");
     VisionProcessorNode node;
     ros::AsyncSpinner spinner(5);
     spinner.start();

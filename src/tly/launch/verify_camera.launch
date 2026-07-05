@@ -1,0 +1,25 @@
+<launch>
+    <!-- 相机内参验证：起 RealSense + 验证节点。只需要相机，不需要机械臂。 -->
+    <arg name="mode" default="report,points" />   <!-- report / points / aruco 逗号组合 -->
+    <arg name="known_distance_m" default="0.0" /> <!-- points 模式：你尺子量的真实距离(m) -->
+    <arg name="marker_length_m" default="0.0" />  <!-- aruco 模式：打印的 marker 实际边长(m) -->
+    <arg name="capture_frames" default="30" />
+
+    <!-- RealSense（深度对齐到 color；滤波与手眼标定时一致） -->
+    <arg name="depth_filters" default="spatial,temporal,hole_filling" />
+    <include file="$(find realsense2_camera)/launch/rs_camera.launch">
+        <arg name="align_depth" value="true" />
+        <arg name="filters" value="$(arg depth_filters)" />
+    </include>
+
+    <node pkg="tly" type="verify_camera_intrinsics.py" name="verify_camera_intrinsics" output="screen"
+          launch-prefix="bash -c 'sleep 4; exec $0 $@'">
+        <param name="mode" value="$(arg mode)" />
+        <param name="known_distance_m" value="$(arg known_distance_m)" />
+        <param name="marker_length_m" value="$(arg marker_length_m)" />
+        <param name="capture_frames" value="$(arg capture_frames)" />
+        <param name="color_info_topic" value="/camera/color/camera_info" />
+        <param name="color_topic" value="/camera/color/image_raw" />
+        <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw" />
+    </node>
+</launch>

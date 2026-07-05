@@ -1,0 +1,37 @@
+<launch>
+    <!-- =========================================================
+         仅测试策略节点 strategy_node（纯算法，无任何硬件依赖）。
+         手动喂入 /vision/board_state 即可触发规划，观察 /tetris_plan：
+
+         布局：7 库存 + 140 占用栅格(14x10) + num_blocks
+               + [shape,u,v,angle,geom_u,geom_v] * num_blocks
+         例（全 0 栅格、库存随便给，像素任意）可用脚本/rostopic pub 构造。
+         观察输出： rostopic echo /tetris_plan
+
+         进阶任务：advanced_mode:=true，按 shape_sequence(下方)循环放置；
+         此模式不要求库存达 34/35（只放一部分），稳定即求解。
+         ========================================================= -->
+    <arg name="advanced_mode" default="false" />
+    <arg name="seq_cyclic" default="true" />
+    <arg name="seq_require_support" default="true" />
+    <!-- 满行且≥4色额外加分(竞赛规则②)。默认 false：实际比赛可能没有此约束 -->
+    <arg name="seq_reward_four_colors" default="false" />
+
+    <node pkg="tly" type="strategy_node" name="strategy_node" output="screen">
+        <param name="expected_total_blocks" value="35" />
+        <param name="inventory_stable_required_frames" value="5" />
+        <param name="min_usable_total_blocks" value="35" />
+        <param name="min_usable_stable_required_frames" value="3" />
+
+        <!-- 进阶任务参数 -->
+        <param name="advanced_mode" value="$(arg advanced_mode)" />
+        <param name="seq_cyclic" value="$(arg seq_cyclic)" />
+        <param name="seq_require_support" value="$(arg seq_require_support)" />
+        <param name="seq_reward_four_colors" value="$(arg seq_reward_four_colors)" />
+        <!-- 形状放置顺序 (0线/1田/2T/3L左/4L右/5Z左/6Z右)，按现场抽签填写 -->
+        <rosparam param="shape_sequence">[0, 1, 2, 3, 4, 5, 6]</rosparam>
+        <!-- 可选：每种形状“可吸取上限”，长度 7 对应形状 id；<0=不限制(默认)。
+             例：只允许吸 2 个 id=0，其余不限 -> [2,-1,-1,-1,-1,-1,-1]。缺省则整行删掉。 -->
+        <!-- <rosparam param="shape_pick_limits">[-1, -1, -1, -1, -1, -1, -1]</rosparam> -->
+    </node>
+</launch>

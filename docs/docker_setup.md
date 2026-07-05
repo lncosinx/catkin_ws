@@ -1,5 +1,5 @@
 
-若在Windows上使用docker容器，请参考：https://learn.microsoft.com/en-us/windows/wsl/install，安装wsl，并参考：https://learn.microsoft.com/en-us/windows/wsl/tutorials/wsl-containers，安装docker
+若在Windows上使用docker容器（不推荐），请参考：https://learn.microsoft.com/en-us/windows/wsl/install，安装wsl，并参考：https://learn.microsoft.com/en-us/windows/wsl/tutorials/wsl-containers，安装docker
 
 参考[wsl_usb.md](wsl_usb.md)使用usbipd_win来挂载usb设备，不要将wsl的网络模式设置为mirror，可能会连不上机械臂，请设置为nat
 

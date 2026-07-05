@@ -13,7 +13,6 @@ Kept ROS interfaces:
   Publishes /vision/board_state:
     inventory[7] + board_state[140] + num_blocks + [shape,u,v,angle]*n
   Publishes /vision/debug_image
-  Service /vision/get_precise_pose, same old response fields.
 
 Shape IDs remain compatible with strategy_node.cpp:
   0 line, 1 square, 2 T, 3 L_left, 4 L_right, 5 Z_left, 6 Z_right
@@ -36,7 +35,6 @@ from geometry_msgs.msg import Pose, PoseArray
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Int32MultiArray
 from tf.transformations import quaternion_matrix, quaternion_from_euler
-from tly.srv import GetPrecisePose, GetPrecisePoseResponse
 
 
 SHAPE_NAMES = {
@@ -321,7 +319,8 @@ class ShapeTemplateVisionNode(object):
         self.image_topic = rospy.get_param("~image_topic", "/camera/color/image_rect_color")
         self.camera_info_topic = rospy.get_param("~camera_info_topic", "/camera/color/camera_info")
         self.assume_image_rectified = bool(rospy.get_param("~assume_image_rectified", True))
-        self.table_frame = rospy.get_param("~table_frame", "table_frame")
+        # table_frame 已废弃（全量 base 化）。仅 debug 用，默认 link_base；board_state 不依赖此 TF。
+        self.table_frame = rospy.get_param("~table_frame", "link_base")
         self.camera_frame_override = rospy.get_param("~camera_frame", "")
         self.target_plane_z = rospy.get_param("~target_plane_z", rospy.get_param("/tetris/PICK_Z", 0.0))
         self.hover_z = rospy.get_param("~hover_z", rospy.get_param("/tetris/HOVER_Z", 0.10))
@@ -363,10 +362,6 @@ class ShapeTemplateVisionNode(object):
         self.stable_max_angle_std_deg = float(rospy.get_param("~stable_max_angle_std_deg", 5.0))
         self.publish_only_stable = bool(rospy.get_param("~publish_only_stable", True))
 
-        self.precise_timeout = float(rospy.get_param("~precise_timeout", 0.8))
-        self.precise_require_stable = bool(rospy.get_param("~precise_require_stable", True))
-        self.precise_center_gate_px = float(rospy.get_param("~precise_center_gate_px", 280.0))
-
         self.publish_debug_foreground = bool(rospy.get_param("~publish_debug_foreground", True))
         self.publish_debug_edges = bool(rospy.get_param("~publish_debug_edges", True))
         self.publish_debug_pose_array = bool(rospy.get_param("~publish_debug_pose_array", True))
@@ -388,7 +383,6 @@ class ShapeTemplateVisionNode(object):
 
         self.info_sub = rospy.Subscriber(self.camera_info_topic, CameraInfo, self.camera_info_callback, queue_size=1)
         self.image_sub = rospy.Subscriber(self.image_topic, Image, self.image_callback, queue_size=1, buff_size=2 ** 24)
-        self.precise_srv = rospy.Service("/vision/get_precise_pose", GetPrecisePose, self.handle_precise_pose)
 
         rospy.loginfo(
             "Shape-template vision ready. image=%s camera_info=%s table_frame=%s plane_z=%.4f rectified=%s",
@@ -705,79 +699,6 @@ class ShapeTemplateVisionNode(object):
                 self.edges_pub.publish(self.bridge.cv2_to_imgmsg(edges, "mono8"))
         except CvBridgeError as exc:
             rospy.logerr("debug publish failed: %s", str(exc))
-
-    def _center_table_point(self, frame_shape, header):
-        cx, cy = self.camera_model.image_center(frame_shape)
-        tx = self._lookup_camera_to_table(header)
-        if tx is None:
-            return None, (cx, cy)
-        return self._pixel_to_table_point(cx, cy, tx), (cx, cy)
-
-    def _equivalent_controller_pixels_from_metric_offset(self, dx_table, dy_table):
-        intr = self.camera_model.intrinsics_for_equivalent_pixel()
-        if intr is None:
-            return None
-        fx, fy, _, _ = intr
-        z_dist = max(abs(float(self.hover_z) - float(self.target_plane_z)), 1e-4)
-        # Keep compatible with current controller: dX=response.dy*z/fy, dY=response.dx*z/fx.
-        return int(round(float(dy_table) * fx / z_dist)), int(round(float(dx_table) * fy / z_dist))
-
-    def _select_precise_track(self, shape_id, frame_shape, header):
-        deadline = time.time() + self.precise_timeout
-        center_table, center_px = self._center_table_point(frame_shape, header)
-        chosen = None
-        while time.time() <= deadline:
-            with self.lock:
-                candidates = []
-                for tr in self.tracks:
-                    if tr.shape_id != int(shape_id) or tr.missed != 0:
-                        continue
-                    if self.precise_require_stable and not tr.is_stable(self.stable_min_frames, self.stable_max_px_std, self.stable_max_angle_std_deg):
-                        continue
-                    pu, pv = tr.stable_px_pick()
-                    if self._px_distance((pu, pv), center_px) > self.precise_center_gate_px:
-                        continue
-                    p = tr.stable_table_pick()
-                    dist = self._table_distance(p, center_table) if p is not None and center_table is not None else self._px_distance((pu, pv), center_px)
-                    candidates.append((dist, tr))
-                if candidates:
-                    candidates.sort(key=lambda x: x[0])
-                    chosen = candidates[0][1]
-                    break
-            rospy.sleep(0.03)
-        return chosen, center_table, center_px
-
-    def handle_precise_pose(self, req):
-        shape_id = int(req.target_shape_type)
-        with self.lock:
-            if self.latest_frame is None:
-                rospy.logwarn("Precise Vision: no image received yet.")
-                return GetPrecisePoseResponse(success=False, dx=0, dy=0, angle=0)
-            frame_shape = self.latest_frame.shape
-            header = self.latest_header
-        track, center_table, center_px = self._select_precise_track(shape_id, frame_shape, header)
-        if track is None:
-            rospy.logwarn("Precise Vision: no stable target shape %d near image center.", shape_id)
-            return GetPrecisePoseResponse(success=False, dx=0, dy=0, angle=0)
-        target_table = track.stable_table_pick()
-        if target_table is not None and center_table is not None:
-            offset = np.array(target_table[:2], dtype=np.float64) - np.array(center_table[:2], dtype=np.float64)
-            eq = self._equivalent_controller_pixels_from_metric_offset(offset[0], offset[1])
-            if eq is None:
-                return GetPrecisePoseResponse(success=False, dx=0, dy=0, angle=0)
-            dx_resp, dy_resp = eq
-            rospy.loginfo(
-                "Precise shape-template: shape=%d track=%d %s | pick_table=(%.6f, %.6f, %.6f) | center_table=(%.6f, %.6f, %.6f) | metric_offset=(%.4f, %.4f) | eq_dxdy=(%d,%d) | angle=%d | score=%.2f",
-                shape_id, track.track_id, SHAPE_NAMES.get(shape_id, "?"),
-                target_table[0], target_table[1], target_table[2],
-                center_table[0], center_table[1], center_table[2],
-                offset[0], offset[1], dx_resp, dy_resp, int(round(track.stable_angle())), track.stable_score(),
-            )
-        else:
-            pu, pv = track.stable_px_pick()
-            dx_resp = int(round(pu - center_px[0]))
-            dy_resp = int(round(pv - center_px[1]))
-        return GetPrecisePoseResponse(success=True, dx=int(dx_resp), dy=int(dy_resp), angle=int(round(track.stable_angle())))
 
 
 if __name__ == "__main__":

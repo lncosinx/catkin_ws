@@ -2,9 +2,17 @@
     <!-- =========================
          Basic arguments
          ========================= -->
-    <arg name="robot_ip" default="192.168.1.228" />
+    <arg name="robot_ip" default="192.168.1.216" />
     <arg name="expected_blocks" default="35" />
     <arg name="place_z_extra_margin" default="0.005" />
+    <!-- 视觉实现: vision_processor_node_cpp (经典轮廓+模板) 或
+         vision_processor_node_dexined (神经网络边缘检测) -->
+    <arg name="vision_node" default="vision_processor_node_cpp" />
+    <!-- 进阶任务模式: true 则策略按 shape_sequence 求解(详见 strategy_node) -->
+    <arg name="advanced_mode" default="true" />
+    <!-- 非进阶任务: 策略节点保留的同分最优候选布局数(>1 时由 path_planner 按关节运动代价择优)。
+         1=旧行为(单解直发)。 roslaunch tly tly.launch num_candidates:=10 -->
+    <arg name="num_candidates" default="8" />
     <param name="robot_description" command="$(find xacro)/xacro --inorder '$(find xarm_description)/urdf/xarm_device.urdf.xacro' robot_type:=xarm dof:=6 add_gripper:=false" />
 
     <!-- =========================
@@ -28,9 +36,12 @@
 
     <!-- =========================
          2. RealSense camera
+         滤波与手眼标定/工具脚本一致：背光板深度更密更稳，反投影/深度Z 更可靠
          ========================= -->
+    <arg name="depth_filters" default="spatial,temporal,hole_filling" />
     <include file="$(find realsense2_camera)/launch/rs_camera.launch">
         <arg name="align_depth" value="true" />
+        <arg name="filters" value="$(arg depth_filters)" />
     </include>
 
     <!-- =========================
@@ -48,10 +59,7 @@
          ========================= -->
     <rosparam file="$(find tly)/config/tetris_config.yaml" command="load" />
 
-    <!-- =========================
-         5. table_frame publisher
-         ========================= -->
-    <node pkg="tly" type="table_tf_broadcaster.py" name="table_tf_broadcaster" output="screen" />
+    <!-- 5. （已移除 table_frame publisher：全量 base 化，board_frame 由 BOARD_POSE_BASE 常量加载）-->
 
     <!-- =========================
          6. Generate /camera/color/image_rect_color
@@ -63,75 +71,98 @@
          Make sure CMake executable name is vision_processor_node_cpp.
          If your executable is vision_processor_node, change type below accordingly.
          ========================= -->
+    <arg name="color_edge_thresh" default="35" /><!-- 命令行可覆盖,边看 debug_edges 边扫 -->
+    <arg name="color_edge_min_area" default="40" /><!-- 颜色边最小连通面积:滤掉掉漆零碎边,掉漆还切就调大 -->
+    <arg name="use_dexined_for_split" default="true" /><!-- 或上DexiNed强边切同色贴碰块;不稳就设false纯颜色 -->
+    <arg name="temporal_alpha" default="0.3" /><!-- 输入帧EMA时间平均系数,0=关;静止料堆抑噪/抗闪,越小越稳(更滞后) -->
+    <arg name="min_template_iou" default="0.75" /><!-- 收回正常值:挡掉粘连大blob/边缘错配(之前0.25是放块的临时档) -->
+     <!--  启动后加载固定曝光/白平衡（camera_config 里调好的，避免每次手调）。 -->
+    <node pkg="dynamic_reconfigure" type="dynparam" name="load_rgb_cfg" output="screen"
+          args="load /camera/rgb_camera $(find tly)/config/camera_config_1.yaml"
+          launch-prefix="bash -c 'sleep 6; exec $0 $@'" />
     <!-- 7. 视觉节点 -->
-    <node pkg="tly" type="vision_processor_node_cpp" name="vision_processor_node" output="screen">
-        <param name="image_topic" value="/camera/color/image_rect_color" />
+    <node pkg="tly" type="$(arg vision_node)" name="vision_processor_node" output="screen">
+        <param name="image_topic" value="/camera/color/image_raw" />
         <param name="camera_info_topic" value="/camera/color/camera_info" />
         <param name="assume_image_rectified" value="true" />
-        <param name="table_frame" value="table_frame" />
-        
+
         <!-- 角度与姿态偏置 -->
         <param name="publish_angle_in_table_frame" value="false" />
         <param name="angle_axis_probe_px" value="40.0" />
         <param name="contour_axis_probe_px" value="50.0" />
-        <!-- 核心修改 1：关闭轮廓轴线推断，彻底消除 T/L 块的角度横跳，信任 1° 精度的模板角度 -->
         <param name="use_contour_axis_yaw" value="false" />
 
-        <!-- Pick point mode: hybrid 模式对 L 型使用形心，更稳固 -->
+        <!-- Pick point mode -->
         <param name="pick_point_mode" value="hybrid" />
         <rosparam param="distance_pick_shapes">[3, 4]</rosparam>
 
-        <!-- Wider ROI for current RealSense view. -->
-        <param name="roi_x_min" value="407" />
-        <param name="roi_y_min" value="126" />
-        <param name="roi_x_max" value="839" />
-        <param name="roi_y_max" value="593" />
+        <!-- ROI -->
+        <param name="roi_x_min" value="335" />
+        <param name="roi_y_min" value="88" />
+        <param name="roi_x_max" value="969" />
+        <param name="roi_y_max" value="711" />
 
-        <!-- Black block segmentation on white lightboard. -->
+        <!-- 黑白分割 -->
         <param name="threshold_mode" value="otsu" />
         <param name="manual_dark_threshold" value="105" />
         <param name="blur_kernel" value="5" />
         <param name="close_kernel" value="3" />
         <param name="open_kernel" value="3" />
 
-        <!-- Lightboard mask: 仅在发光板亮区内寻找黑色积木 -->
-        <param name="use_saturation_foreground" value="false" />
+        <!-- 发光板掩码 -->
+        <!-- 彩色块场景务必开：用 HSV 饱和度抓彩色块(含偏亮红/黄)，避免灰度暗阈值漏块。
+             竞赛若把画面压成黑白(黑块)则设 false，走灰度暗阈值即可。 -->
+        <param name="use_saturation_foreground" value="true" />
         <param name="use_lightboard_mask" value="true" />
         <param name="lightboard_min_area_ratio" value="0.08" />
         <param name="lightboard_close_kernel" value="15" />
 
-        <!-- Area filtering at 1280x720. -->
+        <!-- 面积过滤 -->
         <param name="min_area" value="900" />
         <param name="max_area" value="50000" />
         <param name="min_contour_fill_ratio" value="0.18" />
-        <param name="max_contour_fill_ratio" value="0.98" />
+        <param name="max_contour_fill_ratio" value="1.0" /><!-- 1.0：别误杀轴对齐的田/一字(填满bbox) -->
 
-        <!-- Topology-enhanced template matching (由于 C++ 中做了全量预计算，refine_step 设为 1 获取最高 1° 精度) -->
-        <param name="min_template_iou" value="0.40" />
+        <!-- 模板匹配 -->
+        <!-- 分水岭分出来的贴碰块边界略有波纹，IoU 会偏低，先放宽到 0.25 验证出框；
+             稳定出货后再按实际 IoU 收紧。 -->
+        <param name="min_template_iou" value="$(arg min_template_iou)" />
+        <!-- 匹配前轮廓多边形近似 eps(占周长比)：拉直分水岭波纹边，提高分类准度。
+             0=关闭；过大(>0.04)会把 L/T/Z 的真实拐角也抹平。形状对了再把 IoU 收回 ~0.4。 -->
+        <param name="poly_approx_eps_ratio" value="0.02" />
+        <!-- 同帧去重：质心距(全分辨率px)小于此视为同块,留高分;0=关。密集小块若被误并就调小 -->
+        <param name="nms_center_dist_px" value="35" />
+        <!-- DexiNed 边缘阈值(现仅 debug 用,切割已改走颜色边界) -->
+        <param name="dexined_thresh" value="200" />
+        <!-- 颜色边界阈值(Lab a/b 梯度,0-255)：异色块边界色度突变→切开。
+             块间没切开(粘连)→调小(12~16);把一个块切碎(块内色不匀)→调大(28~35)。
+             debug_edges 现在显示的就是这个颜色边界,可对照着调。 -->
+        <param name="color_edge_thresh" value="$(arg color_edge_thresh)" />
+        <param name="color_edge_min_area" value="$(arg color_edge_min_area)" />
+        <param name="use_dexined_for_split" value="$(arg use_dexined_for_split)" />
+        <param name="temporal_alpha" value="$(arg temporal_alpha)" />
         <param name="template_size" value="72" />
         <param name="template_angle_step" value="10" />
         <param name="template_refine_step" value="1" />
 
-        <!-- Tracking/stability: faster startup, tolerant to short missed detections. -->
-        <param name="track_history_len" value="9" />
-        <param name="stable_min_frames" value="2" />
-        <!-- 核心修改 2：放宽位置抖动容忍度，防止边缘积木和 L 型距离变换点在几像素内滑动导致误判 -->
+        <!-- 跟踪/稳定 -->
+        <param name="track_history_len" value="13" /><!-- 形状投票窗口:大些更稳(放料后收敛稍慢) -->
+        <param name="stable_min_frames" value="3" />
         <param name="stable_max_px_std" value="8.0" />
         <param name="stable_max_angle_std_deg" value="15.0" />
         <param name="publish_only_stable" value="true" />
-        <param name="stable_publish_max_missed" value="3" />
-        <param name="max_missed_frames" value="10" />
-
-        <!-- Track matching gates. -->
+        <param name="stable_publish_max_missed" value="35" /><!-- 边缘块偶尔漏检也保持发布,稳住库存计数 -->
+        <param name="max_missed_frames" value="15" />
         <param name="track_match_gate_px" value="85.0" />
         <param name="track_match_gate_m" value="0.055" />
 
-        <!-- Precise Pose 服务参数 (显式暴露方便后续机械臂微调时修改) -->
-        <param name="precise_timeout" value="0.8" />
-        <param name="precise_require_stable" value="true" />
-        <param name="precise_center_gate_px" value="280.0" />
-
+        <!-- 深度抓取 Z 采样 -->
+        <param name="use_depth_pick_z" value="true" />
+        <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw" />
+        <param name="depth_sample_radius_px" value="4" />
+        <param name="depth_sample_in_raw_color" value="true" />
     </node>
+
 
     <!-- =========================
          8. xArm controller node
@@ -140,65 +171,65 @@
    <node pkg="tly" type="xarm_controller_node" name="xarm_controller_node" output="screen"
       launch-prefix="bash -c 'sleep 4; exec $0 $@'">
 
-    <!-- Frames -->
-    <param name="eef_frame" value="link_tcp" />
-    <param name="table_frame" value="table_frame" />
-    <param name="base_frame" value="link_base" />
-    <param name="camera_frame" value="camera_color_optical_frame" />
-    <param name="camera_info_topic" value="/camera/color/camera_info" />
-    <param name="assume_image_rectified" value="true" />
+    <!-- 纯执行器：消费 path_planner 解算好的 MotionPlan(已含腕部翻转决策与悬停位姿)。
+         本节点不加载任何标定、不做坐标/腕部计算；几何/标定/深度全部由 path_planner 负责。 -->
+    <param name="plan_topic" value="/motion_cmds" />
 
-    <!-- Calibration / geometry -->
-    <param name="use_true_pick_plane" value="true" />
-    <param name="use_pick_homography" value="true" />
-    <param name="use_pick_affine_correction" value="false" />
-    <param name="require_pick_plane" value="true" />
-    <param name="require_board_map" value="true" />
-    <param name="require_place_z_map" value="true" />
-    <param name="pick_yaw_offset_deg" value="90.0" />
-    <param name="yaw_homography_probe_px" value="30.0" />
-    <param name="yaw_homography_v_sign" value="-1.0" />
-
-    <!-- Real board and placement -->
-    <param name="place_release_z_margin" value="0.006" />
-    <param name="tcp_pick_offset_z" value="0.004" />
-    <param name="tcp_pick_offset_x" value="0.0" />
-    <param name="tcp_pick_offset_y" value="0.0" />
-    <param name="tcp_place_offset_x" value="0.0" />
-    <param name="tcp_place_offset_y" value="-0.001" />
-    <param name="tcp_place_offset_z" value="0.004" />
     <param name="verify_native_xyz_after_motion" value="false" />
+    <param name="native_xyz_tolerance_mm" value="6.0" />
+    <!-- 到位校验：轮询等"运动后的新鲜上报"进入容差，取代固定 sleep -->
+    <param name="native_verify_timeout_s" value="1.0" />
+    <param name="native_verify_poll_hz" value="50.0" />
 
     <!-- Speed: first test must be slow -->
+    <!-- 保守 -->
+    <!-- ⚠️ 同步点：transit_speed_mm_s / loaded_transit_speed_mm_s 是控制器实际执行 move_line 的线速度，
+         必须与 path_planner 的 transit_lin_speed_m_s / loaded_lin_speed_m_s(见本文件下方 path_planner_node
+         节点，单位 m/s = 此处 mm/s ÷ 1000)保持一致——代价模型用它作"关节饱和"门槛的 v_lin，两处不同则算错。
+         注意：path_planner 的 omega_per_v_lin_rad_per_m 是"比值"，与线速度档位无关，改速度不用动它。 -->
     <param name="transit_speed_mm_s" value="500.0" />
-    <param name="transit_acc_mm_s2" value="4500.0" />
+    <param name="transit_acc_mm_s2" value="2000.0" />
     <param name="loaded_transit_speed_mm_s" value="500.0" />
-    <param name="loaded_transit_acc_mm_s2" value="3500.0" />
-    <param name="pick_down_speed_mm_s" value="400" />
-    <param name="pick_down_acc_mm_s2" value="4000" />
-    <param name="place_down_speed_mm_s" value="400" />
-    <param name="place_down_acc_mm_s2" value="3500" />
-    <param name="lift_speed_mm_s" value="450" />
-    <param name="lift_acc_mm_s2" value="4500" />
+    <param name="loaded_transit_acc_mm_s2" value="2000.0" />
+    <param name="pick_down_speed_mm_s" value="500" />
+    <param name="pick_down_acc_mm_s2" value="2000" />
+    <param name="place_down_speed_mm_s" value="500" />
+    <param name="place_down_acc_mm_s2" value="2000" />
+    <param name="lift_speed_mm_s" value="500" />
+    <param name="lift_acc_mm_s2" value="2000" />
 
-    <!-- Safety: do not block normal total joint rotation, only block bad trajectory segments -->
-    <param name="enable_joint_jump_guard" value="false" />
-    <param name="enable_trajectory_guard" value="true" />
-    <param name="warn_ptp_joint_jump_rad" value="1.20" />
-    <param name="max_lin_branch_jump_rad" value="1.20" />
-    <param name="max_traj_segment_joint_delta_rad" value="0.35" />
-    <param name="lock_loaded_roll_pitch" value="true" />
-    <param name="use_loaded_lin_transport" value="true" />
-
-    <param name="enable_place_shake" value="true" />
+    <param name="enable_place_shake" value="false" />
     <param name="place_shake_cycles" value="1" />
     <param name="place_shake_dx_m" value="0.005" />
     <param name="place_shake_dy_m" value="0.005" />
-    <param name="place_shake_speed_mm_s" value="250.0" />
-    <param name="place_shake_acc_mm_s2" value="6000.0" />
+    <param name="place_shake_speed_mm_s" value="100.0" />
+    <param name="place_shake_acc_mm_s2" value="5000.0" />
+    <!-- 激进 -->
+    <!-- <param name="transit_speed_mm_s" value="1000.0" />
+    <param name="transit_acc_mm_s2" value="50000.0" />
+    <param name="loaded_transit_speed_mm_s" value="1000.0" />
+    <param name="loaded_transit_acc_mm_s2" value="50000.0" />
+    <param name="pick_down_speed_mm_s" value="1000" />
+    <param name="pick_down_acc_mm_s2" value="50000" />
+    <param name="place_down_speed_mm_s" value="1000" />
+    <param name="place_down_acc_mm_s2" value="50000" />
+    <param name="lift_speed_mm_s" value="1000" />
+    <param name="lift_acc_mm_s2" value="50000" />
+
+    <param name="enable_place_shake" value="false" />
+    <param name="place_shake_cycles" value="1" />
+    <param name="place_shake_dx_m" value="0.005" />
+    <param name="place_shake_dy_m" value="0.005" />
+    <param name="place_shake_speed_mm_s" value="1000.0" />
+    <param name="place_shake_acc_mm_s2" value="50000.0" /> -->
 
     <param name="suction_on_wait" value="0.05" />
     <param name="suction_off_wait" value="0.0" />
+
+    <!-- Debug 单步：true 则每到 pick_hover/pick/place_hover/place 暂停，待
+         rostopic pub -1 /xarm_controller/continue std_msgs/Empty "{}" 才继续。 -->
+    <param name="debug_step" value="false" />
+    <param name="debug_continue_topic" value="/xarm_controller/continue" />
 
     <!-- First verify one block only -->
     <param name="max_tasks_per_plan" value="34" />
@@ -207,6 +238,99 @@
     <param name="suction_io_num" value="1" />
 </node>
 
+    <!-- =========================
+         8b. Path planner node (控制路径主节点)
+         消费 strategy 的 /tetris_plan, 完成全部坐标解算(抓取Z用深度)、腕部翻转决策与
+         关节空间路程优化, 发布可执行 MotionPlan 到 /motion_cmds 供控制节点(纯执行器)消费。
+         ========================= -->
+    <node pkg="tly" type="path_planner_node" name="path_planner_node" output="screen"
+          launch-prefix="bash -c 'sleep 4; exec $0 $@'">
+        <!-- Frames -->
+        <param name="base_frame" value="link_base" />
+        <param name="camera_frame" value="camera_color_optical_frame" />
+        <param name="camera_info_topic" value="/camera/color/camera_info" />
+
+        <!-- Calibration / geometry (与控制节点一致) -->
+        <param name="use_true_pick_plane" value="true" />
+        <param name="use_pick_homography" value="true" />
+        <param name="use_board_map" value="true" />
+        <param name="use_cell_max_place_z" value="true" />
+        <param name="require_board_map" value="true" />
+        <param name="require_place_z_map" value="true" />
+        <param name="pick_yaw_offset_deg" value="-90.0" />
+        <param name="yaw_homography_probe_px" value="30.0" />
+        <param name="yaw_homography_v_sign" value="-1.0" />
+
+        <!-- 关节空间路程优化：读 /xarm/joint_states 当前关节作起点 q；用 xArm6 闭式 FK/IK 把每个
+             TCP 位姿转 6 关节角，联合优化放置顺序/同形状抓取分配/腕部翻转。代价=沿 move_line 直线路径
+             积分的"真实时间"(见下)。启动用 fk/ik 对照 base→link_tcp TF 自检，失败自动回退 XY 距离代价。 -->
+        <param name="joint_state_topic" value="/xarm/joint_states" />
+        <!-- 代价模型(单位秒，仅作候选排序代理，勿当绝对耗时)：每段基准笛卡尔时间=max(Δd/v_lin, Δθ/ω)
+             (位置线速度/姿态角速度取瓶颈)，实际时间再对关节饱和取 max(基准, maxᵢ|Δq|/v_max,i)。
+             v_lin: 空载/载料转移的 TCP 线速度(m/s，对齐控制器 transit/loaded_transit)。
+             omega_per_v_lin_rad_per_m: TCP 姿态角速度上限与线速度的比值 ω/v_lin(rad/m)。move_line 的 ω 随
+                    mvvelo 线性变(Move.srv: 0~1000→0~3.14 rad/s)，实测 ω=0.645rad/s@200mm/s → 比值≈3.23≈π
+                    且与档位无关，故用比值逐段自适应(ω=此值×v_lin)。含义：多少 rad 转动≈1m 平移的时间当量。
+                    转动主导阈值 Δθ>此值·Δd，与速度无关。用 measure_tcp_omega.launch 复测可更新。
+             joint_max_vel_rad_s: 各轴关节限速(rad/s)，作轨迹的关节饱和阈值；实测不同则取消注释填入。 -->
+        <!-- ⚠️ 同步点：这两个 v_lin 必须等于控制器实际速度 transit_speed_mm_s / loaded_transit_speed_mm_s
+             (见本文件上方 xarm_controller_node 节点) ÷ 1000。改速度时两处一起改。
+             omega_per_v_lin_rad_per_m 是比值(rad/m)、与速度无关，改速度不用动；用 measure_tcp_omega.launch 复测更新。 -->
+        <param name="transit_lin_speed_m_s" value="0.500" />
+        <param name="loaded_lin_speed_m_s" value="0.500" />
+        <param name="omega_per_v_lin_rad_per_m" value="3.001" />
+        <!-- <rosparam param="joint_max_vel_rad_s">[3.14,3.14,3.14,3.14,3.14,3.14]</rosparam> -->
+        <!-- J6 限位(rad)：软限位=优化偏好(越界按秒尺度加罚但仍可用，least-bad)；硬限位=绝对拒发
+             (留余量到±2π=6.283真硬限)。转移段沿直线笛卡尔路径采样 J6(端点校验抓不到中途越限)：
+             transit_j6_samples 为每段采样点数。某就绪槽所有(块,翻转,重排)的转移峰值 J6 都越硬限 →
+             规划失败、不发布、报错待重规划。
+             wrist_soft_penalty_s_per_rad: 越软限位每 rad 的时间罚(秒尺度，压过真实时间差但仍有序)。
+             tie_break_weight_s_per_rad: 平局次级项 Σ|Δq| 的极小权重(不饱和平局时偏好腕部少甩)。 -->
+        <param name="wrist_soft_limit_rad" value="4.7" />
+        <param name="wrist_hard_limit_rad" value="6.10" />
+        <param name="wrist_soft_penalty_s_per_rad" value="1000.0" />
+        <param name="tie_break_weight_s_per_rad" value="0.001" />
+        <param name="transit_j6_samples" value="8" />
+        <param name="ik_selfcheck_tol_rad" value="0.05" />
+
+        <param name="place_release_z_margin" value="0.006" />
+        <!-- tcp_*_offset_z(波纹管补偿)默认从标定写入的 /tetris/TCP_*_OFFSET_Z 读取；
+             如需手动覆盖，取消下面两行注释即可。 -->
+        <param name="tcp_pick_offset_z" value="0.012" />
+        <param name="tcp_place_offset_z" value="0.0" />
+        <param name="tcp_pick_offset_x" value="0.0" />
+        <param name="tcp_pick_offset_y" value="0.0" />
+        <param name="tcp_place_offset_x" value="0.0" />
+        <param name="tcp_place_offset_y" value="0.0" />
+
+        <!-- 深度抓取 Z (D2: 两种 XY 来源可切换) -->
+        <param name="use_depth_pick_z" value="false" />
+        <param name="pick_xy_source" value="homography" />
+        <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw" />
+        <param name="depth_sample_radius_px" value="4" />
+        <param name="depth_sample_in_raw_color" value="true" />
+
+        <!-- 附加式: 发布全部任务供对照 -->
+        <param name="max_tasks_per_plan" value="0" />
+
+        <!-- 路程优化: 放置依赖 DAG 内重排 + 同形状抓取分配 + 腕部翻转, 用关节空间代价联合最小化。
+             消费 strategy 的 /tetris_plan, 输出可执行 MotionPlan 到 /motion_cmds (控制节点消费),
+             另发 /tetris_plan_opt(Int32, 重排+分配后) 仅作调试对照。候选池取 /vision/board_state。 -->
+        <param name="optimize_order" value="true" />
+        <!-- 是否允许重排放置顺序。true=在 DAG 内按关节代价重排(默认)；
+             false=保持策略节点顺序(比赛若有方块相邻等 DAG 外约束)，仅选代价最小的同形状块+翻转。 -->
+        <param name="allow_reorder" value="false" />
+        <param name="plan_topic" value="/tetris_plan" />
+        <!-- 多候选择优：消费 strategy 的同分候选集，逐个求关节代价后取最小者执行(节点内多线程并行)。
+             true → 订阅 /tetris_plan_candidates；false → 退回订阅单计划 /tetris_plan(旧行为)。
+             与策略节点的 num_candidates 配套使用。 -->
+        <param name="use_plan_candidates" value="true" />
+        <param name="plan_candidates_topic" value="/tetris_plan_candidates" />
+        <param name="parallel_candidate_eval" value="true" />
+        <param name="optimized_plan_topic" value="/tetris_plan_opt" />
+        <param name="board_state_topic" value="/vision/board_state" />
+        <param name="eef_frame" value="link_tcp" />
+    </node>
 
     <!-- =========================
          9. Strategy node
@@ -218,5 +342,26 @@
         <param name="inventory_stable_required_frames" value="5" />
         <param name="min_usable_total_blocks" value="35" />
         <param name="min_usable_stable_required_frames" value="3" />
+
+        <!-- 非进阶任务：保留的同分最优候选布局数，发往 /tetris_plan_candidates 供 path_planner
+             按关节运动代价择优。1=旧行为(单解)。进阶任务不受此影响(只发单候选)。 -->
+        <param name="num_strategy_candidates" value="$(arg num_candidates)" />
+        <param name="plan_candidates_topic" value="/tetris_plan_candidates" />
+
+        <!-- 进阶任务：默认关闭。开启则按 shape_sequence(下方)求解；
+             进阶时只放一部分方块，不要求库存达 34/35。
+             roslaunch tly tly.launch advanced_mode:=true -->
+        <param name="advanced_mode" value="$(arg advanced_mode)" />
+        <!-- 进阶「峰值保持」：稳定后仍等识别数不再上升才发；等此秒数仍达不到峰值则用最优稳定帧兜底。 -->
+        <param name="advanced_peak_max_wait_sec" value="10.0" />
+        <param name="seq_cyclic" value="true" />
+        <param name="seq_require_support" value="true" />
+        <!-- 满行且≥4色额外加分(竞赛规则②)。默认 false：实际比赛可能没有此约束，
+             开启时设 true -->
+        <param name="seq_reward_four_colors" value="false" />
+        <rosparam param="shape_sequence">[2,3,5,6,4,0,1]</rosparam>
+        <!-- 可选：每种形状“可吸取上限”，长度 7 对应形状 id；<0=不限制(默认)。
+             例：场上有 4 个 id=0 但只允许吸 2 个 -> [2,-1,-1,-1,-1,-1,-1]。缺省整行删掉。 -->
+        <rosparam param="shape_pick_limits">[4,4,2,1,5,4,5]</rosparam>
     </node>
 </launch>

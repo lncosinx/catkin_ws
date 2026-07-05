@@ -7,7 +7,6 @@ add_compile_options(-std=c++14)
 # 开启 O3 最高级别优化！对于纯算力的 DLX 算法，这能让速度提升几十倍
 set(CMAKE_CXX_FLAGS "-O3 ${CMAKE_CXX_FLAGS}")
 
-# 🌟 1. 新增 message_generation 依赖
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
@@ -22,27 +21,29 @@ find_package(catkin REQUIRED COMPONENTS
   tf2_ros
   tf2_geometry_msgs
   xarm_msgs
-  message_generation 
+  message_generation
 )
 
 # 寻找 OpenCV (确保包含 CUDA 模块)
-find_package(OpenCV REQUIRED)
+# 建议修改为显式查找 dnn 模块
+find_package(OpenCV REQUIRED COMPONENTS core imgproc dnn)
 
-# 🌟 2. 声明要编译的 Service 文件
-# 确保在 tly 包的根目录下创建了 srv 文件夹，并把 GetPrecisePose.srv 放进去！
-add_service_files(
+# 线程库：path_planner_node 用 std::async 并行评估多候选计划
+find_package(Threads REQUIRED)
+
+# /motion_cmds 消息：路径节点 -> 控制节点 (base 系抓放位姿队列)
+add_message_files(
   FILES
-  GetPrecisePose.srv
+  MotionTask.msg
+  MotionPlan.msg
 )
 
-# 🌟 3. 生成消息，依赖基础消息包
 generate_messages(
   DEPENDENCIES
   std_msgs
   geometry_msgs
 )
 
-# 🌟 4. 在导出包时新增 message_runtime
 catkin_package(
   CATKIN_DEPENDS roscpp rospy std_msgs geometry_msgs sensor_msgs cv_bridge image_transport moveit_ros_planning_interface tf2 xarm_msgs message_runtime
 )
@@ -57,7 +58,6 @@ include_directories(
 # 安装 Python 脚本
 catkin_install_python(PROGRAMS
   scripts/vision_processor_node.py
-  scripts/table_tf_broadcaster.py
   scripts/single_block_test.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
@@ -83,11 +83,35 @@ target_link_libraries(xarm_controller_node
 )
 
 # =========================================================
-# 编译视觉处理节点 (Vision Processor Node - C++ CUDA)
+# 编译视觉处理节点 (经典版：轮廓提取 + 模板匹配)
 # =========================================================
 add_executable(vision_processor_node_cpp src/vision_processor_node.cpp)
 add_dependencies(vision_processor_node_cpp ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 target_link_libraries(vision_processor_node_cpp
   ${catkin_LIBRARIES}
   ${OpenCV_LIBRARIES}
+)
+
+# =========================================================
+# 编译视觉处理节点 (DexiNed 版：神经网络边缘检测 + 模板匹配)
+# 与经典版话题/消息契约一致，靠 launch 的 type:= 切换。
+# =========================================================
+add_executable(vision_processor_node_dexined src/vision_processor_node_dexined.cpp)
+add_dependencies(vision_processor_node_dexined ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(vision_processor_node_dexined
+  ${catkin_LIBRARIES}
+  ${OpenCV_LIBRARIES}
+)
+
+# =========================================================
+# 编译路径规划节点 (Path Planner Node)
+# 消费 /tetris_plan，做像素->base 抓取(含深度Z)+格子->base 放置解算，
+# 发布 /motion_cmds (base 系抓放位姿队列) 供控制节点执行。
+# =========================================================
+add_executable(path_planner_node src/path_planner_node.cpp)
+add_dependencies(path_planner_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS} xarm_msgs_gencpp)
+target_link_libraries(path_planner_node
+  ${catkin_LIBRARIES}
+  ${OpenCV_LIBRARIES}
+  Threads::Threads
 )

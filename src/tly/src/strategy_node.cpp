@@ -7,475 +7,19 @@
 #include <random>
 #include <string>
 #include <cstdio>
+#include <tly/tetris_solver.hpp>
 
 using namespace std;
 
-// ==============================================================================
-// 核心数据结构与形状定义
-// ==============================================================================
-struct Point
-{
-    int x, y;
-    bool operator<(const Point &o) const { return y != o.y ? y < o.y : x < o.x; }
-};
-
-struct ShapeVariant
-{
-    vector<Point> coords;
-    int real_way; // 0=0°, 1=90°, 2=180°, 3=270°
-};
-
-struct Action
-{
-    int piece_id;
-    int shape_type;
-    int rot_idx;
-    int real_way;
-    int start_r, start_c;
-    vector<Point> absolute_coords;
-};
-
-struct PlanConfig
-{
-    int target_blocks;
-    int start_r;
-    vector<Point> disabled_cells;
-    int max_possible_score;
-    int max_search_nodes;
-    int max_restarts;
-};
-
-// 【积木形状定义省略内部...】
-vector<vector<Point>> BASE_SHAPES = {
-    {{0, 0}, {1, 0}, {2, 0}, {3, 0}}, // 0: 红色一字形
-    {{0, 0}, {1, 0}, {0, 1}, {1, 1}}, // 1: 橙色田字形
-    {{0, 0}, {1, 0}, {2, 0}, {1, 1}}, // 2: 棕色T
-
-    {{1, 0}, {1, 1}, {1, 2}, {0, 2}}, // 3: 紫色L左
-    {{0, 0}, {0, 1}, {0, 2}, {1, 2}}, // 4: 黄色L右
-
-    {{0, 0}, {1, 0}, {1, 1}, {2, 1}}, // 5: 蓝色Z左
-    {{1, 0}, {2, 0}, {0, 1}, {1, 1}}  // 6: 绿色Z右
-};
-
-// ==============================================================================
-// DLX 极速精确覆盖引擎 (省略未改动的方法...)
-// ==============================================================================
-const int MAX_NODES = 500000;
-struct DLXNode
-{
-    int r, c, up, down, left, right;
-};
-
-class DLX
-{
-public:
-    DLXNode nodes[MAX_NODES];
-    int col_size[200], head[200], node_count, col_count, max_solutions;
-    vector<int> current_ans;
-    vector<vector<int>> all_solutions;
-    vector<int> row_to_piece, piece_prev;
-    bool is_piece_used[40];
-    int search_nodes_count, max_search_nodes;
-
-    void init(int c_count, int max_sol, vector<int> p_prev, int limit_nodes = 5000000)
-    {
-        col_count = c_count;
-        max_solutions = max_sol;
-        piece_prev = p_prev;
-        search_nodes_count = 0;
-        max_search_nodes = limit_nodes;
-        for (int i = 0; i < 40; ++i)
-            is_piece_used[i] = false;
-        for (int i = 0; i <= col_count; ++i)
-        {
-            nodes[i].left = i - 1;
-            nodes[i].right = i + 1;
-            nodes[i].up = i;
-            nodes[i].down = i;
-            col_size[i] = 0;
-            head[i] = i;
-        }
-        nodes[0].left = col_count;
-        nodes[col_count].right = 0;
-        node_count = col_count + 1;
-        all_solutions.clear();
-        current_ans.clear();
-        row_to_piece.clear();
-    }
-
-    void addRow(int row_idx, const vector<int> &columns, int piece_id)
-    {
-        if (row_idx >= row_to_piece.size())
-            row_to_piece.resize(row_idx + 1, -1);
-        row_to_piece[row_idx] = piece_id;
-        int first_node = node_count;
-        for (int i = 0; i < columns.size(); ++i)
-        {
-            int c = columns[i] + 1;
-            int id = node_count++;
-            nodes[id].r = row_idx;
-            nodes[id].c = c;
-            nodes[id].down = head[c];
-            nodes[id].up = nodes[head[c]].up;
-            nodes[nodes[head[c]].up].down = id;
-            nodes[head[c]].up = id;
-            col_size[c]++;
-            if (i == 0)
-            {
-                nodes[id].left = id;
-                nodes[id].right = id;
-            }
-            else
-            {
-                nodes[id].left = first_node;
-                nodes[id].right = nodes[first_node].right;
-                nodes[nodes[first_node].right].left = id;
-                nodes[first_node].right = id;
-            }
-        }
-    }
-
-    void remove(int c)
-    {
-        nodes[nodes[c].right].left = nodes[c].left;
-        nodes[nodes[c].left].right = nodes[c].right;
-        for (int i = nodes[c].down; i != c; i = nodes[i].down)
-            for (int j = nodes[i].right; j != i; j = nodes[j].right)
-            {
-                nodes[nodes[j].down].up = nodes[j].up;
-                nodes[nodes[j].up].down = nodes[j].down;
-                col_size[nodes[j].c]--;
-            }
-    }
-
-    void resume(int c)
-    {
-        for (int i = nodes[c].up; i != c; i = nodes[i].up)
-            for (int j = nodes[i].left; j != i; j = nodes[j].left)
-            {
-                nodes[nodes[j].down].up = j;
-                nodes[nodes[j].up].down = j;
-                col_size[nodes[j].c]++;
-            }
-        nodes[nodes[c].right].left = c;
-        nodes[nodes[c].left].right = c;
-    }
-
-    void search()
-    {
-        if (all_solutions.size() >= max_solutions)
-            return;
-        if (search_nodes_count++ > max_search_nodes)
-            return;
-        if (nodes[0].right == 0)
-        {
-            all_solutions.push_back(current_ans);
-            return;
-        }
-
-        int c = nodes[0].right;
-        for (int i = nodes[0].right; i != 0; i = nodes[i].right)
-            if (col_size[i] < col_size[c])
-                c = i;
-
-        remove(c);
-        for (int i = nodes[c].down; i != c; i = nodes[i].down)
-        {
-            int r = nodes[i].r;
-            int p_id = row_to_piece[r];
-            int prev_p = piece_prev[p_id];
-            if (prev_p != -1 && !is_piece_used[prev_p])
-                continue;
-
-            is_piece_used[p_id] = true;
-            current_ans.push_back(r);
-            for (int j = nodes[i].right; j != i; j = nodes[j].right)
-                remove(nodes[j].c);
-            search();
-            for (int j = nodes[i].left; j != i; j = nodes[j].left)
-                resume(nodes[j].c);
-            current_ans.pop_back();
-            is_piece_used[p_id] = false;
-        }
-        resume(c);
-    }
-};
-
-// ==============================================================================
-// 图形处理与规划引擎
-// ==============================================================================
-vector<Point> normalize(vector<Point> shape)
-{
-    int min_x = 999, min_y = 999;
-    for (auto &p : shape)
-    {
-        min_x = min(min_x, p.x);
-        min_y = min(min_y, p.y);
-    }
-    vector<Point> norm;
-    for (auto &p : shape)
-        norm.push_back({p.x - min_x, p.y - min_y});
-    sort(norm.begin(), norm.end(), [](const Point &a, const Point &b)
-         {
-        if (a.y != b.y) return a.y < b.y;
-        return a.x < b.x; });
-    return norm;
-}
-
-vector<ShapeVariant> getUniqueRotations(vector<Point> base)
-{
-    vector<ShapeVariant> unique_rots;
-    for (int r = 0; r < 4; ++r)
-    {
-        vector<Point> rot;
-        if (r == 0)
-            rot = base;
-        else if (r == 1)
-        {
-            for (auto &p : base)
-                rot.push_back({-p.y, p.x});
-        }
-        else if (r == 2)
-        {
-            for (auto &p : base)
-                rot.push_back({-p.x, -p.y});
-        }
-        else if (r == 3)
-        {
-            for (auto &p : base)
-                rot.push_back({p.y, -p.x});
-        }
-
-        vector<Point> norm = normalize(rot);
-
-        bool is_dup = false;
-        for (auto &existing : unique_rots)
-        {
-            if (existing.coords.size() == norm.size())
-            {
-                bool match = true;
-                for (size_t i = 0; i < norm.size(); ++i)
-                {
-                    if (existing.coords[i].x != norm[i].x || existing.coords[i].y != norm[i].y)
-                    {
-                        match = false;
-                        break;
-                    }
-                }
-                if (match)
-                {
-                    is_dup = true;
-                    break;
-                }
-            }
-        }
-        if (!is_dup)
-            unique_rots.push_back({norm, r});
-    }
-    return unique_rots;
-}
-
-bool solveForMask(const PlanConfig &plan, const vector<int> &sub_inv, const int current_board[14][10],
-                  vector<Action> &out_actions, vector<int> &out_best_sol, int &out_best_score)
-{
-    int total_pieces = plan.target_blocks;
-
-    int cell_col_map[14][10];
-    for (int r = 0; r < 14; ++r)
-        for (int c = 0; c < 10; ++c)
-            cell_col_map[r][c] = -1;
-
-    int col_idx = total_pieces;
-    for (int r = plan.start_r; r <= 13; ++r)
-    {
-        for (int c = 0; c < 10; ++c)
-        {
-            bool disabled = false;
-            for (auto &p : plan.disabled_cells)
-            {
-                if (p.x == r && p.y == c)
-                {
-                    disabled = true;
-                    break;
-                }
-            }
-            if (!disabled)
-                cell_col_map[r][c] = col_idx++;
-        }
-    }
-
-    int col_count = col_idx;
-    vector<vector<int>> matrix;
-    vector<Action> all_actions;
-    vector<int> piece_prev(total_pieces, -1);
-
-    int p_id = 0;
-    for (int type = 0; type < 7; ++type)
-    {
-        auto unique_rots = getUniqueRotations(BASE_SHAPES[type]);
-        for (int inst = 0; inst < sub_inv[type]; ++inst)
-        {
-            if (inst > 0)
-                piece_prev[p_id] = p_id - 1;
-
-            matrix.push_back({p_id});
-            all_actions.push_back({p_id, type, -1, -1, -1, -1, {}});
-
-            for (int rot_idx = 0; rot_idx < unique_rots.size(); ++rot_idx)
-            {
-                auto &variant = unique_rots[rot_idx];
-                auto &shape = variant.coords;
-                int max_x = 0, max_y = 0;
-                for (auto &p : shape)
-                {
-                    max_x = max(max_x, p.x);
-                    max_y = max(max_y, p.y);
-                }
-
-                int valid_height = 14 - plan.start_r;
-                for (int local_r = 0; local_r <= valid_height - max_y - 1; ++local_r)
-                {
-                    for (int c = 0; c <= 10 - max_x - 1; ++c)
-                    {
-                        bool valid = true;
-                        vector<Point> abs_coords;
-                        vector<int> row_cols = {p_id};
-
-                        int global_r = plan.start_r + local_r;
-                        for (auto &p : shape)
-                        {
-                            int nr = global_r + p.y;
-                            int nc = c + p.x;
-                            if (nr < plan.start_r || nr >= 14 || nc < 0 || nc >= 10 || current_board[nr][nc] != 0 || cell_col_map[nr][nc] == -1)
-                            {
-                                valid = false;
-                                break;
-                            }
-                            abs_coords.push_back({nr, nc}); // x为行，y为列
-                            row_cols.push_back(cell_col_map[nr][nc]);
-                        }
-                        if (valid)
-                        {
-                            all_actions.push_back({p_id, type, rot_idx, variant.real_way, global_r, c, abs_coords});
-                            matrix.push_back(row_cols);
-                        }
-                    }
-                }
-            }
-            p_id++;
-        }
-    }
-
-    mt19937 rng(1337 + plan.target_blocks);
-    int max_sols = (plan.target_blocks >= 34) ? 400 : 100;
-    int global_best_score_internal = -1;
-
-    for (int attempt = 0; attempt < plan.max_restarts; ++attempt)
-    {
-        vector<int> row_indices(matrix.size());
-        for (int i = 0; i < matrix.size(); ++i)
-            row_indices[i] = i;
-        shuffle(row_indices.begin(), row_indices.end(), rng);
-
-        DLX *dlx = new DLX();
-        dlx->init(col_count, max_sols, piece_prev, plan.max_search_nodes);
-        for (int i = 0; i < matrix.size(); ++i)
-        {
-            int idx = row_indices[i];
-            dlx->addRow(idx, matrix[idx], all_actions[idx].piece_id);
-        }
-        dlx->search();
-
-        if (!dlx->all_solutions.empty())
-        {
-            for (const auto &sol : dlx->all_solutions)
-            {
-                int temp_board[14][10];
-                for (int i = 0; i < 14; ++i)
-                    for (int j = 0; j < 10; ++j)
-                        temp_board[i][j] = current_board[i][j];
-
-                for (int row_idx : sol)
-                {
-                    if (all_actions[row_idx].rot_idx == -1)
-                        continue;
-                    for (const auto &pt : all_actions[row_idx].absolute_coords)
-                    {
-                        temp_board[pt.x][pt.y] = all_actions[row_idx].shape_type + 1;
-                    }
-                }
-
-                int score = 0;
-                for (int y = plan.start_r; y < 14; ++y)
-                {
-                    std::set<int> unique_colors;
-                    bool is_full = true;
-                    for (int x = 0; x < 10; ++x)
-                    {
-                        if (temp_board[y][x] == 0)
-                            is_full = false;
-                        else
-                            unique_colors.insert(temp_board[y][x]);
-                    }
-                    if (is_full)
-                    {
-                        score += 10;
-                        if (unique_colors.size() >= 4)
-                            score += 10;
-                    }
-                }
-                if (score > global_best_score_internal)
-                {
-                    global_best_score_internal = score;
-                    out_best_sol = sol;
-                }
-            }
-
-            if (global_best_score_internal >= plan.max_possible_score)
-            {
-                out_actions = all_actions;
-                out_best_score = global_best_score_internal;
-                delete dlx;
-                return true;
-            }
-        }
-        delete dlx;
-    }
-
-    if (global_best_score_internal != -1)
-    {
-        out_actions = all_actions;
-        out_best_score = global_best_score_internal;
-        return true;
-    }
-    return false;
-}
-
-void generateSubInventories(int type, int current_sum, int target_sum, vector<int> &current_sub,
-                            const vector<int> &max_inv, vector<vector<int>> &valid_subs)
-{
-    if (type == 7)
-    {
-        if (current_sum == target_sum && current_sub[2] % 2 == 0)
-            valid_subs.push_back(current_sub);
-        return;
-    }
-    for (int take = 0; take <= max_inv[type]; ++take)
-    {
-        if (current_sum + take <= target_sum)
-        {
-            current_sub.push_back(take);
-            generateSubInventories(type + 1, current_sum + take, target_sum, current_sub, max_inv, valid_subs);
-            current_sub.pop_back();
-        }
-    }
-}
 
 // ==============================================================================
 // ROS 节点逻辑
 // ==============================================================================
 ros::Publisher plan_pub;
+ros::Publisher candidates_pub; // 同分多候选集 (/tetris_plan_candidates)
+std::string plan_candidates_topic = "/tetris_plan_candidates";
+// 非进阶任务：策略节点保留的同分最优候选布局数（>1 时交规划节点按运动代价择优）。
+int num_strategy_candidates = 8;
 bool is_planning = false;
 bool is_robot_busy = false;
 bool task_completed = false;
@@ -489,6 +33,29 @@ int inventory_stable_required_frames = 5;
 int min_usable_stable_required_frames = 3;
 int inventory_stable_count = 0;
 vector<int> last_inventory(7, -1);
+
+// 进阶任务模式：按外部形状序列(硬约束)求解。进阶任务只放 35 块中的一部分，
+// 故不要求库存达到 34/35，只要稳定即可。
+bool advanced_mode = false;
+vector<int> shape_sequence;     // 形状 id 顺序，例如 [0,1,2,3,...]
+bool seq_cyclic = false;        // 是否按序列循环放置
+bool seq_require_support = true; // true=竞赛规则③(下方支撑)；false=宽松实验
+bool seq_reward_four_colors = false; // 满行且≥4色额外 +10(竞赛规则②)。默认 false：
+                                     // 实际比赛可能没有此配色加分，关掉只追求满行。
+// 进阶模式：每种形状“可吸取上限”。即使场上识别到更多，也只允许吸取指定数量的该形状；
+// 例如场上有 4 个 id=0，设 shape_pick_limits[0]=2 则最多只放/吸 2 个。<0=不限制(默认，
+// 用视觉全部库存)。长度 7，一一对应 7 种形状 id。仅进阶模式生效。
+vector<int> shape_pick_limits(7, -1);
+
+// 进阶模式「峰值保持」：仅「稳定」不够——视觉可能停在偏低的误识别值并稳定住。故等识别总数
+// 「不再上升」(current==peak) 才规划；若某帧曾见更高峰值，就再等它稳定恢复，直到 wait 预算耗尽，
+// 用见过的「最优稳定帧」整帧兜底（整帧一致，避免库存计数与像素表错位）。
+int adv_peak_total = -1;                                  // 本轮见过的最大识别总数（含瞬时帧）
+int adv_best_stable_total = -1;                           // 已达稳定的帧中总数最大者
+std_msgs::Int32MultiArray::ConstPtr adv_best_stable_msg; // 上者对应的整帧（兜底规划用）
+ros::Time adv_wait_start;                                 // 本轮等待起点（首帧）
+bool adv_wait_started = false;
+double advanced_peak_max_wait_sec = 10.0; // 峰值保持超时预算（秒）
 
 void statusCallback(const std_msgs::Bool::ConstPtr &msg)
 {
@@ -505,6 +72,219 @@ struct BlockInfo
     int geom_u = 0, geom_v = 0; // 几何中心，用于控制节点补偿 hybrid 吸点偏移
     bool has_geom = false;
 }; // 统一存放每个积木的物理属性
+
+// 把若干份 17-int 计划打包成候选集消息并发布: [K, len0, plan0..., len1, plan1...]。
+static void publishCandidateSet(ros::Publisher &pub,
+                                const vector<std_msgs::Int32MultiArray> &plans)
+{
+    std_msgs::Int32MultiArray msg;
+    msg.data.push_back((int)plans.size());
+    for (const auto &p : plans)
+    {
+        msg.data.push_back((int)p.data.size());
+        msg.data.insert(msg.data.end(), p.data.begin(), p.data.end());
+    }
+    pub.publish(msg);
+}
+
+// 由一个候选解(行索引序列) + 其 action 表 + 棋盘 + 库存，构建一份 17-int 抓放计划：
+// 复刻原单解流程(提取放置 + 补余块填充 + 放置依赖拓扑排序 + 扁平打包)。
+// available_blocks 为按形状分组的视觉散块，函数内部拷贝后 pop_back，不影响调用方；
+// 多个候选因此可各自独立回填抓取像素。verbose 仅对首选候选打印逐块日志，避免刷屏。
+static bool buildPlanMsgFromSolution(const vector<int> &solution,
+                                     const vector<Action> &actions,
+                                     const int board[14][10],
+                                     const vector<int> &inventory,
+                                     const vector<BlockInfo> available_blocks[7],
+                                     std_msgs::Int32MultiArray &plan_msg,
+                                     bool verbose)
+{
+    vector<BlockInfo> avail[7];
+    for (int s = 0; s < 7; ++s)
+        avail[s] = available_blocks[s];
+
+    vector<Action> final_actions;
+    int used_count[7] = {0};
+    for (int r : solution)
+    {
+        if (actions[r].rot_idx == -1)
+            continue;
+        final_actions.push_back(actions[r]);
+        used_count[actions[r].shape_type]++;
+    }
+
+    int board_piece[14][10];
+    for (int i = 0; i < 14; ++i)
+        for (int j = 0; j < 10; ++j)
+            board_piece[i][j] = board[i][j] > 0 ? -2 : -1;
+    for (const auto &act : final_actions)
+        for (auto pt : act.absolute_coords)
+            board_piece[pt.x][pt.y] = act.piece_id;
+
+    int next_piece_id = 100;
+    for (int type = 0; type < 7; ++type)
+    {
+        int leftover = inventory[type] - used_count[type];
+        for (int k = 0; k < leftover; ++k)
+        {
+            auto unique_rots = getUniqueRotations(BASE_SHAPES[type]);
+            bool placed = false;
+            for (int r = 13; r >= 0 && !placed; --r)
+                for (int c = 0; c < 10 && !placed; ++c)
+                    for (int rot_idx = 0; rot_idx < unique_rots.size() && !placed; ++rot_idx)
+                    {
+                        auto &variant = unique_rots[rot_idx];
+                        auto &shape = variant.coords;
+                        bool valid = true, fully_supported = true;
+                        vector<Point> abs_coords;
+                        for (auto &p : shape)
+                        {
+                            int nr = r + p.y, nc = c + p.x;
+                            if (nr < 0 || nr >= 14 || nc < 0 || nc >= 10 || board_piece[nr][nc] != -1)
+                            {
+                                valid = false;
+                                break;
+                            }
+                            if (nr < 13 && board_piece[nr + 1][nc] == -1)
+                                fully_supported = false;
+                            abs_coords.push_back({nr, nc});
+                        }
+                        if (valid && fully_supported)
+                        {
+                            Action act = {next_piece_id++, type, rot_idx, variant.real_way, r, c, abs_coords};
+                            final_actions.push_back(act);
+                            for (auto &pt : abs_coords)
+                                board_piece[pt.x][pt.y] = act.piece_id;
+                            placed = true;
+                        }
+                    }
+        }
+    }
+
+    vector<int> adj[200];
+    int in_degree[200] = {0};
+    for (int r = 0; r < 13; ++r)
+        for (int c = 0; c < 10; ++c)
+        {
+            int curr = board_piece[r][c];
+            int below = board_piece[r + 1][c];
+            if (curr >= 0 && below >= 0 && curr != below)
+            {
+                bool exist = false;
+                for (int t : adj[below])
+                    if (t == curr)
+                        exist = true;
+                if (!exist)
+                {
+                    adj[below].push_back(curr);
+                    in_degree[curr]++;
+                }
+            }
+        }
+
+    int p_bottom[200] = {0};
+    int p_left[200] = {0};
+    for (const auto &act : final_actions)
+    {
+        int pid = act.piece_id;
+        int max_r = -1;
+        int min_c = 999;
+        for (auto &pt : act.absolute_coords)
+        {
+            if (pt.x > max_r)
+                max_r = pt.x;
+            if (pt.y < min_c)
+                min_c = pt.y;
+        }
+        p_bottom[pid] = max_r;
+        p_left[pid] = min_c;
+    }
+
+    auto cmp = [&](int a, int b)
+    {
+        if (p_bottom[a] != p_bottom[b])
+            return p_bottom[a] < p_bottom[b];
+        return p_left[a] > p_left[b];
+    };
+
+    priority_queue<int, vector<int>, decltype(cmp)> pq(cmp);
+    for (const auto &act : final_actions)
+        if (in_degree[act.piece_id] == 0)
+            pq.push(act.piece_id);
+
+    vector<int> seq;
+    while (!pq.empty())
+    {
+        int u = pq.top();
+        pq.pop();
+        seq.push_back(u);
+        for (int v : adj[u])
+            if (--in_degree[v] == 0)
+                pq.push(v);
+    }
+
+    if (seq.empty())
+        return false;
+
+    static const char *SHAPE_NAMES[] = {
+        "linear_red", "grid_orange", "T_shape_brown",
+        "L_left_purple", "L_right_yellow", "Z_left_blue", "Z_right_green"};
+
+    plan_msg.data.clear();
+    plan_msg.data.push_back(seq.size()); // 每个动作使用扩展 17-int 格式
+
+    for (size_t i = 0; i < seq.size(); ++i)
+    {
+        for (const auto &act : final_actions)
+        {
+            if (act.piece_id != seq[i])
+                continue;
+            int pu = 0, pv = 0, p_ang = 0, geom_u = 0, geom_v = 0;
+            bool has_geom = false;
+            if (!avail[act.shape_type].empty())
+            {
+                BlockInfo b = avail[act.shape_type].back();
+                pu = b.u;
+                pv = b.v;
+                p_ang = b.ang;
+                geom_u = b.geom_u;
+                geom_v = b.geom_v;
+                has_geom = b.has_geom;
+                avail[act.shape_type].pop_back();
+            }
+
+            int sum_r = 0, sum_c = 0;
+            for (auto &pt : act.absolute_coords)
+            {
+                sum_r += pt.x;
+                sum_c += pt.y;
+            }
+
+            plan_msg.data.push_back(act.shape_type);
+            plan_msg.data.push_back(act.real_way);
+            plan_msg.data.push_back(sum_r);
+            plan_msg.data.push_back(sum_c);
+            plan_msg.data.push_back(pu);
+            plan_msg.data.push_back(pv);
+            plan_msg.data.push_back(p_ang);
+            plan_msg.data.push_back(geom_u);
+            plan_msg.data.push_back(geom_v);
+            for (auto &pt : act.absolute_coords)
+            {
+                plan_msg.data.push_back(pt.x); // row
+                plan_msg.data.push_back(pt.y); // col
+            }
+
+            if (verbose)
+                ROS_INFO("action [%2zu/%lu]: select block => %-18s | center=(%.2f, %.2f) | rotation => %3d degree | pick=(%d,%d,%d) geom=(%d,%d) has_geom=%s",
+                         i + 1, seq.size(), SHAPE_NAMES[act.shape_type],
+                         sum_r / 4.0, sum_c / 4.0, act.real_way * 90, pu, pv, p_ang,
+                         geom_u, geom_v, has_geom ? "true" : "false");
+            break;
+        }
+    }
+    return true;
+}
 
 void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
 {
@@ -523,8 +303,21 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
         total_blocks += current_inventory[i];
     }
 
+    // 进阶峰值保持：每帧（含未稳定帧）更新峰值与等待起点，供后面的「不再上升」判定。
+    if (advanced_mode)
+    {
+        if (!adv_wait_started)
+        {
+            adv_wait_start = ros::Time::now();
+            adv_wait_started = true;
+        }
+        if (total_blocks > adv_peak_total)
+            adv_peak_total = total_blocks;
+    }
+
     // 1) 数量太少时不规划；但允许“差 1 个”的 34 块稳定库存作为可用 fallback。
-    if (total_blocks < min_usable_total_blocks)
+    //    进阶模式只放一部分方块，跳过此数量门槛（仅要求稳定 + 非空）。
+    if (!advanced_mode && total_blocks < min_usable_total_blocks)
     {
         inventory_stable_count = 0;
         last_inventory = current_inventory;
@@ -545,9 +338,11 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
         last_inventory = current_inventory;
     }
 
-    int required_stable = (total_blocks >= expected_total_blocks)
+    int required_stable = advanced_mode
                               ? inventory_stable_required_frames
-                              : min_usable_stable_required_frames;
+                              : ((total_blocks >= expected_total_blocks)
+                                     ? inventory_stable_required_frames
+                                     : min_usable_stable_required_frames);
 
     if (inventory_stable_count < required_stable)
     {
@@ -560,12 +355,54 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
         return;
     }
 
-    if (total_blocks < expected_total_blocks)
+    if (!advanced_mode && total_blocks < expected_total_blocks)
     {
         ROS_WARN("[WAIT_VISION] fallback planning with %d/%d blocks after stable inventory. inv=[%d,%d,%d,%d,%d,%d,%d]",
                  total_blocks, expected_total_blocks,
                  current_inventory[0], current_inventory[1], current_inventory[2],
                  current_inventory[3], current_inventory[4], current_inventory[5], current_inventory[6]);
+    }
+
+    // 规划所用的帧：默认当前帧；进阶超时兜底时切到「最优稳定帧」。
+    std_msgs::Int32MultiArray::ConstPtr frame = msg;
+
+    // 进阶峰值保持决策：已稳定，但若识别数还没回到峰值，就再等（直到超时兜底）。
+    if (advanced_mode)
+    {
+        // 记录已达稳定的最优（总数最大）帧——整帧存下，兜底时其库存/棋盘/像素表内部一致。
+        if (total_blocks > adv_best_stable_total)
+        {
+            adv_best_stable_total = total_blocks;
+            adv_best_stable_msg = msg;
+        }
+        const double waited = adv_wait_started ? (ros::Time::now() - adv_wait_start).toSec() : 0.0;
+        const bool at_peak = (total_blocks >= adv_peak_total);
+        const bool timed_out = (waited >= advanced_peak_max_wait_sec);
+
+        if (!at_peak && !timed_out)
+        {
+            ROS_WARN_THROTTLE(1.0,
+                              "[WAIT_VISION][PEAK-HOLD] stable at %d but peak %d seen; waiting %.1f/%.0fs for count to recover. inv=[%d,%d,%d,%d,%d,%d,%d]",
+                              total_blocks, adv_peak_total, waited, advanced_peak_max_wait_sec,
+                              current_inventory[0], current_inventory[1], current_inventory[2],
+                              current_inventory[3], current_inventory[4], current_inventory[5], current_inventory[6]);
+            return;
+        }
+        if (!at_peak && timed_out && adv_best_stable_msg && adv_best_stable_total > total_blocks)
+        {
+            // 超时兜底：改用见过的「最优稳定帧」整帧规划。
+            frame = adv_best_stable_msg;
+            for (int i = 0; i < 7; ++i)
+                current_inventory[i] = frame->data[i];
+            total_blocks = adv_best_stable_total;
+            ROS_WARN("[WAIT_VISION][PEAK-HOLD] timeout %.1fs: peak %d never held stable; falling back to best stable frame total=%d.",
+                     waited, adv_peak_total, total_blocks);
+        }
+        else if (!at_peak && timed_out)
+        {
+            ROS_WARN("[WAIT_VISION][PEAK-HOLD] timeout %.1fs: proceeding with current stable total=%d (peak %d).",
+                     waited, total_blocks, adv_peak_total);
+        }
     }
 
     is_planning = true;
@@ -582,7 +419,7 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
     {
         for (int c = 0; c < 10; ++c)
         {
-            current_board[r][c] = msg->data[idx++];
+            current_board[r][c] = frame->data[idx++];
         }
     }
 
@@ -591,24 +428,24 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
     // 新格式每块 6 个整数：[shape, pick_u, pick_v, angle, geom_u, geom_v]
     // hybrid 吸取时需要 geom_u/geom_v 给控制节点补偿“吸点不在几何中心”的放置偏差。
     vector<BlockInfo> available_blocks[7];
-    if (msg->data.size() > 147)
+    if (frame->data.size() > 147)
     {
-        int num_blocks = msg->data[idx++];
-        int remaining = (int)msg->data.size() - idx;
+        int num_blocks = frame->data[idx++];
+        int remaining = (int)frame->data.size() - idx;
         bool vision_has_geom = (num_blocks > 0 && remaining >= num_blocks * 6);
         int stride = vision_has_geom ? 6 : 4;
 
-        for (int i = 0; i < num_blocks && idx + stride - 1 < (int)msg->data.size(); ++i)
+        for (int i = 0; i < num_blocks && idx + stride - 1 < (int)frame->data.size(); ++i)
         {
             BlockInfo b;
-            int shape = msg->data[idx++];
-            b.u = msg->data[idx++];
-            b.v = msg->data[idx++];
-            b.ang = msg->data[idx++];
+            int shape = frame->data[idx++];
+            b.u = frame->data[idx++];
+            b.v = frame->data[idx++];
+            b.ang = frame->data[idx++];
             if (vision_has_geom)
             {
-                b.geom_u = msg->data[idx++];
-                b.geom_v = msg->data[idx++];
+                b.geom_u = frame->data[idx++];
+                b.geom_v = frame->data[idx++];
                 b.has_geom = true;
             }
             else
@@ -632,6 +469,126 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
         return;
     }
 
+    // ============================================================
+    // 进阶任务：按外部形状序列(硬约束)求解，按放置顺序直接打包(跳过拓扑排序)。
+    // 棋盘从空开始(进阶任务裁判已清盘)；输出沿用 /tetris_plan 17-int 格式。
+    // ============================================================
+    if (advanced_mode)
+    {
+        if (shape_sequence.empty())
+        {
+            ROS_WARN("[ADVANCED] shape_sequence param is empty; nothing to solve.");
+            is_planning = false;
+            return;
+        }
+
+        // 可选“可吸取上限”：某形状即使场上识别到更多，也只允许吸取指定数量。
+        // shape_pick_limits[s] < 0 表示不限制(用视觉全部库存)；否则对该形状取 min。
+        vector<int> effective_inventory = current_inventory;
+        bool limits_applied = false;
+        for (int s = 0; s < 7; ++s)
+        {
+            int lim = (s < (int)shape_pick_limits.size()) ? shape_pick_limits[s] : -1;
+            if (lim >= 0 && lim < effective_inventory[s])
+            {
+                effective_inventory[s] = lim;
+                limits_applied = true;
+            }
+        }
+        if (limits_applied)
+            ROS_INFO("[ADVANCED] pick limits applied: vision inv=[%d,%d,%d,%d,%d,%d,%d] -> capped=[%d,%d,%d,%d,%d,%d,%d]",
+                     current_inventory[0], current_inventory[1], current_inventory[2], current_inventory[3],
+                     current_inventory[4], current_inventory[5], current_inventory[6],
+                     effective_inventory[0], effective_inventory[1], effective_inventory[2], effective_inventory[3],
+                     effective_inventory[4], effective_inventory[5], effective_inventory[6]);
+
+        SeqConfig cfg;
+        cfg.sequence = shape_sequence;
+        cfg.cyclic = seq_cyclic;
+        cfg.inventory = effective_inventory;
+        cfg.require_support = seq_require_support;
+        cfg.reward_four_colors = seq_reward_four_colors;
+        cfg.board_rows = 14;
+        cfg.board_cols = 10;
+        SeqResult res = solveSequence(cfg);
+        ROS_INFO("[ADVANCED] solveSequence: placed=%d score=%d (seq_len=%lu cyclic=%d support=%d four_colors=%d)",
+                 res.placed, res.score, shape_sequence.size(), (int)seq_cyclic, (int)seq_require_support,
+                 (int)seq_reward_four_colors);
+
+        if (res.placements.empty())
+        {
+            ROS_WARN("[ADVANCED] no valid placement found.");
+            is_planning = false;
+            return;
+        }
+
+        const char *SHAPE_NAMES[] = {
+            "linear_red", "grid_orange", "T_shape_brown",
+            "L_left_purple", "L_right_yellow", "Z_left_blue", "Z_right_green"};
+
+        std_msgs::Int32MultiArray plan_msg;
+        plan_msg.data.push_back((int)res.placements.size());
+
+        ROS_INFO("====== ADVANCED pick-and-place sequence ======");
+        for (size_t i = 0; i < res.placements.size(); ++i)
+        {
+            const auto &pl = res.placements[i];
+            int pu = 0, pv = 0, p_ang = 0, geom_u = 0, geom_v = 0;
+            bool has_geom = false;
+            if (pl.shape_type >= 0 && pl.shape_type < 7 && !available_blocks[pl.shape_type].empty())
+            {
+                BlockInfo b = available_blocks[pl.shape_type].back();
+                pu = b.u;
+                pv = b.v;
+                p_ang = b.ang;
+                geom_u = b.geom_u;
+                geom_v = b.geom_v;
+                has_geom = b.has_geom;
+                available_blocks[pl.shape_type].pop_back();
+            }
+            else
+            {
+                ROS_WARN("[ADVANCED] no pixel coordinate for shape %d! Using 0,0.", pl.shape_type);
+            }
+
+            int sum_r = 0, sum_c = 0;
+            for (auto &pt : pl.cells)
+            {
+                sum_r += pt.x;
+                sum_c += pt.y;
+            }
+
+            // 17-int 格式：与普通模式一致
+            plan_msg.data.push_back(pl.shape_type);
+            plan_msg.data.push_back(pl.real_way);
+            plan_msg.data.push_back(sum_r);
+            plan_msg.data.push_back(sum_c);
+            plan_msg.data.push_back(pu);
+            plan_msg.data.push_back(pv);
+            plan_msg.data.push_back(p_ang);
+            plan_msg.data.push_back(geom_u);
+            plan_msg.data.push_back(geom_v);
+            for (auto &pt : pl.cells)
+            {
+                plan_msg.data.push_back(pt.x); // row
+                plan_msg.data.push_back(pt.y); // col
+            }
+
+            ROS_INFO("adv action [%2lu/%lu]: %-18s | center=(%.2f, %.2f) | rotation => %3d degree | pick=(%d,%d,%d) has_geom=%s",
+                     i + 1, res.placements.size(), SHAPE_NAMES[pl.shape_type],
+                     sum_r / 4.0, sum_c / 4.0, pl.real_way * 90, pu, pv, p_ang,
+                     has_geom ? "true" : "false");
+        }
+        ROS_INFO("===============================================================");
+        plan_pub.publish(plan_msg);
+        // 进阶模式只有一个确定解：以单候选集形式同时发往候选话题，供规划节点统一消费。
+        publishCandidateSet(candidates_pub, {plan_msg});
+        ROS_INFO("[ADVANCED][SUCCESS] score=%d! Sent %lu blocks to execution.", res.score, res.placements.size());
+        task_completed = true;
+        is_planning = false;
+        return;
+    }
+
     vector<PlanConfig> plans;
     if (total_blocks >= 34)
     {
@@ -651,7 +608,7 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
 
     int global_best_score = -1;
     vector<Action> global_best_actions;
-    vector<int> global_best_solution;
+    vector<vector<int>> global_best_candidates; // 同分最优的多个布局(去重)，交规划节点按运动代价择优
     PlanConfig optimal_plan;
 
     for (const auto &plan : plans)
@@ -666,16 +623,17 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
         for (int i = 0; i < eval_limit; ++i)
         {
             vector<Action> temp_actions;
-            vector<int> temp_sol;
+            vector<vector<int>> temp_cands;
             int current_score = 0;
 
-            if (solveForMask(plan, valid_subs[i], current_board, temp_actions, temp_sol, current_score))
+            if (solveForMaskMulti(plan, valid_subs[i], current_board, temp_actions, temp_cands,
+                                  current_score, num_strategy_candidates))
             {
                 if (current_score > global_best_score)
                 {
                     global_best_score = current_score;
                     global_best_actions = temp_actions;
-                    global_best_solution = temp_sol;
+                    global_best_candidates = temp_cands;
                     optimal_plan = plan;
                     if (global_best_score >= plan.max_possible_score)
                         break;
@@ -684,220 +642,44 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
         }
         if (global_best_score != -1)
         {
-            ROS_INFO("Strategic Lock-on! Successfully found the perfect solution with a score of %d points.", global_best_score);
+            ROS_INFO("Strategic Lock-on! score=%d with %lu candidate layout(s).",
+                     global_best_score, global_best_candidates.size());
             break;
         }
     }
 
     if (global_best_score != -1)
     {
-        vector<Action> final_actions;
-        int used_count[7] = {0};
-        for (int r : global_best_solution)
+        // 为每个同分候选布局各打一份 17-int 计划(独立回填抓取像素)。
+        ROS_INFO("====== Packing %lu candidate plan(s) for path planner ======",
+                 global_best_candidates.size());
+        vector<std_msgs::Int32MultiArray> plan_msgs;
+        plan_msgs.reserve(global_best_candidates.size());
+        for (size_t ci = 0; ci < global_best_candidates.size(); ++ci)
         {
-            if (global_best_actions[r].rot_idx == -1)
-                continue;
-            final_actions.push_back(global_best_actions[r]);
-            used_count[global_best_actions[r].shape_type]++;
+            std_msgs::Int32MultiArray pm;
+            if (buildPlanMsgFromSolution(global_best_candidates[ci], global_best_actions, current_board,
+                                         current_inventory, available_blocks, pm, /*verbose=*/(ci == 0)))
+                plan_msgs.push_back(std::move(pm));
         }
 
-        int board_piece[14][10];
-        for (int i = 0; i < 14; ++i)
-            for (int j = 0; j < 10; ++j)
-                board_piece[i][j] = current_board[i][j] > 0 ? -2 : -1;
-        for (const auto &act : final_actions)
+        if (plan_msgs.empty())
         {
-            for (auto pt : act.absolute_coords)
-                board_piece[pt.x][pt.y] = act.piece_id;
+            ROS_WARN("Failed to pack any candidate plan from %lu solution(s).",
+                     global_best_candidates.size());
+            is_planning = false;
+            return;
         }
 
-        int next_piece_id = 100;
-        for (int type = 0; type < 7; ++type)
-        {
-            int leftover = current_inventory[type] - used_count[type];
-            for (int k = 0; k < leftover; ++k)
-            {
-                auto unique_rots = getUniqueRotations(BASE_SHAPES[type]);
-                bool placed = false;
-                for (int r = 13; r >= 0 && !placed; --r)
-                {
-                    for (int c = 0; c < 10 && !placed; ++c)
-                    {
-                        for (int rot_idx = 0; rot_idx < unique_rots.size() && !placed; ++rot_idx)
-                        {
-                            auto &variant = unique_rots[rot_idx];
-                            auto &shape = variant.coords;
-                            bool valid = true, fully_supported = true;
-                            vector<Point> abs_coords;
-                            for (auto &p : shape)
-                            {
-                                int nr = r + p.y, nc = c + p.x;
-                                if (nr < 0 || nr >= 14 || nc < 0 || nc >= 10 || board_piece[nr][nc] != -1)
-                                {
-                                    valid = false;
-                                    break;
-                                }
-                                if (nr < 13 && board_piece[nr + 1][nc] == -1)
-                                    fully_supported = false;
-                                abs_coords.push_back({nr, nc});
-                            }
-                            if (valid && fully_supported)
-                            {
-                                Action act = {next_piece_id++, type, rot_idx, variant.real_way, r, c, abs_coords};
-                                final_actions.push_back(act);
-                                for (auto &pt : abs_coords)
-                                    board_piece[pt.x][pt.y] = act.piece_id;
-                                placed = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        vector<int> adj[200];
-        int in_degree[200] = {0};
-        for (int r = 0; r < 13; ++r)
-        {
-            for (int c = 0; c < 10; ++c)
-            {
-                int curr = board_piece[r][c];
-                int below = board_piece[r + 1][c];
-                if (curr >= 0 && below >= 0 && curr != below)
-                {
-                    bool exist = false;
-                    for (int t : adj[below])
-                        if (t == curr)
-                            exist = true;
-                    if (!exist)
-                    {
-                        adj[below].push_back(curr);
-                        in_degree[curr]++;
-                    }
-                }
-            }
-        }
-
-        int p_bottom[200] = {0};
-        int p_left[200] = {0};
-        for (const auto &act : final_actions)
-        {
-            int pid = act.piece_id;
-            int max_r = -1;
-            int min_c = 999;
-            for (auto &pt : act.absolute_coords)
-            {
-                if (pt.x > max_r)
-                    max_r = pt.x;
-                if (pt.y < min_c)
-                    min_c = pt.y;
-            }
-            p_bottom[pid] = max_r;
-            p_left[pid] = min_c;
-        }
-
-        auto cmp = [&](int a, int b)
-        {
-            if (p_bottom[a] != p_bottom[b])
-                return p_bottom[a] < p_bottom[b];
-            return p_left[a] > p_left[b];
-        };
-
-        priority_queue<int, vector<int>, decltype(cmp)> pq(cmp);
-        for (const auto &act : final_actions)
-        {
-            int pid = act.piece_id;
-            if (in_degree[pid] == 0)
-                pq.push(pid);
-        }
-
-        vector<int> seq;
-        while (!pq.empty())
-        {
-            int u = pq.top();
-            pq.pop();
-            seq.push_back(u);
-            for (int v : adj[u])
-                if (--in_degree[v] == 0)
-                    pq.push(v);
-        }
-
-        std_msgs::Int32MultiArray plan_msg;
-        plan_msg.data.push_back(seq.size()); // 每个动作使用扩展 17-int 格式
-
-        const char *SHAPE_NAMES[] = {
-            "linear_red", "grid_orange", "T_shape_brown",
-            "L_left_purple", "L_right_yellow", "Z_left_blue", "Z_right_green"};
-
-        ROS_INFO("====== Starting output of detailed pick-and-place sequence ======");
-        for (int i = 0; i < seq.size(); ++i)
-        {
-            for (const auto &act : final_actions)
-            {
-                if (act.piece_id == seq[i])
-                {
-                    int pu = 0, pv = 0, p_ang = 0, geom_u = 0, geom_v = 0;
-                    bool has_geom = false;
-                    if (!available_blocks[act.shape_type].empty())
-                    {
-                        BlockInfo b = available_blocks[act.shape_type].back();
-                        pu = b.u;
-                        pv = b.v;
-                        p_ang = b.ang;
-                        geom_u = b.geom_u;
-                        geom_v = b.geom_v;
-                        has_geom = b.has_geom;
-                        available_blocks[act.shape_type].pop_back();
-                    }
-                    else
-                    {
-                        ROS_WARN("No pixel coordinate found for shape %d! Using 0,0.", act.shape_type);
-                    }
-
-                    // 替换为求 4 个积木坐标的绝对总和：
-                    int sum_r = 0, sum_c = 0;
-                    for (auto &pt : act.absolute_coords)
-                    {
-                        sum_r += pt.x;
-                        sum_c += pt.y;
-                    }
-
-                    // 扩展版发送格式：每个动作 17 个整数
-                    // [shape, way, sum_r, sum_c, pick_u, pick_v, pick_angle, geom_u, geom_v,
-                    //  cell0_r, cell0_c, cell1_r, cell1_c, cell2_r, cell2_c, cell3_r, cell3_c]
-                    // pick_u/v 用于吸取；geom_u/v 用于控制节点补偿 hybrid 吸点偏离几何中心造成的放置平移误差。
-                    plan_msg.data.push_back(act.shape_type);
-                    plan_msg.data.push_back(act.real_way);
-                    plan_msg.data.push_back(sum_r);
-                    plan_msg.data.push_back(sum_c);
-                    plan_msg.data.push_back(pu);
-                    plan_msg.data.push_back(pv);
-                    plan_msg.data.push_back(p_ang);
-                    plan_msg.data.push_back(geom_u);
-                    plan_msg.data.push_back(geom_v);
-
-                    std::string cell_str;
-                    for (auto &pt : act.absolute_coords)
-                    {
-                        plan_msg.data.push_back(pt.x); // row
-                        plan_msg.data.push_back(pt.y); // col
-
-                        char buf[32];
-                        snprintf(buf, sizeof(buf), "(%d,%d) ", pt.x, pt.y);
-                        cell_str += buf;
-                    }
-
-                    ROS_INFO("action [%2d/%lu]: select block => %-18s | cells => %s| center=(%.2f, %.2f) | rotation => %3d degree | pick=(%d,%d,%d) geom=(%d,%d) has_geom=%s",
-                             i + 1, seq.size(), SHAPE_NAMES[act.shape_type], cell_str.c_str(),
-                             sum_r / 4.0, sum_c / 4.0, act.real_way * 90, pu, pv, p_ang,
-                             geom_u, geom_v, has_geom ? "true" : "false");
-                    break;
-                }
-            }
-        }
         ROS_INFO("===============================================================");
-        plan_pub.publish(plan_msg);
-        ROS_INFO("[SUCCESS] Max Score Achieved: %d points! Sent %lu blocks to execution.", global_best_score, seq.size());
+        // 1) 向后兼容：/tetris_plan 仍发最优(首个)候选，供 test_path/test_controller 单解流程使用。
+        plan_pub.publish(plan_msgs.front());
+        // 2) 候选集：/tetris_plan_candidates 帧格式 [K, len0, plan0..., len1, plan1...]，
+        //    规划节点对每个候选求关节代价后取最小者执行。
+        publishCandidateSet(candidates_pub, plan_msgs);
+        ROS_INFO("[SUCCESS] Max Score=%d. Published %lu candidate plan(s); first has %d task(s).",
+                 global_best_score, plan_msgs.size(),
+                 plan_msgs.front().data.empty() ? 0 : plan_msgs.front().data[0]);
         task_completed = true;
         is_planning = false;
     }
@@ -920,7 +702,43 @@ int main(int argc, char **argv)
     pnh.param("inventory_stable_required_frames", inventory_stable_required_frames, inventory_stable_required_frames);
     pnh.param("min_usable_stable_required_frames", min_usable_stable_required_frames, min_usable_stable_required_frames);
 
+    // 非进阶任务：同分最优候选数（>1 时由规划节点按运动代价择优）。
+    pnh.param("num_strategy_candidates", num_strategy_candidates, num_strategy_candidates);
+    if (num_strategy_candidates < 1)
+        num_strategy_candidates = 1;
+    pnh.param("plan_candidates_topic", plan_candidates_topic, plan_candidates_topic);
+
+    pnh.param("advanced_mode", advanced_mode, advanced_mode);
+    pnh.param("advanced_peak_max_wait_sec", advanced_peak_max_wait_sec, advanced_peak_max_wait_sec);
+    pnh.param("seq_cyclic", seq_cyclic, seq_cyclic);
+    pnh.param("seq_require_support", seq_require_support, seq_require_support);
+    pnh.param("seq_reward_four_colors", seq_reward_four_colors, seq_reward_four_colors);
+    pnh.getParam("shape_sequence", shape_sequence); // 形状 id 列表，例如 [0,1,2,3]
+
+    // 可选“可吸取上限”：list<int>，长度≤7，一一对应形状 id；<0=该形状不限制。
+    // 缺省(不传)则保持默认全 -1(不限制)。传入不足 7 项时其余保持 -1。
+    {
+        vector<int> user_limits;
+        if (pnh.getParam("shape_pick_limits", user_limits))
+        {
+            for (size_t i = 0; i < user_limits.size() && i < 7; ++i)
+                shape_pick_limits[i] = user_limits[i];
+            if (user_limits.size() > 7)
+                ROS_WARN("[ADVANCED] shape_pick_limits has %lu entries; only first 7 used.", user_limits.size());
+        }
+    }
+
+    if (advanced_mode)
+        ROS_INFO("[ADVANCED] mode ON: seq_len=%lu cyclic=%d require_support=%d reward_four_colors=%d pick_limits=[%d,%d,%d,%d,%d,%d,%d]",
+                 shape_sequence.size(), (int)seq_cyclic, (int)seq_require_support,
+                 (int)seq_reward_four_colors,
+                 shape_pick_limits[0], shape_pick_limits[1], shape_pick_limits[2], shape_pick_limits[3],
+                 shape_pick_limits[4], shape_pick_limits[5], shape_pick_limits[6]);
+
     plan_pub = nh.advertise<std_msgs::Int32MultiArray>("/tetris_plan", 10, true);
+    candidates_pub = nh.advertise<std_msgs::Int32MultiArray>(plan_candidates_topic, 10, true);
+    ROS_INFO("[STRATEGY] num_strategy_candidates=%d, candidates topic='%s'",
+             num_strategy_candidates, plan_candidates_topic.c_str());
 
     // 【核心修复3】：把订阅频道改回正确的 /vision/board_state ！！！
     ros::Subscriber vision_sub = nh.subscribe("/vision/board_state", 1, visionCallback);
@@ -929,6 +747,9 @@ int main(int argc, char **argv)
     ROS_INFO("[WAIT_VISION] expected_total_blocks=%d min_usable=%d stable_required_frames=%d min_usable_stable_frames=%d",
              expected_total_blocks, min_usable_total_blocks,
              inventory_stable_required_frames, min_usable_stable_required_frames);
+    if (advanced_mode)
+        ROS_INFO("[WAIT_VISION] advanced peak-hold: wait for count to stop climbing, timeout=%.0fs -> best stable frame.",
+                 advanced_peak_max_wait_sec);
 
     ros::spin();
     return 0;
