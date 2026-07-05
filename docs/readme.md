@@ -42,6 +42,13 @@
   与 [wsl_usb.md](wsl_usb.md)（用 usbipd-win 挂载 USB，网络设 **nat** 不要 mirror）。
 - 第三方源码包 `xarm_ros` / `realsense-ros` / `easy_handeye` 已被 `.gitignore` 排除，
   **必须存在于挂载进来的 `src/` 里**（镜像不含它们）。
+```bash
+cd catkin_ws
+git clone -b ros1-legacy https://github.com/realsenseai/realsense-ros.git 
+git clone https://github.com/xArm-Developer/xarm_ros.git
+git clone https://github.com/IFL-CAMP/easy_handeye.git
+git clone -b noetic https://github.com/ros-perception/vision_opencv.git
+```
 
 ### 2. 下载 DexiNed 边缘检测模型
 
