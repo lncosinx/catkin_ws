@@ -6,7 +6,7 @@
            /vision/board_state, /vision/debug_image, /vision/pick_depth_debug
          切换实现：vision_node:=vision_processor_node_cpp / vision_processor_node_dexined
          ========================================================= -->
-    <arg name="vision_node" default="vision_processor_node_dexined" />
+    <arg name="vision_node" default="vision_processor_node_cpp" />
     <arg name="color_edge_thresh" default="35" /><!-- 命令行可覆盖,边看 debug_edges 边扫 -->
     <arg name="color_edge_min_area" default="40" /><!-- 颜色边最小连通面积:滤掉掉漆零碎边,掉漆还切就调大 -->
     <arg name="use_dexined_for_split" default="true" /><!-- 或上DexiNed强边切同色贴碰块;不稳就设false纯颜色 -->
@@ -20,7 +20,7 @@
 
     <!-- 1.5 启动后加载固定曝光/白平衡（camera_config 里调好的，避免每次手调）。 -->
     <node pkg="dynamic_reconfigure" type="dynparam" name="load_rgb_cfg" output="screen"
-          args="load /camera/rgb_camera $(find tly)/config/camera_config.yaml"
+          args="load /camera/rgb_camera $(find tly)/config/camera_config_1.yaml"
           launch-prefix="bash -c 'sleep 6; exec $0 $@'" />
 
     <!-- 2. 生成 /camera/color/image_rect_color -->
@@ -43,11 +43,10 @@
         <rosparam param="distance_pick_shapes">[3, 4]</rosparam>
 
         <!-- ROI -->
-        <param name="roi_x_min" value="225" />
-        <param name="roi_y_min" value="23" />
-        <param name="roi_x_max" value="756" />
-        <param name="roi_y_max" value="699" />
-
+        <param name="roi_x_min" value="335" />
+        <param name="roi_y_min" value="88" />
+        <param name="roi_x_max" value="969" />
+        <param name="roi_y_max" value="711" />
         <!-- 黑白分割 -->
         <param name="threshold_mode" value="otsu" />
         <param name="manual_dark_threshold" value="105" />

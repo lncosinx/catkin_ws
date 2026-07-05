@@ -7,9 +7,9 @@
     <arg name="place_z_extra_margin" default="0.005" />
     <!-- 视觉实现: vision_processor_node_cpp (经典轮廓+模板) 或
          vision_processor_node_dexined (神经网络边缘检测) -->
-    <arg name="vision_node" default="vision_processor_node_dexined" />
+    <arg name="vision_node" default="vision_processor_node_cpp" />
     <!-- 进阶任务模式: true 则策略按 shape_sequence 求解(详见 strategy_node) -->
-    <arg name="advanced_mode" default="false" />
+    <arg name="advanced_mode" default="true" />
     <!-- 非进阶任务: 策略节点保留的同分最优候选布局数(>1 时由 path_planner 按关节运动代价择优)。
          1=旧行为(单解直发)。 roslaunch tly tly.launch num_candidates:=10 -->
     <arg name="num_candidates" default="8" />
@@ -78,7 +78,7 @@
     <arg name="min_template_iou" default="0.75" /><!-- 收回正常值:挡掉粘连大blob/边缘错配(之前0.25是放块的临时档) -->
      <!--  启动后加载固定曝光/白平衡（camera_config 里调好的，避免每次手调）。 -->
     <node pkg="dynamic_reconfigure" type="dynparam" name="load_rgb_cfg" output="screen"
-          args="load /camera/rgb_camera $(find tly)/config/camera_config.yaml"
+          args="load /camera/rgb_camera $(find tly)/config/camera_config_1.yaml"
           launch-prefix="bash -c 'sleep 6; exec $0 $@'" />
     <!-- 7. 视觉节点 -->
     <node pkg="tly" type="$(arg vision_node)" name="vision_processor_node" output="screen">
@@ -97,10 +97,10 @@
         <rosparam param="distance_pick_shapes">[3, 4]</rosparam>
 
         <!-- ROI -->
-        <param name="roi_x_min" value="225" />
-        <param name="roi_y_min" value="23" />
-        <param name="roi_x_max" value="756" />
-        <param name="roi_y_max" value="699" />
+        <param name="roi_x_min" value="335" />
+        <param name="roi_y_min" value="88" />
+        <param name="roi_x_max" value="969" />
+        <param name="roi_y_max" value="711" />
 
         <!-- 黑白分割 -->
         <param name="threshold_mode" value="otsu" />
@@ -278,7 +278,7 @@
              omega_per_v_lin_rad_per_m 是比值(rad/m)、与速度无关，改速度不用动；用 measure_tcp_omega.launch 复测更新。 -->
         <param name="transit_lin_speed_m_s" value="0.500" />
         <param name="loaded_lin_speed_m_s" value="0.500" />
-        <param name="omega_per_v_lin_rad_per_m" value="3.23" />
+        <param name="omega_per_v_lin_rad_per_m" value="3.001" />
         <!-- <rosparam param="joint_max_vel_rad_s">[3.14,3.14,3.14,3.14,3.14,3.14]</rosparam> -->
         <!-- J6 限位(rad)：软限位=优化偏好(越界按秒尺度加罚但仍可用，least-bad)；硬限位=绝对拒发
              (留余量到±2π=6.283真硬限)。转移段沿直线笛卡尔路径采样 J6(端点校验抓不到中途越限)：
@@ -296,8 +296,8 @@
         <param name="place_release_z_margin" value="0.006" />
         <!-- tcp_*_offset_z(波纹管补偿)默认从标定写入的 /tetris/TCP_*_OFFSET_Z 读取；
              如需手动覆盖，取消下面两行注释即可。 -->
-        <param name="tcp_pick_offset_z" value="-0.005" />
-        <param name="tcp_place_offset_z" value="-0.002" />
+        <param name="tcp_pick_offset_z" value="0.012" />
+        <param name="tcp_place_offset_z" value="0.0" />
         <param name="tcp_pick_offset_x" value="0.0" />
         <param name="tcp_pick_offset_y" value="0.0" />
         <param name="tcp_place_offset_x" value="0.0" />
@@ -319,7 +319,7 @@
         <param name="optimize_order" value="true" />
         <!-- 是否允许重排放置顺序。true=在 DAG 内按关节代价重排(默认)；
              false=保持策略节点顺序(比赛若有方块相邻等 DAG 外约束)，仅选代价最小的同形状块+翻转。 -->
-        <param name="allow_reorder" value="true" />
+        <param name="allow_reorder" value="false" />
         <param name="plan_topic" value="/tetris_plan" />
         <!-- 多候选择优：消费 strategy 的同分候选集，逐个求关节代价后取最小者执行(节点内多线程并行)。
              true → 订阅 /tetris_plan_candidates；false → 退回订阅单计划 /tetris_plan(旧行为)。
@@ -352,14 +352,16 @@
              进阶时只放一部分方块，不要求库存达 34/35。
              roslaunch tly tly.launch advanced_mode:=true -->
         <param name="advanced_mode" value="$(arg advanced_mode)" />
+        <!-- 进阶「峰值保持」：稳定后仍等识别数不再上升才发；等此秒数仍达不到峰值则用最优稳定帧兜底。 -->
+        <param name="advanced_peak_max_wait_sec" value="10.0" />
         <param name="seq_cyclic" value="true" />
         <param name="seq_require_support" value="true" />
         <!-- 满行且≥4色额外加分(竞赛规则②)。默认 false：实际比赛可能没有此约束，
              开启时设 true -->
         <param name="seq_reward_four_colors" value="false" />
-        <rosparam param="shape_sequence">[5,3,2,1,0,6,4]</rosparam>
+        <rosparam param="shape_sequence">[2,3,5,6,4,0,1]</rosparam>
         <!-- 可选：每种形状“可吸取上限”，长度 7 对应形状 id；<0=不限制(默认)。
              例：场上有 4 个 id=0 但只允许吸 2 个 -> [2,-1,-1,-1,-1,-1,-1]。缺省整行删掉。 -->
-        <!-- <rosparam param="shape_pick_limits">[-1,-1,-1,-1,-1,-1,-1]</rosparam> -->
+        <rosparam param="shape_pick_limits">[4,4,2,1,5,4,5]</rosparam>
     </node>
 </launch>

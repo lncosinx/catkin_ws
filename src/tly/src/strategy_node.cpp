@@ -47,6 +47,16 @@ bool seq_reward_four_colors = false; // 满行且≥4色额外 +10(竞赛规则�
 // 用视觉全部库存)。长度 7，一一对应 7 种形状 id。仅进阶模式生效。
 vector<int> shape_pick_limits(7, -1);
 
+// 进阶模式「峰值保持」：仅「稳定」不够——视觉可能停在偏低的误识别值并稳定住。故等识别总数
+// 「不再上升」(current==peak) 才规划；若某帧曾见更高峰值，就再等它稳定恢复，直到 wait 预算耗尽，
+// 用见过的「最优稳定帧」整帧兜底（整帧一致，避免库存计数与像素表错位）。
+int adv_peak_total = -1;                                  // 本轮见过的最大识别总数（含瞬时帧）
+int adv_best_stable_total = -1;                           // 已达稳定的帧中总数最大者
+std_msgs::Int32MultiArray::ConstPtr adv_best_stable_msg; // 上者对应的整帧（兜底规划用）
+ros::Time adv_wait_start;                                 // 本轮等待起点（首帧）
+bool adv_wait_started = false;
+double advanced_peak_max_wait_sec = 10.0; // 峰值保持超时预算（秒）
+
 void statusCallback(const std_msgs::Bool::ConstPtr &msg)
 {
     is_robot_busy = msg->data;
@@ -293,6 +303,18 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
         total_blocks += current_inventory[i];
     }
 
+    // 进阶峰值保持：每帧（含未稳定帧）更新峰值与等待起点，供后面的「不再上升」判定。
+    if (advanced_mode)
+    {
+        if (!adv_wait_started)
+        {
+            adv_wait_start = ros::Time::now();
+            adv_wait_started = true;
+        }
+        if (total_blocks > adv_peak_total)
+            adv_peak_total = total_blocks;
+    }
+
     // 1) 数量太少时不规划；但允许“差 1 个”的 34 块稳定库存作为可用 fallback。
     //    进阶模式只放一部分方块，跳过此数量门槛（仅要求稳定 + 非空）。
     if (!advanced_mode && total_blocks < min_usable_total_blocks)
@@ -341,6 +363,48 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
                  current_inventory[3], current_inventory[4], current_inventory[5], current_inventory[6]);
     }
 
+    // 规划所用的帧：默认当前帧；进阶超时兜底时切到「最优稳定帧」。
+    std_msgs::Int32MultiArray::ConstPtr frame = msg;
+
+    // 进阶峰值保持决策：已稳定，但若识别数还没回到峰值，就再等（直到超时兜底）。
+    if (advanced_mode)
+    {
+        // 记录已达稳定的最优（总数最大）帧——整帧存下，兜底时其库存/棋盘/像素表内部一致。
+        if (total_blocks > adv_best_stable_total)
+        {
+            adv_best_stable_total = total_blocks;
+            adv_best_stable_msg = msg;
+        }
+        const double waited = adv_wait_started ? (ros::Time::now() - adv_wait_start).toSec() : 0.0;
+        const bool at_peak = (total_blocks >= adv_peak_total);
+        const bool timed_out = (waited >= advanced_peak_max_wait_sec);
+
+        if (!at_peak && !timed_out)
+        {
+            ROS_WARN_THROTTLE(1.0,
+                              "[WAIT_VISION][PEAK-HOLD] stable at %d but peak %d seen; waiting %.1f/%.0fs for count to recover. inv=[%d,%d,%d,%d,%d,%d,%d]",
+                              total_blocks, adv_peak_total, waited, advanced_peak_max_wait_sec,
+                              current_inventory[0], current_inventory[1], current_inventory[2],
+                              current_inventory[3], current_inventory[4], current_inventory[5], current_inventory[6]);
+            return;
+        }
+        if (!at_peak && timed_out && adv_best_stable_msg && adv_best_stable_total > total_blocks)
+        {
+            // 超时兜底：改用见过的「最优稳定帧」整帧规划。
+            frame = adv_best_stable_msg;
+            for (int i = 0; i < 7; ++i)
+                current_inventory[i] = frame->data[i];
+            total_blocks = adv_best_stable_total;
+            ROS_WARN("[WAIT_VISION][PEAK-HOLD] timeout %.1fs: peak %d never held stable; falling back to best stable frame total=%d.",
+                     waited, adv_peak_total, total_blocks);
+        }
+        else if (!at_peak && timed_out)
+        {
+            ROS_WARN("[WAIT_VISION][PEAK-HOLD] timeout %.1fs: proceeding with current stable total=%d (peak %d).",
+                     waited, total_blocks, adv_peak_total);
+        }
+    }
+
     is_planning = true;
     ROS_INFO("===============================================================");
     ROS_INFO("=      Vision inventory stable. Launching Dynamic Engine V3    =");
@@ -355,7 +419,7 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
     {
         for (int c = 0; c < 10; ++c)
         {
-            current_board[r][c] = msg->data[idx++];
+            current_board[r][c] = frame->data[idx++];
         }
     }
 
@@ -364,24 +428,24 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
     // 新格式每块 6 个整数：[shape, pick_u, pick_v, angle, geom_u, geom_v]
     // hybrid 吸取时需要 geom_u/geom_v 给控制节点补偿“吸点不在几何中心”的放置偏差。
     vector<BlockInfo> available_blocks[7];
-    if (msg->data.size() > 147)
+    if (frame->data.size() > 147)
     {
-        int num_blocks = msg->data[idx++];
-        int remaining = (int)msg->data.size() - idx;
+        int num_blocks = frame->data[idx++];
+        int remaining = (int)frame->data.size() - idx;
         bool vision_has_geom = (num_blocks > 0 && remaining >= num_blocks * 6);
         int stride = vision_has_geom ? 6 : 4;
 
-        for (int i = 0; i < num_blocks && idx + stride - 1 < (int)msg->data.size(); ++i)
+        for (int i = 0; i < num_blocks && idx + stride - 1 < (int)frame->data.size(); ++i)
         {
             BlockInfo b;
-            int shape = msg->data[idx++];
-            b.u = msg->data[idx++];
-            b.v = msg->data[idx++];
-            b.ang = msg->data[idx++];
+            int shape = frame->data[idx++];
+            b.u = frame->data[idx++];
+            b.v = frame->data[idx++];
+            b.ang = frame->data[idx++];
             if (vision_has_geom)
             {
-                b.geom_u = msg->data[idx++];
-                b.geom_v = msg->data[idx++];
+                b.geom_u = frame->data[idx++];
+                b.geom_v = frame->data[idx++];
                 b.has_geom = true;
             }
             else
@@ -645,6 +709,7 @@ int main(int argc, char **argv)
     pnh.param("plan_candidates_topic", plan_candidates_topic, plan_candidates_topic);
 
     pnh.param("advanced_mode", advanced_mode, advanced_mode);
+    pnh.param("advanced_peak_max_wait_sec", advanced_peak_max_wait_sec, advanced_peak_max_wait_sec);
     pnh.param("seq_cyclic", seq_cyclic, seq_cyclic);
     pnh.param("seq_require_support", seq_require_support, seq_require_support);
     pnh.param("seq_reward_four_colors", seq_reward_four_colors, seq_reward_four_colors);
@@ -682,6 +747,9 @@ int main(int argc, char **argv)
     ROS_INFO("[WAIT_VISION] expected_total_blocks=%d min_usable=%d stable_required_frames=%d min_usable_stable_frames=%d",
              expected_total_blocks, min_usable_total_blocks,
              inventory_stable_required_frames, min_usable_stable_required_frames);
+    if (advanced_mode)
+        ROS_INFO("[WAIT_VISION] advanced peak-hold: wait for count to stop climbing, timeout=%.0fs -> best stable frame.",
+                 advanced_peak_max_wait_sec);
 
     ros::spin();
     return 0;

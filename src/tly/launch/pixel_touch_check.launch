@@ -20,7 +20,7 @@
     </include>
 
     <node pkg="tf2_ros" type="static_transform_publisher" name="suction_tcp_broadcaster"
-          args="0.00075 0.0004 0.068 0 0 0 link6 link_tcp" />
+          args="0.0008 0.0003 0.068 0 0 0 link6 link_tcp" />
 
     <include file="$(find realsense2_camera)/launch/rs_camera.launch">
         <arg name="align_depth" value="true" />

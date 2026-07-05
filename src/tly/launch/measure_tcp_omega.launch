@@ -16,8 +16,8 @@
             - 起始姿态取当前上报位姿，默认只改 yaw、角度 [20,60,100,140]°，可用 args 调整。
          ========================================================= -->
     <arg name="robot_ip" default="192.168.1.216" />
-    <arg name="mvvelo" default="200.0" />          <!-- mm/s，测生产实际档位 -->
-    <arg name="mvacc" default="1000.0" />
+    <arg name="mvvelo" default="500.0" />          <!-- mm/s，测生产实际档位 -->
+    <arg name="mvacc" default="2000.0" />
     <arg name="axis" default="yaw" />             <!-- roll / pitch / yaw -->
     <arg name="angles_deg" default="[20.0, 60.0, 100.0, 140.0]" />
     <arg name="repeats" default="3" />

@@ -197,6 +197,10 @@ private:
     // 是否允许重排放置顺序。true=在 DAG 内按代价重排；false=保持策略节点给的顺序（比赛可能有
     // 方块相邻等 DAG 之外的约束），仅为每个槽的指定形状选代价最小的物理块 + 腕部翻转。
     bool allow_reorder_ = true;
+    // 保序（allow_reorder=false）关节代价模式下，沿固定放置顺序做有界 beam 搜索的宽度。
+    // J6 可行性路径相关（见 optimizePlan），贪心逐槽择优会近视地把 J6 绕到边界令后续槽无解；
+    // beam 保留前 N 条最优前缀，让下游不可行能回改上游选择。1 = 退化为原贪心。
+    int reorder_beam_width_ = 12;
     bool pool_ready_ = false;
     std::vector<PoolBlock> pool_by_shape_[7];
 
@@ -396,6 +400,7 @@ private:
         pnh_.param("joint_state_topic", joint_state_topic_, joint_state_topic_);
         pnh_.param("optimize_order", optimize_order_, optimize_order_);
         pnh_.param("allow_reorder", allow_reorder_, allow_reorder_);
+        pnh_.param("reorder_beam_width", reorder_beam_width_, reorder_beam_width_);
         pnh_.param("camera_info_topic", camera_info_topic_, camera_info_topic_);
         pnh_.param("base_frame", base_frame_, base_frame_);
         pnh_.param("camera_frame", camera_frame_, camera_frame_);
@@ -1549,76 +1554,169 @@ private:
         // 占位/回退（候选池可用时由本节点重选）。
         if (!allow_reorder_)
         {
+            if (joint_mode)
+            {
+                // 关节代价模式：J6 可行性沿放置序列「路径相关」——端点 IK 与转移段 J6 采样都以上一槽
+                // 落点的关节/位姿为起点做「就近解」，故某槽能否 J6 可行取决于此前所有槽的选择。逐槽贪心
+                // 择优会近视地把 J6 绕到边界，令后续槽无解。改用有界 beam 搜索：沿固定放置顺序展开
+                // (物理块, 翻转) 选择并携带 (q_cur, cur_pose) 状态，保留前 B 条最低代价前缀，让下游
+                // 不可行能回改上游选择。
+                // 保险：若无「全 n 槽」可行解，取「第一个不可行槽之前」的最长合法前缀执行（截断 goals）；
+                //       保序前缀不破坏放置 DAG（依赖只会更靠前），故可安全执行。
+                struct BeamNode
+                {
+                    double cost = 0.0;
+                    Joints q_cur{};
+                    geometry_msgs::Pose cur_pose;
+                    std::array<std::vector<char>, 7> used; // 逐形状已消费标记（各节点独立）
+                    std::vector<int> pick_cand;            // 每槽选中的 cand 下标（-1 = 保留策略抓取）
+                    std::vector<char> pick_flip;           // 每槽翻转
+                    std::vector<double> pick_maxj6;        // 每槽 J6 路径峰值（软限位告警用）
+                };
+                BeamNode root;
+                root.q_cur = q_cur;
+                root.cur_pose = cur_pose;
+                if (use_pool)
+                    for (int s = 0; s < 7; ++s)
+                        root.used[s].assign(cand[s].size(), 0);
+                std::vector<BeamNode> beam;
+                beam.push_back(std::move(root));
+
+                const int B = std::max(1, reorder_beam_width_);
+                int placed = 0; // 已可行前缀长度
+                for (int i = 0; i < n; ++i)
+                {
+                    const int s = goals[i].shape_type;
+                    std::vector<BeamNode> next;
+                    for (const BeamNode &st : beam)
+                    {
+                        auto tryOption = [&](int cand_k, const PixelPoint &pk, int ang,
+                                             const PixelPoint &gm, bool has_geom)
+                        {
+                            PairEval pe = evalPairJoint(goals[i], pk, ang, gm, has_geom, st.q_cur, st.cur_pose);
+                            if (!pe.ok)
+                                return;
+                            BeamNode ch = st;
+                            ch.cost += pe.cost;
+                            ch.q_cur = pe.q_place;
+                            ch.cur_pose = pe.end_pose;
+                            if (cand_k >= 0)
+                                ch.used[s][cand_k] = 1;
+                            ch.pick_cand.push_back(cand_k);
+                            ch.pick_flip.push_back(pe.flip ? 1 : 0);
+                            ch.pick_maxj6.push_back(pe.max_j6);
+                            next.push_back(std::move(ch));
+                        };
+                        if (use_pool && s >= 0 && s < 7)
+                        {
+                            for (int k = 0; k < static_cast<int>(cand[s].size()); ++k)
+                            {
+                                if (st.used[s][k])
+                                    continue;
+                                const PoolBlock &b = cand[s][k];
+                                PixelPoint pk{b.u, b.v}, gm{b.geom_u, b.geom_v};
+                                tryOption(k, pk, b.ang, gm, b.has_geom);
+                            }
+                        }
+                        else
+                        {
+                            // 池不可用：保留策略抓取，仅由 evalPairJoint 内部择翻转（无块重选自由度）。
+                            tryOption(-1, goals[i].pick_pixel, goals[i].pick_angle_deg,
+                                      goals[i].geom_pixel, goals[i].has_geom_pixel);
+                        }
+                    }
+                    if (next.empty())
+                    {
+                        placed = i; // 槽 i 是第一个不可行槽 → 前缀 0..i-1 可行
+                        break;
+                    }
+                    if (static_cast<int>(next.size()) > B)
+                    {
+                        std::nth_element(next.begin(), next.begin() + B, next.end(),
+                                         [](const BeamNode &a, const BeamNode &b)
+                                         { return a.cost < b.cost; });
+                        next.resize(B);
+                    }
+                    beam = std::move(next);
+                    placed = i + 1;
+                }
+
+                const BeamNode *bestNode = nullptr;
+                for (const BeamNode &st : beam)
+                    if (!bestNode || st.cost < bestNode->cost)
+                        bestNode = &st;
+
+                if (!bestNode || placed == 0)
+                {
+                    ROS_ERROR("[PATH] PLANNING FAILED: task 0 (shape %d) has no J6-feasible pick/flip "
+                              "(every transit exceeds hard limit %.0f deg); nothing runnable. NOT publishing — re-plan needed.",
+                              n > 0 ? goals[0].shape_type : -1, wrist_hard_limit_rad_ * 180.0 / M_PI);
+                    return false;
+                }
+
+                // 回填选中的抓取块 + 翻转（前缀 0..placed-1）。
+                for (int j = 0; j < placed; ++j)
+                {
+                    const int s = goals[j].shape_type;
+                    const int k = bestNode->pick_cand[j];
+                    if (use_pool && k >= 0 && s >= 0 && s < 7)
+                    {
+                        const PoolBlock &b = cand[s][k];
+                        goals[j].pick_pixel.u = b.u;
+                        goals[j].pick_pixel.v = b.v;
+                        goals[j].pick_angle_deg = b.ang;
+                        goals[j].geom_pixel.u = b.geom_u;
+                        goals[j].geom_pixel.v = b.geom_v;
+                        goals[j].has_geom_pixel = b.has_geom;
+                    }
+                    goals[j].flip = (bestNode->pick_flip[j] != 0);
+                    if (bestNode->pick_maxj6[j] > wrist_soft_limit_rad_)
+                        ROS_WARN("[PATH] task %d J6 path peak %.0f deg exceeds soft %.0f deg (within hard); margin low.",
+                                 j, bestNode->pick_maxj6[j] * 180.0 / M_PI, wrist_soft_limit_rad_ * 180.0 / M_PI);
+                }
+                total_cost = bestNode->cost;
+
+                if (placed < n)
+                {
+                    // 保险触发：无完整可行解，执行第一个不可行槽之前的所有合法放置。
+                    ROS_WARN("[PATH] SAFETY FALLBACK: no full J6-feasible assignment for %d task(s) "
+                             "(beam=%d, pool=%s); task %d (shape %d) infeasible. Running %d legal placement(s) "
+                             "before it; dropping %d task(s).",
+                             n, B, use_pool ? "on" : "off", placed, goals[placed].shape_type,
+                             placed, n - placed);
+                    goals.resize(placed);
+                }
+                else
+                {
+                    ROS_INFO("[PATH] keep-order beam: all %d task(s) J6-feasible; assigned picks+flip, "
+                             "cost=%.4f (beam=%d, pool=%s).",
+                             n, total_cost, B, use_pool ? "on" : "off");
+                }
+                return true;
+            }
+
+            // XY 回退代价模式（IK 不可用）：无 J6 硬约束，逐槽按 pick+place 直线距离贪心选块，
+            // 事后统一用 yaw 启发式定翻转；此路径不会因 J6 失败，故无前缀截断。
             for (int i = 0; i < n; ++i)
             {
                 int s = goals[i].shape_type;
                 double best = std::numeric_limits<double>::max();
                 int best_cand = -1;
-                bool best_flip = false;
-                bool feasible = false;
-                Joints best_qplace = q_cur;
-                geometry_msgs::Pose best_endpose = cur_pose;
-                double best_maxj6 = 0.0;
-
                 if (use_pool && s >= 0 && s < 7)
                 {
                     for (int k = 0; k < static_cast<int>(cand[s].size()); ++k)
                     {
                         if (cand_used[s][k])
                             continue;
-                        const PoolBlock &b = cand[s][k];
-                        if (joint_mode)
+                        double d = (has_cur ? std::hypot(cur_x - cand_x[s][k], cur_y - cand_y[s][k]) : 0.0) +
+                                   std::hypot(cand_x[s][k] - place_x[i], cand_y[s][k] - place_y[i]);
+                        if (d < best)
                         {
-                            PixelPoint pk{b.u, b.v}, gm{b.geom_u, b.geom_v};
-                            PairEval pe = evalPairJoint(goals[i], pk, b.ang, gm, b.has_geom, q_cur, cur_pose);
-                            if (pe.ok && pe.cost < best)
-                            {
-                                best = pe.cost;
-                                best_cand = k;
-                                best_flip = pe.flip;
-                                best_qplace = pe.q_place;
-                                best_endpose = pe.end_pose;
-                                best_maxj6 = pe.max_j6;
-                                feasible = true;
-                            }
-                        }
-                        else
-                        {
-                            double d = (has_cur ? std::hypot(cur_x - cand_x[s][k], cur_y - cand_y[s][k]) : 0.0) +
-                                       std::hypot(cand_x[s][k] - place_x[i], cand_y[s][k] - place_y[i]);
-                            if (d < best)
-                            {
-                                best = d;
-                                best_cand = k;
-                            }
+                            best = d;
+                            best_cand = k;
                         }
                     }
                 }
-                else if (joint_mode)
-                {
-                    // 池不可用：保留策略抓取，仍按关节代价选翻转。
-                    PairEval pe = evalPairJoint(goals[i], goals[i].pick_pixel, goals[i].pick_angle_deg,
-                                                goals[i].geom_pixel, goals[i].has_geom_pixel, q_cur, cur_pose);
-                    if (pe.ok)
-                    {
-                        best = pe.cost;
-                        best_flip = pe.flip;
-                        best_qplace = pe.q_place;
-                        best_endpose = pe.end_pose;
-                        best_maxj6 = pe.max_j6;
-                        feasible = true;
-                    }
-                }
-
-                // 不重排模式下没有重排自由度：该槽若无任何 J6 可行 (块,翻转) → 规划失败。
-                if (joint_mode && !feasible)
-                {
-                    ROS_ERROR("[PATH] PLANNING FAILED: task %d (shape %d) has no J6-feasible pick/flip "
-                              "(every transit exceeds hard limit %.0f deg). NOT publishing — re-plan needed.",
-                              i, s, wrist_hard_limit_rad_ * 180.0 / M_PI);
-                    return false;
-                }
-
                 if (use_pool && best_cand >= 0 && s >= 0 && s < 7)
                 {
                     const PoolBlock &b = cand[s][best_cand];
@@ -1630,25 +1728,15 @@ private:
                     goals[i].geom_pixel.v = b.geom_v;
                     goals[i].has_geom_pixel = b.has_geom;
                 }
-                if (joint_mode)
-                {
-                    if (best_maxj6 > wrist_soft_limit_rad_)
-                        ROS_WARN("[PATH] task %d J6 path peak %.0f deg exceeds soft %.0f deg (within hard); margin low.",
-                                 i, best_maxj6 * 180.0 / M_PI, wrist_soft_limit_rad_ * 180.0 / M_PI);
-                    goals[i].flip = best_flip;
-                    q_cur = best_qplace;
-                    cur_pose = best_endpose;
-                }
                 if (best < std::numeric_limits<double>::max())
                     total_cost += best;
                 cur_x = place_x[i];
                 cur_y = place_y[i];
                 has_cur = true;
             }
-            if (!joint_mode)
-                assignFlipsByYaw(goals);
-            ROS_INFO("[PATH] kept strategy order; assigned picks+flip: %d task(s), pool=%s, cost=%s.",
-                     n, use_pool ? "on" : "off", joint_mode ? "joint" : "xy");
+            assignFlipsByYaw(goals);
+            ROS_INFO("[PATH] kept strategy order (XY); assigned picks: %d task(s), pool=%s.",
+                     n, use_pool ? "on" : "off");
             return true;
         }
 
@@ -2025,9 +2113,11 @@ private:
     void buildAndPublishMotion(std::vector<TaskGoal> &goals, int total, int stride)
     {
         // 1) 调试用 17-int 计划（回填抓取字段后无损重排），不含翻转信息。
+        // 计数取实际 goals.size()（可能因保序前缀截断 < total），保持帧头与内容一致，避免下游解析越界。
+        const int n_goals = static_cast<int>(goals.size());
         std_msgs::Int32MultiArray opt;
         opt.data.reserve(1 + total * stride);
-        opt.data.push_back(total);
+        opt.data.push_back(n_goals);
         for (const auto &g : goals)
         {
             std::vector<int> blk = g.raw;
@@ -2066,7 +2156,7 @@ private:
 
         ROS_INFO("[PATH] Published %s with %lu task(s) + %s Int32(%d) [%s cost].",
                  motion_topic_.c_str(), plan.tasks.size(), optimized_plan_topic_.c_str(),
-                 total, use_joint_cost_ ? "joint" : "xy");
+                 n_goals, use_joint_cost_ ? "joint" : "xy");
     }
 
     void planCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
@@ -2149,6 +2239,7 @@ private:
         {
             bool ok = false;
             double cost = std::numeric_limits<double>::max();
+            int placed = 0; // optimizePlan 保序前缀截断后实际可执行任务数（择优先比它）
             std::vector<TaskGoal> goals;
             int total = 0;
             int stride = 0;
@@ -2166,7 +2257,7 @@ private:
             if (optimize_order_)
             {
                 if (!optimizePlan(goals, cost))
-                    return; // 该候选 J6 不可行，淘汰
+                    return; // 该候选整体 J6 不可行（连首任务都不行），淘汰
             }
             else
             {
@@ -2175,6 +2266,7 @@ private:
             }
             e.ok = true;
             e.cost = cost;
+            e.placed = static_cast<int>(goals.size()); // 可能因保险前缀 < 原任务数
             e.goals = std::move(goals);
             e.total = total;
             e.stride = stride;
@@ -2196,16 +2288,20 @@ private:
                 work(k);
         }
 
+        // 择优：先比可执行任务数（保险截断后越多越好），同数再比运动代价（越小越好）。
         int best = -1;
         double best_cost = std::numeric_limits<double>::max();
+        int best_placed = -1;
         int feasible = 0;
         for (int k = 0; k < M; ++k)
         {
             if (!evals[k].ok)
                 continue;
             ++feasible;
-            if (evals[k].cost < best_cost)
+            if (evals[k].placed > best_placed ||
+                (evals[k].placed == best_placed && evals[k].cost < best_cost))
             {
+                best_placed = evals[k].placed;
                 best_cost = evals[k].cost;
                 best = k;
             }
@@ -2216,8 +2312,8 @@ private:
             return;
         }
 
-        ROS_INFO("[PATH] Candidate selection: %d/%d feasible; chose #%d cost=%.4f (%s cost).",
-                 feasible, M, best, best_cost, use_joint_cost_ ? "joint" : "xy");
+        ROS_INFO("[PATH] Candidate selection: %d/%d feasible; chose #%d placed=%d cost=%.4f (%s cost).",
+                 feasible, M, best, best_placed, best_cost, use_joint_cost_ ? "joint" : "xy");
         buildAndPublishMotion(evals[best].goals, evals[best].total, evals[best].stride);
     }
 };

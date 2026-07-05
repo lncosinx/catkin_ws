@@ -82,7 +82,7 @@
 
     <!-- 【核心新增】：在空间点标定阶段，也必须发布精确的吸盘 TCP 坐标系！ -->
     <node pkg="tf2_ros" type="static_transform_publisher" name="suction_tcp_broadcaster"
-          args="0.00075 0.0004 0.068 0 0 0 link6 link_tcp" />
+          args="0.0008 0.0003 0.068 0 0 0 link6 link_tcp" />
 
     <!-- 2. 启动 RealSense，相机内参来自 /camera/color/camera_info（滤波与手眼标定时一致） -->
     <arg name="depth_filters" default="spatial,temporal,hole_filling" />
@@ -160,7 +160,7 @@
 
         <!-- 步骤7 抓取单应性：整流彩色图 + 点数（可变，至少 min 个、至多 points 个；min 强制 >=4） -->
         <param name="rect_color_topic" value="/camera/color/image_rect_color" />
-        <param name="pick_homography_points" value="4" />
+        <param name="pick_homography_points" value="9" />
         <param name="pick_homography_min_points" value="4" />
 
         <param name="block_samples" value="3" />

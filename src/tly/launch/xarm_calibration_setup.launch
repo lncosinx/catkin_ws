@@ -22,7 +22,7 @@
     <!-- 【核心改进 1】：发布吸盘末端 TCP 的静态 TF。数据来自 xArm Studio (单位转为米) -->
     <!-- args 参数顺序: x y z yaw pitch roll parent_frame child_frame -->
     <node pkg="tf2_ros" type="static_transform_publisher" name="suction_tcp_broadcaster"
-          args="0.00075 0.0004 0.068 0 0 0 link6 link_tcp" />
+          args="0.0008 0.0003 0.068 0 0 0 link6 link_tcp" />
 
     <!-- ChArUco 整板检测，广播 camera_color_optical_frame -> charuco_board_frame -->
     <node pkg="tly" type="charuco_tracker.py" name="charuco_tracker" output="screen">

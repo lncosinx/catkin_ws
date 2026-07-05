@@ -19,7 +19,7 @@ dictitems:
       contrast: 100
       enable_auto_exposure: false
       enable_auto_white_balance: false
-      exposure: 180
+      exposure: 166
       frames_queue_size: 16
       gain: 0
       gamma: 100
