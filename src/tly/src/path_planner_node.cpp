@@ -7,11 +7,11 @@
 //   - 放置 XY/Z：白板格心双线性插值 + PLACE_Z_MAP。
 //   - 悬停：在 table 系抬到 HOVER_Z（table +Z 即 board 法向），再换算 base。
 //
-// 关节空间代价（替代旧 XY 直线距离）：用 xArm6 闭式 FK + seeded DLS IK（见
-// tly/xarm6_kinematics.hpp）把每个 TCP 位姿转成 6 关节角 q，代价
-//   Cost = Σ wᵢ (q_B,i − q_A,i)²
+// 运动代价（替代旧 XY 直线距离）：用 xArm6 闭式 FK + seeded DLS IK（见
+// tly/xarm6_kinematics.hpp）沿每段 move_line 直线笛卡尔路径逐点 IK，积分"真实时间"作代价——
+//   Cost = Σ Δt_k'，Δt_k' = max(基准笛卡尔时间, maxᵢ|Δq_{k,i}|/v_max,i)（见 evalTransit）。
 // 联合优化：放置顺序（DAG 内重排）× 同形状抓取分配 × 腕部 A/B 180° 翻转，统一最小化。
-// 翻转并入该代价：A(不翻)/B(翻180°) 两套各算关节代价取小，J6 软限位作排除约束。
+// 翻转并入该代价：A(不翻)/B(翻180°) 两套各算路径时间取小，J6 软限位作排除约束。
 // 起点关节 q 取自 /xarm/joint_states；启动用 fk/ik 对照 base→link_tcp TF 自检，失败则
 // 回退到旧的 XY 直线代价（安全网）。
 //

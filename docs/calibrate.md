@@ -294,7 +294,7 @@ roslaunch tly measure_tcp_omega.launch robot_ip:=192.168.1.216 mvvelo:=200
 # 0) 相机内参自检（可选）
 roslaunch tly verify_camera.launch mode:=report,points known_distance_m:=0.30
 
-# 1) 手眼标定（自动采样，推荐）
+# 1) 手眼标定（自动采样，不推荐）
 roslaunch tly xarm_calibration_setup_moveit.launch robot_ip:=192.168.1.216
 #    或手动 freehand：
 roslaunch tly xarm_calibration_setup.launch robot_ip:=192.168.1.216
