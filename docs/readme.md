@@ -30,20 +30,17 @@
 
 ### 1. 准备环境（Docker）
 
-- **Linux**：用本仓库的 [Dockerfile](Dockerfile) 构建环境镜像，再绑定挂载工作区：
+- **Linux**：用本仓库的 [docker-compose.yml](../docker/docker-compose.yml) 构建环境镜像：
   ```bash
-  docker build -f docs/Dockerfile -t xarm_tly:latest .
-  docker run -it --gpus all --net=host --privileged \
-      --device=/dev/bus/usb \
-      -v /tmp/.X11-unix:/tmp/.X11-unix -e DISPLAY=$DISPLAY \
-      -v $PWD:/root/catkin_ws xarm_tly:latest
+  cd docker
+  docker-compose up -d --build
   ```
 - **Windows / WSL2（不推荐）**：见 [docker_setup.md](docker_setup.md)（导入 `.tar` 镜像 + devcontainer）
   与 [wsl_usb.md](wsl_usb.md)（用 usbipd-win 挂载 USB，网络设 **nat** 不要 mirror）。
 - 第三方源码包 `xarm_ros` / `realsense-ros` / `easy_handeye` 已被 `.gitignore` 排除，
   **必须存在于挂载进来的 `src/` 里**（镜像不含它们）。
 ```bash
-cd catkin_ws
+cd catkin_ws/src
 git clone -b ros1-legacy https://github.com/realsenseai/realsense-ros.git 
 git clone https://github.com/xArm-Developer/xarm_ros.git
 git clone https://github.com/IFL-CAMP/easy_handeye.git
