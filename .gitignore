@@ -5,7 +5,8 @@ src/xarm_ros/
 .vscode/
 src/realsense-ros/
 images/
-src/easy_handeye
+src/easy_handeye/
+src/vision_opencv/
 OpenCV_Source/
 *.onnx
 *.pyc
