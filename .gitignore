@@ -9,5 +9,5 @@ src/easy_handeye
 OpenCV_Source/
 *.onnx
 *.pyc
-/root/catkin_ws/src/tly/config/tetris_config.yaml.bak_before_homography
-/root/catkin_ws/src/tly/config/tetris_config.yaml.bak_before_pick_affine
+/root/catkin_ws/src/lucky/config/tetris_config.yaml.bak_before_homography
+/root/catkin_ws/src/lucky/config/tetris_config.yaml.bak_before_pick_affine

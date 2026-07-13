@@ -1,0 +1,84 @@
+<launch>
+    <!-- =========================================================
+         测试路径节点 path_planner_node：感知→策略→路径整条链，
+         机械臂仅提供 TF（不运动，无控制节点）。
+         观察输出： rostopic echo /motion_cmds
+                   以及 [PATH][TASK] 日志中的 z_plane / z_depth 对照。
+         path 需要真实 TF(camera->table->base) + camera_info + 对齐深度，
+         故必须连上机械臂(robot_ip)，但全程不发任何运动指令。
+         ========================================================= -->
+    <arg name="robot_ip" default="192.168.1.216" />
+    <arg name="expected_blocks" default="35" />
+    <arg name="vision_node" default="vision_processor_node_dexined" />
+
+    <param name="robot_description" command="$(find xacro)/xacro --inorder '$(find xarm_description)/urdf/xarm_device.urdf.xacro' robot_type:=xarm dof:=6 add_gripper:=false" />
+
+    <!-- 1. xArm 原生驱动（提供 joint_states + 原生服务；本测试不下发运动） -->
+    <include file="$(find xarm_bringup)/launch/xarm6_server.launch">
+        <arg name="robot_ip" value="$(arg robot_ip)" />
+        <arg name="use_moveit" value="false" />
+        <arg name="ns" value="xarm" />
+        <arg name="velocity_control" value="false" />
+        <arg name="enforce_limits" value="true" />
+        <arg name="add_gripper" value="false" />
+    </include>
+    <node pkg="robot_state_publisher" type="robot_state_publisher" name="robot_state_publisher" output="screen">
+        <remap from="joint_states" to="/xarm/joint_states" />
+    </node>
+
+    <!-- 2. 手眼 TF：camera_color_optical_frame -> 机器人 TF 树 -->
+    <include file="$(find easy_handeye)/launch/publish.launch">
+        <arg name="eye_on_hand" value="true" />
+        <arg name="namespace_prefix" value="xarm6_realsense_calibration" />
+    </include>
+
+    <!-- 3. 标定/配置 + table_frame -->
+    <rosparam file="$(find lucky)/config/tetris_config.yaml" command="load" />
+
+    <!-- 4. 相机 + image_proc + 视觉节点（复用 test_vision.launch） -->
+    <include file="$(find lucky)/launch/test_vision.launch">
+        <arg name="vision_node" value="$(arg vision_node)" />
+    </include>
+
+    <!-- 5. 策略节点（生成 /tetris_plan） -->
+    <node pkg="lucky" type="strategy_node" name="strategy_node" output="screen"
+          launch-prefix="bash -c 'sleep 5; exec $0 $@'">
+        <param name="expected_total_blocks" value="$(arg expected_blocks)" />
+        <param name="inventory_stable_required_frames" value="5" />
+        <param name="min_usable_total_blocks" value="35" />
+        <param name="min_usable_stable_required_frames" value="3" />
+    </node>
+
+    <!-- 6. 路径节点（被测对象，发布 /motion_cmds） -->
+    <node pkg="lucky" type="path_planner_node" name="path_planner_node" output="screen"
+          launch-prefix="bash -c 'sleep 4; exec $0 $@'">
+        <param name="base_frame" value="link_base" />
+        <param name="camera_frame" value="camera_color_optical_frame" />
+        <param name="camera_info_topic" value="/camera/color/camera_info" />
+
+        <param name="use_true_pick_plane" value="true" />
+        <param name="use_pick_homography" value="true" />
+        <param name="use_board_map" value="true" />
+        <param name="use_cell_max_place_z" value="true" />
+        <param name="require_board_map" value="true" />
+        <param name="require_place_z_map" value="true" />
+        <param name="pick_yaw_offset_deg" value="90.0" />
+        <param name="yaw_homography_probe_px" value="30.0" />
+        <param name="yaw_homography_v_sign" value="-1.0" />
+
+        <param name="place_release_z_margin" value="0.006" />
+        <param name="tcp_pick_offset_z" value="0.004" />
+        <param name="tcp_pick_offset_x" value="0.0" />
+        <param name="tcp_pick_offset_y" value="0.0" />
+        <param name="tcp_place_offset_x" value="0.0" />
+        <param name="tcp_place_offset_y" value="-0.001" />
+        <param name="tcp_place_offset_z" value="0.004" />
+
+        <param name="use_depth_pick_z" value="true" />
+        <param name="pick_xy_source" value="homography" />
+        <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw" />
+        <param name="depth_sample_radius_px" value="4" />
+        <param name="depth_sample_in_raw_color" value="true" />
+        <param name="max_tasks_per_plan" value="0" />
+    </node>
+</launch>

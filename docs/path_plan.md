@@ -1,12 +1,12 @@
 # 路径规划节点说明（path_planner_node）
 
-本文档介绍 `src/tly/src/path_planner_node.cpp` 的职责与策略，以及配套测试 launch
-`src/tly/launch/test_path.launch`。
+本文档介绍 `src/lucky/src/path_planner_node.cpp` 的职责与策略，以及配套测试 launch
+`src/lucky/launch/test_path.launch`。
 
 `path_planner_node` 是流水线的**大脑**：它消费策略节点的 `/tetris_plan`（或同分候选集
 `/tetris_plan_candidates`），把每个任务的「抓取像素 / 放置格子」**全部解算成 base 系可直接
 执行的位姿**（含沿 board 法向的悬停），决定腕部 180° 翻转，并对整条抓放序列做**关节空间路程
-（真实运动时间）优化**，最后输出 `tly::MotionPlan` 到 `/motion_cmds` 给控制节点。控制节点已是
+（真实运动时间）优化**，最后输出 `lucky::MotionPlan` 到 `/motion_cmds` 给控制节点。控制节点已是
 **纯执行器**——所有坐标换算、标定加载、腕部决策都集中在本节点（见 `docs/control.md`）。
 
 ```
@@ -27,7 +27,7 @@ strategy(/tetris_plan[_candidates]) ┼─► path_planner_node ─► /motion_c
 | 订阅 | `/xarm/joint_states` | `sensor_msgs/JointState` | 起点关节角 q（关节代价 + IK 自检）|
 | 订阅 | `/xarm/xarm_states` | `xarm_msgs/RobotMsg` | 固件上报位姿，取初始工具朝向（`tool_tilt_from_firmware`）|
 | 订阅 | `/camera/aligned_depth_to_color/image_raw` | `sensor_msgs/Image` | 抓取 Z 用的对齐深度（`use_depth_pick_z`）|
-| 发布 | `/motion_cmds` | `tly/MotionPlan`（latched）| 解算好的抓放序列，控制节点消费 |
+| 发布 | `/motion_cmds` | `lucky/MotionPlan`（latched）| 解算好的抓放序列，控制节点消费 |
 | 发布 | `/tetris_plan_opt` | `std_msgs/Int32MultiArray`（latched）| 重排+抓取分配后的 17-int 计划，**仅调试对照** |
 | TF | `base ← camera`、`base ← eef` | — | 像素反投影、初始工具朝向、IK 自检 |
 
@@ -51,7 +51,7 @@ strategy(/tetris_plan[_candidates]) ┼─► path_planner_node ─► /motion_c
 [9..16]          （stride≥17）4 个目标格 (row,col)，放置 Z 逐格取最高
 ```
 
-### 输出 `tly/MotionPlan`
+### 输出 `lucky/MotionPlan`
 
 `Header header` + `MotionTask[] tasks`，顺序即执行顺序。每个 `MotionTask` 含 `shape` /
 `way`（仅记录）+ 四个 base 位姿：`pick_pose` / `pick_hover_pose` / `place_pose` /
@@ -102,7 +102,7 @@ strategy(/tetris_plan[_candidates]) ┼─► path_planner_node ─► /motion_c
 **关节代价 = 沿 `move_line` 直线路径积分的真实运动时间**（取代旧的 XY 直线距离）：
 
 - 每段基准笛卡尔时间 = `max(Δd / v_lin, Δθ / ω)`（位置线速度与姿态角速度取瓶颈），再对关节饱和
-  取 `max(Δt_nominal, maxᵢ|Δq| / v_max,i)`；用 xArm6 闭式 FK + seeded DLS IK（`tly/xarm6_kinematics.hpp`）
+  取 `max(Δt_nominal, maxᵢ|Δq| / v_max,i)`；用 xArm6 闭式 FK + seeded DLS IK（`lucky/xarm6_kinematics.hpp`）
   把 TCP 位姿转成 6 关节角。
 - ω 随线速度自适应：`ω = omega_per_v_lin_rad_per_m × v_lin`（实测比值≈π，与档位无关，用
   `measure_tcp_omega.launch` 复测更新，见 `docs/calibrate.md`）。后果：一个 180° 翻转 ≈ 1m 平移的
@@ -153,7 +153,7 @@ strategy(/tetris_plan[_candidates]) ┼─► path_planner_node ─► /motion_c
 | 优化 | `optimize_order` / `allow_reorder` | true / true | 顺序优化 / 允许重排 |
 | 优化 | `use_plan_candidates` / `parallel_candidate_eval` | false / true | 多候选择优 / 并行评估 |
 | 代价 | `transit_lin_speed_m_s` / `loaded_lin_speed_m_s` | 0.06 / 0.045 | 空载/负载 TCP 线速度（须与控制器一致）|
-| 代价 | `omega_per_v_lin_rad_per_m` | 3.14（tly 用 3.23）| ω/v_lin 比值，`measure_tcp_omega` 标定 |
+| 代价 | `omega_per_v_lin_rad_per_m` | 3.14（lucky 用 3.23）| ω/v_lin 比值，`measure_tcp_omega` 标定 |
 | 代价 | `joint_max_vel_rad_s` / `wrist_soft_limit_rad` / `wrist_hard_limit_rad` | 3.14×6 / 4.7 / 6.10 | 关节限速 / J6 软·硬限位 |
 | 代价 | `wrist_soft_penalty_s_per_rad` / `tie_break_weight_s_per_rad` / `transit_j6_samples` / `ik_selfcheck_tol_rad` | 见源码 | 越限罚 / 平局项 / J6 采样 / 自检阈值 |
 | 安全 | `max_tasks_per_plan` | 0（不限）| 发布任务数上限（控制器另有 1 的执行闸）|
@@ -170,13 +170,13 @@ strategy(/tetris_plan[_candidates]) ┼─► path_planner_node ─► /motion_c
 
 ## 6. 运行与测试
 
-- **生产**：`tly.launch` 端到端起感知/策略/路径/控制；那里 `use_plan_candidates=true`、
+- **生产**：`lucky.launch` 端到端起感知/策略/路径/控制；那里 `use_plan_candidates=true`、
   `optimize_order=true`，`omega_per_v_lin_rad_per_m=3.23`。
 - **仅链路自测**：`test_path.launch` 起 **感知→策略→路径**（需臂提供 TF，但**绝不命令运动**），
   只发 `/motion_cmds` 供观察：
 
   ```bash
-  roslaunch tly test_path.launch robot_ip:=192.168.1.216
+  roslaunch lucky test_path.launch robot_ip:=192.168.1.216
   rostopic echo /motion_cmds
   ```
 

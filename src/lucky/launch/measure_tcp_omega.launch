@@ -1,0 +1,48 @@
+<launch>
+    <!-- =========================================================
+         测量 move_line 的 TCP 姿态角速度，输出 path_planner 代价用的比值 ω/v_lin
+         （→ lucky.launch 的 omega_per_v_lin_rad_per_m）。只起 xArm 原生驱动 + measure_tcp_omega.py，
+         原地纯转姿态、多角度计时，斜率法消加减速斜坡后求 ω，再换算 ω/v_lin=ω·1000/mvvelo。
+
+         用法（比值与 mvvelo 无关，任一档位测得的比值都可直接用）：
+           roslaunch lucky measure_tcp_omega.launch robot_ip:=192.168.1.216 mvvelo:=200
+           （实测 ω=0.645@200mm/s → 比值≈3.23≈π。换个 mvvelo 复测比值应稳定即确认。）
+
+         重测时机：改了 TCP 或关节的加速度/加加速度(jerk)后，斜坡/角速度上限可能变，重测本项。
+
+         ⚠️ 真机脚本，会驱动机械臂原地旋转腕部：
+            - 运行前在 UF Studio 把 J6/J4/J1 摇到中段，避免大角度旋转把腕部推过 ±180°/限位；
+            - 确认工作区无人、急停可达；
+            - 起始姿态取当前上报位姿，默认只改 yaw、角度 [20,60,100,140]°，可用 args 调整。
+         ========================================================= -->
+    <arg name="robot_ip" default="192.168.1.216" />
+    <arg name="mvvelo" default="500.0" />          <!-- mm/s，测生产实际档位 -->
+    <arg name="mvacc" default="2000.0" />
+    <arg name="axis" default="yaw" />             <!-- roll / pitch / yaw -->
+    <arg name="angles_deg" default="[20.0, 60.0, 100.0, 140.0]" />
+    <arg name="repeats" default="3" />
+
+    <param name="robot_description" command="$(find xacro)/xacro --inorder '$(find xarm_description)/urdf/xarm_device.urdf.xacro' robot_type:=xarm dof:=6 add_gripper:=false" />
+
+    <!-- xArm 原生驱动：/xarm/set_mode, set_state, move_line, xarm_states -->
+    <include file="$(find xarm_bringup)/launch/xarm6_server.launch">
+        <arg name="robot_ip" value="$(arg robot_ip)" />
+        <arg name="use_moveit" value="false" />
+        <arg name="ns" value="xarm" />
+        <arg name="velocity_control" value="false" />
+        <arg name="enforce_limits" value="true" />
+        <arg name="add_gripper" value="false" />
+    </include>
+
+    <!-- move_line 立刻返回，靠状态轮询计时（脚本内也会 set_param 确保）。 -->
+    <param name="/xarm/wait_for_finish" value="false" />
+
+    <node pkg="lucky" type="measure_tcp_omega.py" name="measure_tcp_omega" output="screen"
+          launch-prefix="bash -c 'sleep 3; exec $0 $@'">
+        <param name="mvvelo" value="$(arg mvvelo)" />
+        <param name="mvacc" value="$(arg mvacc)" />
+        <param name="axis" value="$(arg axis)" />
+        <rosparam param="angles_deg" subst_value="true">$(arg angles_deg)</rosparam>
+        <param name="repeats" value="$(arg repeats)" />
+    </node>
+</launch>

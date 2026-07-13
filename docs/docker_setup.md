@@ -17,7 +17,7 @@ cd C:\Users\你的用户名\Desktop
 
 ```powerShell
 # 语法：docker load -i <文件名.tar>
-docker load -i xarm_tly.tar
+docker load -i xarm_lucky.tar
 ```
 导入完成后，你可以运行 
 ```powershell
@@ -33,7 +33,7 @@ vscode安装相关插件：WSL, Dev Containers, Docker
 ```text
 {
     "name": "xArm-Full-Workspace",
-    "image": "xarm_tly:04042144",
+    "image": "xarm_lucky:latest",
     "workspaceFolder": "/root/catkin_ws",
     "workspaceMount": "source=${localWorkspaceFolder},target=/root/catkin_ws,type=bind",
     "runArgs": [

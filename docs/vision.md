@@ -1,13 +1,13 @@
 # 视觉模块说明
 
-本文档介绍 `tly` 的视觉感知子系统：它在背光板上识别黑色/彩色的多联骨牌
+本文档介绍 `lucky` 的视觉感知子系统：它在背光板上识别黑色/彩色的多联骨牌
 （俄罗斯方块），分类形状、估计朝向、确定抓取点，并把库存与逐块信息发布给
 策略节点。
 
 参考文件：
-- 启动：[test_vision.launch](../src/tly/launch/test_vision.launch)
-- 经典实现：[vision_processor_node.cpp](../src/tly/src/vision_processor_node.cpp)
-- DexiNed 实现：[vision_processor_node_dexined.cpp](../src/tly/src/vision_processor_node_dexined.cpp)
+- 启动：[test_vision.launch](../src/lucky/launch/test_vision.launch)
+- 经典实现：[vision_processor_node.cpp](../src/lucky/src/vision_processor_node.cpp)
+- DexiNed 实现：[vision_processor_node_dexined.cpp](../src/lucky/src/vision_processor_node_dexined.cpp)
 
 ---
 
@@ -24,7 +24,7 @@
 在 launch 里用 `vision_node:=...` 切换：
 
 ```bash
-roslaunch tly test_vision.launch vision_node:=vision_processor_node_dexined
+roslaunch lucky test_vision.launch vision_node:=vision_processor_node_dexined
 ```
 
 > 两个实现各配一套相机曝光/色彩档：DexiNed 用 `camera_config.yaml`、经典用
@@ -161,10 +161,10 @@ roslaunch tly test_vision.launch vision_node:=vision_processor_node_dexined
 策略 / 控制，便于单独调参。
 
 ```bash
-roslaunch tly test_vision.launch                       # 默认 DexiNed
-roslaunch tly test_vision.launch vision_node:=vision_processor_node_cpp
+roslaunch lucky test_vision.launch                       # 默认 DexiNed
+roslaunch lucky test_vision.launch vision_node:=vision_processor_node_cpp
 # 命令行可覆盖调参，对照 debug 图边看边调：
-roslaunch tly test_vision.launch color_edge_thresh:=16 min_template_iou:=0.6
+roslaunch lucky test_vision.launch color_edge_thresh:=16 min_template_iou:=0.6
 ```
 
 launch 要点：
@@ -186,7 +186,7 @@ launch 要点：
 ## 5. 相机参数：实时调整 / 保存 / 加载
 
 视觉检测对**曝光与白平衡**很敏感：开自动曝光时背光板亮度会浮动，检测会抖。所以本
-项目把相机参数固定下来存进 [config/camera_config.yaml](../src/tly/config/camera_config.yaml)，
+项目把相机参数固定下来存进 [config/camera_config.yaml](../src/lucky/config/camera_config.yaml)，
 `test_vision.launch` 启动时自动加载。相机参数的 dynamic_reconfigure 命名空间是
 **`/camera/rgb_camera`**（深度/红外在 `stereo_module` 等其它分支，别选错）。
 
@@ -197,15 +197,15 @@ launch 要点：
 
 | 档案 | 配套节点 | 风格取向（关键差异） |
 |------|----------|----------------------|
-| [config/camera_config.yaml](../src/tly/config/camera_config.yaml) | `vision_processor_node_dexined`（**默认**） | **保留色彩**：saturation 64、gamma 300、contrast 50、hue 0；供 DexiNed 边缘 + Lab 颜色边界切割用 |
-| [config/camer_config_1.yaml](../src/tly/config/camer_config_1.yaml) | `vision_processor_node_cpp` | **高对比去饱和**：contrast 100、saturation 0、sharpness 100、brightness −64、hue 180；突出明暗轮廓，适配经典灰度阈值 |
+| [config/camera_config.yaml](../src/lucky/config/camera_config.yaml) | `vision_processor_node_dexined`（**默认**） | **保留色彩**：saturation 64、gamma 300、contrast 50、hue 0；供 DexiNed 边缘 + Lab 颜色边界切割用 |
+| [config/camer_config_1.yaml](../src/lucky/config/camer_config_1.yaml) | `vision_processor_node_cpp` | **高对比去饱和**：contrast 100、saturation 0、sharpness 100、brightness −64、hue 180；突出明暗轮廓，适配经典灰度阈值 |
 
 > 文件名 `camer_config_1.yaml` 确实少了个 `a`，是磁盘上的真实名字，别当笔误改掉。
 
 两档的共同点：都**关自动曝光/自动白平衡**（`exposure=180`、`white_balance=6000`、
 `power_line_frequency=3`），保证亮度/色温稳定。
 
-> ⚠️ **切换视觉实现时，相机档也要一并换。** `test_vision.launch` / `tly.launch` 里
+> ⚠️ **切换视觉实现时，相机档也要一并换。** `test_vision.launch` / `lucky.launch` 里
 > `load_rgb_cfg` 那行**硬编码加载 `camera_config.yaml`**（DexiNed 档）。改用经典节点
 > （`vision_node:=vision_processor_node_cpp`）时，需把该行的文件名换成
 > `camer_config_1.yaml`，或启动后手动 `dynparam load`（见 §5.3）——否则相机档与视觉
@@ -235,7 +235,7 @@ rosrun rqt_reconfigure rqt_reconfigure
 
 ```bash
 rosrun dynamic_reconfigure dynparam dump /camera/rgb_camera \
-  $(rospack find tly)/config/camera_config.yaml
+  $(rospack find lucky)/config/camera_config.yaml
 ```
 
 > 统一用 `dynparam dump` 保存，别用 rqt_reconfigure 自带的 “Save” 按钮——两者格式
@@ -248,14 +248,14 @@ rosrun dynamic_reconfigure dynparam dump /camera/rgb_camera \
 
 ```bash
 rosrun dynamic_reconfigure dynparam load /camera/rgb_camera \
-  $(rospack find tly)/config/camera_config.yaml
+  $(rospack find lucky)/config/camera_config.yaml
 ```
 
-而 `test_vision.launch` / `tly.launch` 里**已自动加载**——相机起来 6 秒后执行：
+而 `test_vision.launch` / `lucky.launch` 里**已自动加载**——相机起来 6 秒后执行：
 
 ```xml
 <node pkg="dynamic_reconfigure" type="dynparam" name="load_rgb_cfg"
-      args="load /camera/rgb_camera $(find tly)/config/camera_config.yaml"
+      args="load /camera/rgb_camera $(find lucky)/config/camera_config.yaml"
       launch-prefix="bash -c 'sleep 6; exec $0 $@'" />
 ```
 
@@ -268,7 +268,7 @@ rosrun dynamic_reconfigure dynparam load /camera/rgb_camera \
 
 - 只有 `vision_processor_node_cpp`（由 `vision_processor_node.cpp` 编译）与
   `vision_processor_node_dexined` 在 `CMakeLists.txt` 里被构建。生产
-  （`tly.launch`）默认用 DexiNed 版。
+  （`lucky.launch`）默认用 DexiNed 版。
 - `scripts/vision_processor_node.py` 是同契约的 Python 重实现，仅供
   `affine.launch` 标定使用，不进生产。
 - `board_state` 的 140 格棋盘占用由视觉端置 0 占位；“某格是否已摆块”的真正判定在

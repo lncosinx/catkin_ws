@@ -122,7 +122,7 @@ OpenCV 鼠标回调返回的是**显示坐标**而非图像坐标。
 
 ### 4.2 RealSense 逐块深度已关（±8mm 太不准）
 `path_planner` 的 `use_depth_pick_z` **已于 2026-06-28 关闭**：RealSense 逐块深度实测有时差到 ~8mm，
-比单一常量还糟；关掉后 path 节点连深度话题都不订阅。视觉节点 `tly.launch` 里的 `use_depth_pick_z=true`
+比单一常量还糟；关掉后 path 节点连深度话题都不订阅。视觉节点 `lucky.launch` 里的 `use_depth_pick_z=true`
 是 **debug-only**（只发 `/vision/pick_depth_debug`，从不写 `board_state`）。**别再建议靠深度修逐块高度。**
 
 ---
@@ -159,7 +159,7 @@ OpenCV 鼠标回调返回的是**显示坐标**而非图像坐标。
   `src/vision_processor_node_cuda.cpp`、`src/xarm_controller_node_pliz.cpp` **不在构建里**（参考用旧变体）。
   改它们对运行无影响——**认定某个 `.cpp` 是活的之前，先查 `CMakeLists.txt`**。
 - **`scripts/vision_processor_node.py`** 是同契约的 Python 重实现，仅供 `affine.launch` 标定使用，
-  不进生产（`tly.launch` 用 C++ 节点）。
+  不进生产（`lucky.launch` 用 C++ 节点）。
 - **两套相机曝光/色彩档要配对**：DexiNed 用 `config/camera_config.yaml`、经典 `_cpp` 用
   `config/camer_config_1.yaml`；launch 硬编码加载前者，切换视觉实现时相机档要一并换。详见
   [vision.md](vision.md) §5.0。

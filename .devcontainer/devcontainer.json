@@ -1,6 +1,6 @@
 {
     "name": "xArm-Full-Workspace",
-    "image": "xarm_tly:06181512",
+    "image": "xarm_lucky:latest",
     "workspaceFolder": "/root/catkin_ws",
     "workspaceMount": "source=${localWorkspaceFolder},target=/root/catkin_ws,type=bind",
     "runArgs": [
