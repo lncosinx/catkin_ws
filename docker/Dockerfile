@@ -13,12 +13,12 @@
 #   librealsense2 (intel apt 源) / moveit 全家桶 / easy_handeye 依赖 (aruco + visp)
 #
 # 构建：
-#   docker build -f docs/Dockerfile -t xarm_tly:latest .
+#   docker build -f docs/Dockerfile -t xarm_lucky:latest .
 # 运行（Linux，接真机 + GPU + 相机 + X11）：
 #   docker run -it --gpus all --net=host --privileged \
 #       --device=/dev/bus/usb \
 #       -v /tmp/.X11-unix:/tmp/.X11-unix -e DISPLAY=$DISPLAY \
-#       -v $PWD:/root/catkin_ws xarm_tly:latest
+#       -v $PWD:/root/catkin_ws xarm_lucky:latest
 #   进容器后：catkin_make && source devel/setup.bash
 #
 # 重要：第三方源码包 xarm_ros / realsense-ros / easy_handeye 已被 .gitignore 排除，
@@ -71,7 +71,7 @@ RUN mkdir -p /etc/apt/keyrings \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         # --- ROS 桌面版（roscpp/rospy/rviz/tf/rqt/image_transport 等） ---
         ros-noetic-desktop \
-        # --- MoveIt 全家桶 + 运动规划（tly 编译期依赖 moveit_ros_planning_interface/core） ---
+        # --- MoveIt 全家桶 + 运动规划（lucky 编译期依赖 moveit_ros_planning_interface/core） ---
         ros-noetic-moveit \
         ros-noetic-moveit-visual-tools \
         ros-noetic-rviz-visual-tools \

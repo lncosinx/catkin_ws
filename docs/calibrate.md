@@ -1,9 +1,9 @@
 # 标定指南
 
-本文档介绍 `tly` 工作区的全部标定流程：**手眼标定**（相机↔机械臂）、**白板标定**
+本文档介绍 `lucky` 工作区的全部标定流程：**手眼标定**（相机↔机械臂）、**白板标定**
 （放置网格几何 + 放置高度 + 抓取单应性）、以及若干**验证/对齐辅助工具**。
 
-所有标定结果最终都写入 `src/tly/config/tetris_config.yaml`（手眼结果除外，它由
+所有标定结果最终都写入 `src/lucky/config/tetris_config.yaml`（手眼结果除外，它由
 `easy_handeye` 存到自己的目录，由 `publish.launch` 在运行时广播）。这些文件当作数据，
 不要手改。
 
@@ -36,7 +36,7 @@
 内参/深度尺度可信。不写任何配置。
 
 ```bash
-roslaunch tly verify_camera.launch mode:=report
+roslaunch lucky verify_camera.launch mode:=report
 ```
 
 参数：
@@ -61,7 +61,7 @@ roslaunch tly verify_camera.launch mode:=report
   `args="0.00075 0.0004 0.068 0 0 0 link6 link_tcp"` 挂在 `link6` 下（单位米；此偏移经
   `pixel_touch_check` 侧向误差诊断精修，各标定/诊断栈保持一致）。
 - `namespace_prefix=xarm6_realsense_calibration`，结果存为
-  `xarm6_realsense_calibration_eye_on_hand`，供 `tly.launch`/各标定栈里的
+  `xarm6_realsense_calibration_eye_on_hand`，供 `lucky.launch`/各标定栈里的
   `easy_handeye/publish.launch` 运行时广播。
 - 标定阶段用 MoveIt 没问题；**生产抓放才必须走原生 `move_line`**（避免规划出曲线把吸住
   的方块转向）。MoveIt 规划器用 **OMPL**，不用 Pilz（Pilz 偶发关节加速度突增）。
@@ -74,7 +74,7 @@ roslaunch tly verify_camera.launch mode:=report
 easy_handeye 通过 MoveIt `move_group`（SRDF 组名 `xarm6`）自动遍历多姿态采样。
 
 ```bash
-roslaunch tly xarm_calibration_setup_moveit.launch robot_ip:=192.168.1.216
+roslaunch lucky xarm_calibration_setup_moveit.launch robot_ip:=192.168.1.216
 ```
 
 常用参数：
@@ -93,7 +93,7 @@ roslaunch tly xarm_calibration_setup_moveit.launch robot_ip:=192.168.1.216
 手动 “Take sample”。适合不想起 MoveIt、或想完全手控的场合。
 
 ```bash
-roslaunch tly xarm_calibration_setup.launch robot_ip:=192.168.1.216
+roslaunch lucky xarm_calibration_setup.launch robot_ip:=192.168.1.216
 ```
 
 它内部 `include` 了 `calibrate_xarm.launch`（默认 `freehand_robot_movement:=true`）。
@@ -123,7 +123,7 @@ roslaunch tly xarm_calibration_setup.launch robot_ip:=192.168.1.216
 是必需的——步骤 2 深度拟板面要把法向从相机系换到 base 系。
 
 ```bash
-roslaunch tly calibrate_tool.launch robot_ip:=192.168.1.216
+roslaunch lucky calibrate_tool.launch robot_ip:=192.168.1.216
 ```
 
 ### 七个步骤（`STEP_TITLES`）
@@ -151,7 +151,7 @@ roslaunch tly calibrate_tool.launch robot_ip:=192.168.1.216
 
 ```bash
 # 例：只重跑步骤 4、5
-roslaunch tly calibrate_tool.launch robot_ip:=192.168.1.216 steps:=4,5
+roslaunch lucky calibrate_tool.launch robot_ip:=192.168.1.216 steps:=4,5
 # 支持 '4' / '3,4,5' / '2-6' / 'all'
 ```
 
@@ -194,7 +194,7 @@ ROI / 平面拟合（相机被迫降低后调）：
 
   ```bash
   # 进入逐格微调模式（不跑 7 步标定）
-  roslaunch tly calibrate_tool.launch robot_ip:=192.168.1.216 edit_cells:=true
+  roslaunch lucky calibrate_tool.launch robot_ip:=192.168.1.216 edit_cells:=true
   ```
 
   > 注意：`edit_cells` 写的是相对现有网格/坐标系的逐格覆盖；一旦重跑步骤 3（重派生网格+
@@ -207,7 +207,7 @@ ROI / 平面拟合（相机被迫降低后调）：
 
   ```bash
   # 巡检全部格心（悬停不下扎）
-  roslaunch tly calibrate_tool.launch robot_ip:=192.168.1.216 verify_cells:=true
+  roslaunch lucky calibrate_tool.launch robot_ip:=192.168.1.216 verify_cells:=true
   ```
 
   参数：
@@ -240,7 +240,7 @@ ROI / 平面拟合（相机被迫降低后调）：
 （固件系，比单应性）→ 打印/保存两条误差 + URDF↔固件系统偏差。
 
 ```bash
-roslaunch tly pixel_touch_check.launch robot_ip:=192.168.1.216
+roslaunch lucky pixel_touch_check.launch robot_ip:=192.168.1.216
 ```
 
 参数：
@@ -261,7 +261,7 @@ roslaunch tly pixel_touch_check.launch robot_ip:=192.168.1.216
 `ω/v_lin`（`omega_per_v_lin_rad_per_m`，rad/m），即"多少 rad 转动 ≈ 1m 平移"的时间当量。
 一键起 **xArm 原生驱动 + `measure_tcp_omega.py`**，原地纯转姿态、多角度计时，用**斜率法**
 消掉加减速斜坡与固定延迟后求 ω。**只测量、打印建议值，不写任何配置**——把结果手填进
-`tly.launch` 的 `omega_per_v_lin_rad_per_m`（当前 3.23）。
+`lucky.launch` 的 `omega_per_v_lin_rad_per_m`（当前 3.23）。
 
 原理：`move_line` 默认立刻返回（`/xarm/wait_for_finish=false`），故靠固件上报的
 `/xarm/xarm_states` state 边沿（1 RUNNING→2 SLEEPING）+ `header.stamp` 计时，抗客户端排队
@@ -269,7 +269,7 @@ roslaunch tly pixel_touch_check.launch robot_ip:=192.168.1.216
 固件映射 ≈π）——换个 `mvvelo` 复测比值应稳定即确认。
 
 ```bash
-roslaunch tly measure_tcp_omega.launch robot_ip:=192.168.1.216 mvvelo:=200
+roslaunch lucky measure_tcp_omega.launch robot_ip:=192.168.1.216 mvvelo:=200
 # 实测 ω≈0.645@200mm/s → 比值≈3.23≈π
 ```
 
@@ -292,21 +292,21 @@ roslaunch tly measure_tcp_omega.launch robot_ip:=192.168.1.216 mvvelo:=200
 
 ```bash
 # 0) 相机内参自检（可选）
-roslaunch tly verify_camera.launch mode:=report,points known_distance_m:=0.30
+roslaunch lucky verify_camera.launch mode:=report,points known_distance_m:=0.30
 
 # 1) 手眼标定（自动采样，不推荐）
-roslaunch tly xarm_calibration_setup_moveit.launch robot_ip:=192.168.1.216
+roslaunch lucky xarm_calibration_setup_moveit.launch robot_ip:=192.168.1.216
 #    或手动 freehand：
-roslaunch tly xarm_calibration_setup.launch robot_ip:=192.168.1.216
+roslaunch lucky xarm_calibration_setup.launch robot_ip:=192.168.1.216
 
 # 2) 白板标定（全 7 步）
-roslaunch tly calibrate_tool.launch robot_ip:=192.168.1.216
+roslaunch lucky calibrate_tool.launch robot_ip:=192.168.1.216
 #    只重跑部分：
-roslaunch tly calibrate_tool.launch robot_ip:=192.168.1.216 steps:=4,5
+roslaunch lucky calibrate_tool.launch robot_ip:=192.168.1.216 steps:=4,5
 
 # 3) 抓偏来源诊断（感知 vs 单应性/视差/执行）
-roslaunch tly pixel_touch_check.launch robot_ip:=192.168.1.216
+roslaunch lucky pixel_touch_check.launch robot_ip:=192.168.1.216
 
 # 4) TCP 姿态角速度标定 → path_planner 的 omega_per_v_lin_rad_per_m
-roslaunch tly measure_tcp_omega.launch robot_ip:=192.168.1.216 mvvelo:=200
+roslaunch lucky measure_tcp_omega.launch robot_ip:=192.168.1.216 mvvelo:=200
 ```

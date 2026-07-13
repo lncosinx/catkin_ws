@@ -5,9 +5,9 @@
 输出**不直接给控制器**，而是给 `path_planner_node`：普通模式会保留**若干同分最优布局**作为候选集发到 `/tetris_plan_candidates`，由 `path_planner_node` 按机械臂运动代价择优、解算坐标与腕部翻转，再喂给纯执行器 `xarm_controller_node`（见 [docs/path_plan.md](path_plan.md)）。同时仍向 `/tetris_plan`（latched）发一份「首选」计划，向后兼容 `test_path` / `test_controller` 的单解流程。
 
 代码：
-- 节点逻辑：[src/tly/src/strategy_node.cpp](../src/tly/src/strategy_node.cpp)
-- 求解引擎（ROS-free，可单独单测）：[src/tly/include/tly/tetris_solver.hpp](../src/tly/include/tly/tetris_solver.hpp)
-- 仅策略测试 launch：[src/tly/launch/test_strategy.launch](../src/tly/launch/test_strategy.launch)
+- 节点逻辑：[src/lucky/src/strategy_node.cpp](../src/lucky/src/strategy_node.cpp)
+- 求解引擎（ROS-free，可单独单测）：[src/lucky/include/lucky/tetris_solver.hpp](../src/lucky/include/lucky/tetris_solver.hpp)
+- 仅策略测试 launch：[src/lucky/launch/test_strategy.launch](../src/lucky/launch/test_strategy.launch)
 
 ---
 
@@ -148,9 +148,9 @@
 `test_strategy.launch` 只起 `strategy_node`，**无任何硬件依赖**——纯算法验证。
 
 ```bash
-roslaunch tly test_strategy.launch
+roslaunch lucky test_strategy.launch
 # 进阶模式：
-roslaunch tly test_strategy.launch advanced_mode:=true seq_cyclic:=true
+roslaunch lucky test_strategy.launch advanced_mode:=true seq_cyclic:=true
 ```
 
 手动喂入 `/vision/board_state` 触发规划，观察输出（`/tetris_plan` 首选计划、`/tetris_plan_candidates` 同分候选集）：

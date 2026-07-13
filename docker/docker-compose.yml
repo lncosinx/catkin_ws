@@ -8,8 +8,8 @@ services:
       # 极为重要：在构建（编译）期使用主机网络，防止 apt/pip 下载由于 Docker 桥接网卡导致的网络超时或 DNS 失败
       network: host
     # 与你的 devcontainer.json 声明的镜像名称保持完美一致
-    image: xarm_tly:06181512
-    container_name: xarm_tly_container
+    image: xarm_lucky:latest
+    container_name: xarm_lucky
     # 容器运行期的主机网络模式
     network_mode: "host"
     ipc: "host"

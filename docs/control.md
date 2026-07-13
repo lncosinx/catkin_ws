@@ -1,14 +1,14 @@
 # 控制节点说明（xarm_controller_node · 纯执行器）
 
-本文档介绍 `src/tly/src/xarm_controller_node.cpp` 的控制策略，以及配套测试
-launch `src/tly/launch/test_controller.launch` 的用法。
+本文档介绍 `src/lucky/src/xarm_controller_node.cpp` 的控制策略，以及配套测试
+launch `src/lucky/launch/test_controller.launch` 的用法。
 
 控制节点是流水线的最后一环，且已重构为**纯执行器（Pure Executor）**：它消费
-`path_planner_node` 发布的 `/motion_cmds`（`tly::MotionPlan`），其中每个任务已经是
+`path_planner_node` 发布的 `/motion_cmds`（`lucky::MotionPlan`），其中每个任务已经是
 **base 系、可直接 `move_line` 的四个位姿**（抓取/放置各一对「下压 + 悬停」）。控制节点
 **不做任何坐标换算、不加载任何标定、不做腕部翻转决策**——像素→base 抓取（含深度 Z）、
 格子→base 放置、腕部 yaw 翻转择优、沿 board 法向的悬停解算，全部由 `path_planner_node`
-完成（见 `docs/path_plan.md` / `src/tly/src/path_planner_node.cpp`）。控制节点只通过
+完成（见 `docs/path_plan.md` / `src/lucky/src/path_planner_node.cpp`）。控制节点只通过
 xArm **原生服务**（不经 MoveIt）逐步执行抓取—搬运—放置。
 
 > 历史说明：早期版本的控制节点自己做坐标转换、单应性/视差、yaw 与 180° 翻转择优。这些
@@ -20,7 +20,7 @@ xArm **原生服务**（不经 MoveIt）逐步执行抓取—搬运—放置。
 
 | 方向 | 话题 / 服务 | 类型 | 说明 |
 | --- | --- | --- | --- |
-| 订阅 | `/motion_cmds` | `tly/MotionPlan` | path_planner 解算后的抓放序列，消费一次 |
+| 订阅 | `/motion_cmds` | `lucky/MotionPlan` | path_planner 解算后的抓放序列，消费一次 |
 | 订阅 | `/xarm/xarm_states` | `xarm_msgs/RobotMsg` | 读当前 6D native 位姿：RPY 就近解绕 + 到位校验 |
 | 订阅 | `/xarm_controller/continue` | `std_msgs/Empty` | Debug 单步模式的「继续」信号（`debug_continue_topic`）|
 | 发布 | `/robot_status` | `std_msgs/Bool`（latched）| 忙 / 闲标志 |
@@ -32,7 +32,7 @@ xArm **原生服务**（不经 MoveIt）逐步执行抓取—搬运—放置。
 `path_planner_node`。启动时会把 `/xarm/wait_for_finish` 设为 `xarm_wait_for_finish`
 （默认 true，即 `move_line` 阻塞到运动完成）。
 
-`/motion_cmds`（`tly/MotionPlan`）数据布局：`Header header` + `MotionTask[] tasks`，
+`/motion_cmds`（`lucky/MotionPlan`）数据布局：`Header header` + `MotionTask[] tasks`，
 **顺序即执行顺序**。每个 `MotionTask`：
 
 ```
@@ -152,7 +152,7 @@ vision/strategy：
    `max_tasks_per_plan=1` 仅执行一个任务
 
 ```bash
-roslaunch tly test_controller.launch robot_ip:=192.168.1.216
+roslaunch lucky test_controller.launch robot_ip:=192.168.1.216
 ```
 
 然后手动喂一个方案（`/tetris_plan`，格式见 `strategy_node` 输出：count + 每任务 17 个 int），

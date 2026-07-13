@@ -23,7 +23,7 @@ ROS 1 (Noetic) catkin 工作区，用于一台 xArm6 机械臂：用 RealSense �
 是否摆了方块"必须以**逐格白板凸起顶面**（`BOARD_BUMP_HEIGHT_MAP_14x10`，步骤3采）
 为基准，不能用发光板平面 `BOARD_SURFACE_Z`。
 
-所有活跃开发都在 `src/tly`。`src/` 下其余内容（`xarm_ros`、`realsense-ros`、
+所有活跃开发都在 `src/lucky`。`src/` 下其余内容（`xarm_ros`、`realsense-ros`、
 `vision_opencv`、`easy_handeye`）都是引入的第三方依赖——`.gitignore` 已把
 `src/xarm_ros`、`src/realsense-ros`、`src/easy_handeye`、`OpenCV_Source/`、
 `build/`、`devel/` 排除在本仓库历史之外。一般不需要改它们，当作已安装的包对待。
@@ -38,17 +38,17 @@ catkin_make            # 在 /root/catkin_ws 下执行 —— 唯一在用的构
 source devel/setup.bash
 ```
 
-`src/tly/CMakeLists.txt` 全局强制 `-std=c++14` 和 `-O3`——`-O3` 是专门为
-`strategy_node` 的 DLX 搜索（计算密集）加的，改构建配置时别去掉。`tly` 本身没有
+`src/lucky/CMakeLists.txt` 全局强制 `-std=c++14` 和 `-O3`——`-O3` 是专门为
+`strategy_node` 的 DLX 搜索（计算密集）加的，改构建配置时别去掉。`lucky` 本身没有
 lint/测试套件。
 
 对真机跑完整流水线：
 
 ```bash
-roslaunch tly tly.launch robot_ip:=192.168.1.228
+roslaunch lucky lucky.launch robot_ip:=192.168.1.228
 ```
 
-按节点划分的 `test_*.launch`（只起某个节点需要的东西，省得跑整个 `tly.launch`
+按节点划分的 `test_*.launch`（只起某个节点需要的东西，省得跑整个 `lucky.launch`
 流水线）。所有带视觉的都可用 `vision_node:=vision_processor_node_dexined` 切换
 视觉实现。
 - `test_vision.launch` —— **仅视觉**：相机 + `image_proc` + 视觉节点。无臂/TF/
@@ -62,13 +62,13 @@ roslaunch tly tly.launch robot_ip:=192.168.1.228
 - `test_pick.launch` —— 较旧的基于 MoveIt 的集成测试：视觉 + `xarm_controller_node`
   + `single_block_test.py`，一次抓放循环。
 
-`src/tly/launch/` 下其它 launch：
-- `tly.launch` —— 生产运行。仅用 xArm 原生驱动（明确*不用* MoveIt/Pilz）。端到端
+`src/lucky/launch/` 下其它 launch：
+- `lucky.launch` —— 生产运行。仅用 xArm 原生驱动（明确*不用* MoveIt/Pilz）。端到端
   起相机、手眼 TF、视觉、控制器、策略、`path_planner_node`。
 - `affine.launch` / `calibrate_tool.launch` / `calibrate_xarm.launch` /
   `xarm_calibration_setup.launch` —— 标定工具，见下文。
 
-## 节点流水线 (src/tly)
+## 节点流水线 (src/lucky)
 
 三个自定义节点通过固定的话题/服务契约通信：
 
@@ -88,7 +88,7 @@ roslaunch tly tly.launch robot_ip:=192.168.1.228
     `data.size() >= 147`（7+140）后再读其余部分。
   - `/vision/tracked_blocks_table`（`geometry_msgs/PoseArray`）以及 `/vision/debug_*`
     和 `/vision/preprocess/*` 下的调试图话题。
-  - 服务 `/vision/get_precise_pose`（`tly/GetPrecisePose`）：给定 `target_shape_type`，
+  - 服务 `/vision/get_precise_pose`（`lucky/GetPrecisePose`）：给定 `target_shape_type`，
     返回细化的 `dx`/`dy`/`angle`。注意：本仓库当前没有节点调用此服务——它仅供
     未来/手动使用。
 
@@ -156,7 +156,7 @@ J6 绕圈 DP `assignYaws` 因此被撤除）；(2) **一旦 J6 越过约 ±180°
 标定流程：
 - `xarm_calibration_setup.launch` + `calibrate_xarm.launch` —— 通过 `easy_handeye`
   做 ArUco 标记的 eye-on-hand 标定，产出 `xarm6_realsense_calibration_eye_on_hand`
-  数据，供 `tly.launch` 里的 `easy_handeye/publish.launch` 使用。
+  数据，供 `lucky.launch` 里的 `easy_handeye/publish.launch` 使用。
 - `calibrate_tool.launch` → `scripts/calibrate_board.py` —— 交互式白板标定
   （6 步；可用 `~steps` 只跑子集）。步骤 3 在 base 系采棋盘网格并**由网格派生
   `board_frame`**（不再手动选原点/X），使放置朝向自动跟随棋盘网格；产出
@@ -180,7 +180,7 @@ J6 绕圈 DP `assignYaws` 因此被撤除）；(2) **一旦 J6 越过约 ±180°
   是活的之前，先查 `CMakeLists.txt`。
 - `scripts/vision_processor_node.py` 是同一节点/话题/服务契约的 Python 重实现
   （与 `strategy_node.cpp` 保持形状 ID 兼容，见其模块 docstring），仅供
-  `affine.launch` 使用。生产（`tly.launch`）用 C++ 节点。
+  `affine.launch` 使用。生产（`lucky.launch`）用 C++ 节点。
 - **启动 MoveIt/realMove_exec 前，±360° 关节（J1/J4/J6）必须远离 ±360° 边界**
   （**重要踩坑**）：凡包含 `xarm6_moveit_config/realMove_exec.launch` 的 launch
   （如 `calibrate_tool.launch`、旧的 `test_pick.launch`），在打印
