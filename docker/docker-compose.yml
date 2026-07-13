@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  ros2_humble_xarm:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      # 极为重要：在构建（编译）期使用主机网络，防止 apt/pip 下载由于 Docker 桥接网卡导致的网络超时或 DNS 失败
+      network: host
+    # 与你的 devcontainer.json 声明的镜像名称保持完美一致
+    image: xarm_tly:06181512
+    container_name: xarm_tly_container
+    # 容器运行期的主机网络模式
+    network_mode: "host"
+    ipc: "host"
+    pid: "host"
+    privileged: true
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
