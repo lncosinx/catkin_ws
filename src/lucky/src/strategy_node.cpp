@@ -37,10 +37,24 @@ vector<int> last_inventory(7, -1);
 // 故不要求库存达到 34/35，只要稳定即可。
 bool advanced_mode = false;
 vector<int> shape_sequence;          // 形状 id 顺序，例如 [0,1,2,3,...]
-bool seq_cyclic = false;             // 是否按序列循环放置
-bool seq_require_support = true;     // true=竞赛规则③(下方支撑)；false=宽松实验
+bool seq_cyclic = false;             // 是否按序列循环放置(仅旧交错模式；分组模式忽略)
+bool seq_require_support = true;     // true=竞赛规则③(下方支撑)；false=宽松实验(仅旧交错模式)
 bool seq_reward_four_colors = false; // 满行且≥4色额外 +10(竞赛规则②)。默认 false：
                                      // 实际比赛可能没有此配色加分，关掉只追求满行。
+                                     // 分组模式(seq_group_by_shape)下恒强制关闭。
+// 分组模式：先放完第一个形状(其全部库存)，再到下一个；形状完成顺序=shape_sequence 去重
+// (按首次出现)。这是进阶任务的新默认策略。
+bool seq_group_by_shape = true;
+// 支撑判定口径(分组模式下)：
+//   false(默认)=逐步支撑——每块放置当场即需下方有支撑(规则③)，分组求解序本身就是先底后顶
+//     合法的执行序，故直接按分组顺序发布，机器人"先放完一种形状再到下一种"，真机不会悬空。
+//   true=终态支撑——允许中途悬空、其底由后续形状填，合法解按终态整盘判(每格受支撑 + 支撑 DAG
+//     无环)；装填自由度更大，但执行序须按支撑 DAG 先底后顶重排(会跨形状交错)。见 solveSequence。
+bool seq_final_support = false;
+// 进阶分组求解的束宽(beam width)。求解器默认 120 太小、会明显欠搜索——实测同一盘 beam=120 只出
+// 5 个满行(score 50)，beam=600 出 8 个满行(score 80)、约 0.8s，beam=1200 约 1.9s(此后基本到顶)。
+// 进阶方案只算一次再执行，故用较大束宽换更高得分是划算的。可用 rosparam seq_beam_width 调整。
+int seq_beam_width = 1200;
 // 进阶模式：每种形状“可吸取上限”。即使场上识别到更多，也只允许吸取指定数量的该形状；
 // 例如场上有 4 个 id=0，设 shape_pick_limits[0]=2 则最多只放/吸 2 个。<0=不限制(默认，
 // 用视觉全部库存)。长度 7，一一对应 7 种形状 id。仅进阶模式生效。
@@ -505,14 +519,19 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
         cfg.sequence = shape_sequence;
         cfg.cyclic = seq_cyclic;
         cfg.inventory = effective_inventory;
-        cfg.require_support = seq_require_support;
-        cfg.reward_four_colors = seq_reward_four_colors;
+        cfg.group_by_shape = seq_group_by_shape;
+        cfg.final_support = seq_final_support;
+        cfg.require_support = seq_require_support; // 仅非终态支撑模式生效
+        // 分组模式(新进阶策略)取消满行配色加分(规则②)；旧交错模式沿用 seq_reward_four_colors。
+        cfg.reward_four_colors = seq_group_by_shape ? false : seq_reward_four_colors;
         cfg.board_rows = 14;
         cfg.board_cols = 10;
+        cfg.beam_width = seq_beam_width;
         SeqResult res = solveSequence(cfg);
-        ROS_INFO("[ADVANCED] solveSequence: placed=%d score=%d (seq_len=%lu cyclic=%d support=%d four_colors=%d)",
-                 res.placed, res.score, shape_sequence.size(), (int)seq_cyclic, (int)seq_require_support,
-                 (int)seq_reward_four_colors);
+        ROS_INFO("[ADVANCED] solveSequence: placed=%d score=%d (seq_len=%lu group_by_shape=%d final_support=%d "
+                 "beam=%d cyclic=%d support=%d four_colors=%d)",
+                 res.placed, res.score, shape_sequence.size(), (int)seq_group_by_shape, (int)seq_final_support,
+                 seq_beam_width, (int)seq_cyclic, (int)seq_require_support, (int)cfg.reward_four_colors);
 
         if (res.placements.empty())
         {
@@ -528,10 +547,90 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
         std_msgs::Int32MultiArray plan_msg;
         plan_msg.data.push_back((int)res.placements.size());
 
-        ROS_INFO("====== ADVANCED pick-and-place sequence ======");
-        for (size_t i = 0; i < res.placements.size(); ++i)
+        // 决定发布(=执行)顺序。
+        const int RN = 14, CN = 10;
+        const int NP = (int)res.placements.size();
+        vector<int> order;
+        order.reserve(NP);
+        if (!seq_final_support)
         {
-            const auto &pl = res.placements[i];
+            // 逐步支撑模式：每块放置当场即受支撑(下方已有块/触底)，故分组求解顺序本身就是合法的
+            // 先底后顶执行序——直接按分组顺序发布，机器人真正"先放完一种形状再到下一种"，不做拓扑重排。
+            for (int i = 0; i < NP; ++i)
+                order.push_back(i);
+        }
+        else
+        {
+            // 终态支撑模式：分组求解序允许中途悬空，不是先底后顶——按支撑依赖 DAG(下方块先放)拓扑
+            // 重排为可执行序(先底后顶，同底再靠左优先)。solveSequence 已保证该 DAG 无环，order 兜底。
+            vector<int> board_piece(RN * CN, -1);
+            for (int i = 0; i < NP; ++i)
+                for (auto &pt : res.placements[i].cells)
+                    board_piece[pt.x * CN + pt.y] = i;
+            vector<vector<int>> adj(NP);
+            vector<int> in_degree(NP, 0);
+            for (int r = 0; r < RN - 1; ++r)
+                for (int c = 0; c < CN; ++c)
+                {
+                    int cur = board_piece[r * CN + c], below = board_piece[(r + 1) * CN + c];
+                    if (cur >= 0 && below >= 0 && cur != below)
+                    {
+                        bool ex = false;
+                        for (int t : adj[below])
+                            if (t == cur)
+                            {
+                                ex = true;
+                                break;
+                            }
+                        if (!ex)
+                        {
+                            adj[below].push_back(cur);
+                            in_degree[cur]++;
+                        }
+                    }
+                }
+            vector<int> p_bottom(NP, -1), p_left(NP, 999);
+            for (int i = 0; i < NP; ++i)
+                for (auto &pt : res.placements[i].cells)
+                {
+                    if (pt.x > p_bottom[i])
+                        p_bottom[i] = pt.x;
+                    if (pt.y < p_left[i])
+                        p_left[i] = pt.y;
+                }
+            auto topo_cmp = [&](int a, int b)
+            {
+                if (p_bottom[a] != p_bottom[b])
+                    return p_bottom[a] < p_bottom[b];
+                return p_left[a] > p_left[b];
+            };
+            priority_queue<int, vector<int>, decltype(topo_cmp)> pq(topo_cmp);
+            for (int i = 0; i < NP; ++i)
+                if (in_degree[i] == 0)
+                    pq.push(i);
+            while (!pq.empty())
+            {
+                int u = pq.top();
+                pq.pop();
+                order.push_back(u);
+                for (int v : adj[u])
+                    if (--in_degree[v] == 0)
+                        pq.push(v);
+            }
+            if ((int)order.size() != NP)
+            {
+                ROS_WARN("[ADVANCED] support DAG not fully orderable (%lu/%d); falling back to solve order.",
+                         order.size(), NP);
+                order.clear();
+                for (int i = 0; i < NP; ++i)
+                    order.push_back(i);
+            }
+        }
+
+        ROS_INFO("====== ADVANCED pick-and-place sequence ======");
+        for (size_t k = 0; k < order.size(); ++k)
+        {
+            const auto &pl = res.placements[order[k]];
             int pu = 0, pv = 0, p_ang = 0, geom_u = 0, geom_v = 0;
             bool has_geom = false;
             if (pl.shape_type >= 0 && pl.shape_type < 7 && !available_blocks[pl.shape_type].empty())
@@ -574,7 +673,7 @@ void visionCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
             }
 
             ROS_INFO("adv action [%2lu/%lu]: %-18s | center=(%.2f, %.2f) | rotation => %3d degree | pick=(%d,%d,%d) has_geom=%s",
-                     i + 1, res.placements.size(), SHAPE_NAMES[pl.shape_type],
+                     k + 1, order.size(), SHAPE_NAMES[pl.shape_type],
                      sum_r / 4.0, sum_c / 4.0, pl.real_way * 90, pu, pv, p_ang,
                      has_geom ? "true" : "false");
         }
@@ -709,6 +808,11 @@ int main(int argc, char **argv)
 
     pnh.param("advanced_mode", advanced_mode, advanced_mode);
     pnh.param("advanced_peak_max_wait_sec", advanced_peak_max_wait_sec, advanced_peak_max_wait_sec);
+    pnh.param("seq_group_by_shape", seq_group_by_shape, seq_group_by_shape);
+    pnh.param("seq_final_support", seq_final_support, seq_final_support);
+    pnh.param("seq_beam_width", seq_beam_width, seq_beam_width);
+    if (seq_beam_width < 1)
+        seq_beam_width = 1;
     pnh.param("seq_cyclic", seq_cyclic, seq_cyclic);
     pnh.param("seq_require_support", seq_require_support, seq_require_support);
     pnh.param("seq_reward_four_colors", seq_reward_four_colors, seq_reward_four_colors);
@@ -728,9 +832,10 @@ int main(int argc, char **argv)
     }
 
     if (advanced_mode)
-        ROS_INFO("[ADVANCED] mode ON: seq_len=%lu cyclic=%d require_support=%d reward_four_colors=%d pick_limits=[%d,%d,%d,%d,%d,%d,%d]",
-                 shape_sequence.size(), (int)seq_cyclic, (int)seq_require_support,
-                 (int)seq_reward_four_colors,
+        ROS_INFO("[ADVANCED] mode ON: seq_len=%lu group_by_shape=%d final_support=%d cyclic=%d require_support=%d "
+                 "reward_four_colors=%d pick_limits=[%d,%d,%d,%d,%d,%d,%d]",
+                 shape_sequence.size(), (int)seq_group_by_shape, (int)seq_final_support, (int)seq_cyclic,
+                 (int)seq_require_support, (int)(seq_group_by_shape ? false : seq_reward_four_colors),
                  shape_pick_limits[0], shape_pick_limits[1], shape_pick_limits[2], shape_pick_limits[3],
                  shape_pick_limits[4], shape_pick_limits[5], shape_pick_limits[6]);
 

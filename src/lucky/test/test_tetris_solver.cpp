@@ -121,6 +121,91 @@ int main()
         assert(res.placed > 0);
         assert(res.score == 0); // 规则④：单一形状不计分
     }
+    // 用例4：分组 + 终态支撑(新进阶模式)。先放完形状 0 的全部库存，再 1，再 2；无四色加分。
+    // 校验：(a) 放置顺序按形状分组(0..0,1..1,2..2)；(b) 终态整盘每个已填格受支撑(触底或正下
+    // 方有块)；(c) 支撑依赖 DAG 无环(可先底后顶执行)；(d) 计分自洽。
+    {
+        SeqConfig cfg;
+        cfg.sequence = {0, 1, 2};
+        cfg.cyclic = false;
+        cfg.inventory = {4, 4, 4, 0, 0, 0, 0};
+        cfg.group_by_shape = true;
+        cfg.final_support = true;
+        cfg.reward_four_colors = false;
+        SeqResult res = solveSequence(cfg);
+        printf("=== grouped + final-support (new advanced) ===\n");
+        printf("placed=%d  score=%d\n", res.placed, res.score);
+        render(res, cfg.board_rows, cfg.board_cols);
+        assert(res.placed > 0);
+
+        // (a) 分组：形状按 sequence 首次出现顺序非递减出现。
+        int last_group = -1;
+        int group_of[7];
+        for (int i = 0; i < 7; ++i) group_of[i] = -1;
+        for (size_t i = 0; i < cfg.sequence.size(); ++i)
+            if (group_of[cfg.sequence[i]] < 0) group_of[cfg.sequence[i]] = (int)i;
+        for (auto &pl : res.placements)
+        {
+            int g = group_of[pl.shape_type];
+            assert(g >= 0 && g >= last_group && "placements must be grouped by shape");
+            last_group = g;
+        }
+
+        // (b) 终态每格受支撑 + (d) 计分自洽。
+        int rows = cfg.board_rows, cols = cfg.board_cols;
+        vector<int> board(rows * cols, 0);
+        for (auto &pl : res.placements)
+            for (auto &c : pl.cells)
+                board[c.x * cols + c.y] = pl.shape_type + 1;
+        for (int r = 0; r < rows - 1; ++r)
+            for (int c = 0; c < cols; ++c)
+                assert(!(board[r * cols + c] && board[(r + 1) * cols + c] == 0) &&
+                       "final board must be fully supported");
+        assert(seqScore(board, rows, cols, cfg.reward_four_colors) == res.score);
+
+        // (c) 支撑 DAG 无环：借 seqFinalValid(整盘支撑 + Kahn 可排完)复核。
+        SeqState st;
+        st.board = board;
+        st.placements = res.placements;
+        assert(seqFinalValid(st, rows, cols) && "support DAG must be acyclic & fully supported");
+        printf("verify: OK (grouped, final-support, acyclic)\n\n");
+    }
+
+    // 用例5：分组 + 逐步支撑(新默认进阶模式)。先放完形状 0 全部库存再 1 再 2；每块放置当场即需
+    // 支撑，故分组求解序本身就是先底后顶合法执行序(策略直接按此发布，不拓扑重排)。
+    // 校验：(a) 分组顺序；(b) 沿放置顺序每块满足规则③支撑(verify)；(c) 计分自洽。
+    {
+        SeqConfig cfg;
+        cfg.sequence = {0, 1, 2};
+        cfg.cyclic = false;
+        cfg.inventory = {4, 4, 4, 0, 0, 0, 0};
+        cfg.group_by_shape = true;
+        cfg.final_support = false;   // 逐步支撑
+        cfg.require_support = true;  // 竞赛规则③
+        cfg.reward_four_colors = false;
+        SeqResult res = solveSequence(cfg);
+        printf("=== grouped + step-support (new advanced default) ===\n");
+        printf("placed=%d  score=%d\n", res.placed, res.score);
+        render(res, cfg.board_rows, cfg.board_cols);
+        assert(res.placed > 0);
+
+        // (a) 分组：形状按 sequence 首次出现顺序非递减。
+        int group_of[7];
+        for (int i = 0; i < 7; ++i) group_of[i] = -1;
+        for (size_t i = 0; i < cfg.sequence.size(); ++i)
+            if (group_of[cfg.sequence[i]] < 0) group_of[cfg.sequence[i]] = (int)i;
+        int last_group = -1;
+        for (auto &pl : res.placements)
+        {
+            int g = group_of[pl.shape_type];
+            assert(g >= 0 && g >= last_group && "placements must be grouped by shape");
+            last_group = g;
+        }
+        // (b)+(c) 沿放置顺序逐块支撑合法 + 计分自洽。
+        assert(verify(res, cfg) && "each block supported when placed (rule3) & score consistent");
+        printf("verify: OK (grouped, step-support, order is executable as-is)\n\n");
+    }
+
     printf("ALL TESTS PASSED\n");
     return 0;
 }

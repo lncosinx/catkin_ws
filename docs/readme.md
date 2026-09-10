@@ -80,6 +80,7 @@ xhost +local:docker
 
 ```bash
 roslaunch lucky lucky.launch robot_ip:=<机械臂IP>     # 默认 192.168.1.216
+rostopic pub -1 /ready std_msgs/Bool "{data: true}"
 ```
 
 切换经典视觉实现（非神经网络边缘检测，无需 onnx 模型）：
