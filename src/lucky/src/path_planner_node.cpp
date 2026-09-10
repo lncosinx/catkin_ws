@@ -197,10 +197,15 @@ private:
     // 是否允许重排放置顺序。true=在 DAG 内按代价重排；false=保持策略节点给的顺序（比赛可能有
     // 方块相邻等 DAG 之外的约束），仅为每个槽的指定形状选代价最小的物理块 + 腕部翻转。
     bool allow_reorder_ = true;
-    // 保序（allow_reorder=false）关节代价模式下，沿固定放置顺序做有界 beam 搜索的宽度。
-    // J6 可行性路径相关（见 optimizePlan），贪心逐槽择优会近视地把 J6 绕到边界令后续槽无解；
-    // beam 保留前 N 条最优前缀，让下游不可行能回改上游选择。1 = 退化为原贪心。
-    int reorder_beam_width_ = 12;
+    // 有界 beam 搜索的宽度，重排（allow_reorder=true，在 DAG 内搜放置顺序+选块+翻转）与保序
+    // （allow_reorder=false，固定顺序仅搜选块+翻转）两种模式共用。J6 可行性路径相关
+    // （见 optimizePlan），贪心逐步择优会近视地把 J6 绕到边界令后续步无解；beam 保留前 N 条
+    // 最优前缀，让下游不可行/高代价能回改上游选择。1 = 退化为原贪心。
+    int reorder_beam_width_ = 24;
+    // beam 出解后做 DAG 安全的 2-opt/or-opt 局部改善（仅关节代价模式）。代价路径相关，每个候选须沿
+    // 新历史重放；用前缀状态缓存 + 时间预算保证实时。beam 求近似最优，2-opt 再压一层（仍非全局最优）。
+    bool refine_two_opt_ = true;
+    double two_opt_max_ms_ = 40.0; // 局部改善时间预算（毫秒），超时即返回当前最优
     bool pool_ready_ = false;
     std::vector<PoolBlock> pool_by_shape_[7];
 
@@ -287,6 +292,26 @@ private:
     // 转移段沿直线笛卡尔路径采样 J6（J6≈heading−J1，J1 沿直线非线性摆动，中途可越过两端点值）。
     double wrist_soft_limit_rad_ = 4.7;  // ≈269°，偏好上界
     double wrist_hard_limit_rad_ = 6.10; // ≈349°，拒发阈值（到 ±2π=360° 留 ~11° 余量）
+    // J6 “保余量”势垒（headroom barrier）：|J6| 在 [0, wrist_center_free_rad_] 留白带内势为 0——正常抓放腕角
+    // (≤±180°) 完全按翻转/时间代价择优（“计较翻转代价”原样保留）；超出留白带按二次势加罚，越靠硬限位越贵，
+    // 逼搜索把 J6 留在中段、保住两侧头寸，使全部方块放得完（放满优先），再在此前提下省翻转。默认 free≈π(180°)、
+    // gain 40 s/rad²（例：269° 处 ≈97s，远压过几秒时间差；仅重塑偏好，硬限位仍硬排除，不会造成不可行）。
+    // 调大 gain → 更保守留头寸、更倾向放满；调小 → 更省翻转但更易单向绕到边界丢方块。
+    double wrist_center_free_rad_ = M_PI;
+    double wrist_center_penalty_s_per_rad2_ = 40.0;
+    // 自动升挡重解：势垒是启发式 + 有界 beam，不保证放满。若某次求解丢块（放置数 < 任务总数），就逐挡加大
+    // 势 gain 与 beam 宽度重跑，取「放置数最多、平局取代价小」的结果——只在物理确实不可行(J6 硬限位)时才丢块。
+    // 每升一挡 gain ×center_escalation_factor_、beam +beam_escalation_step_。max=0 关闭升挡（退回单次求解）。
+    int max_center_escalations_ = 8;
+    double center_escalation_factor_ = 3.0;    // 每挡势 gain 倍率（升几挡即饱和，此后无害）
+    // beam 宽度按几何增长（每挡 ×此倍率）——加宽是完备性的真杠杆且单调安全，故用几何而非加法，才能在预算内
+    // 从窄 beam 快速升到几百的宽 beam。真正的耗时闸门是下面的墙钟预算，而非挡数。
+    double beam_escalation_mult_ = 1.5;
+    double center_escalation_budget_s_ = 12.0; // 升挡墙钟预算(秒)：挡间累计超此即停、留当前最优(0=不限，仅按挡数)
+    // 少杠杆场景（K=1 候选，多为进阶模式的单一确定解——保序、无候选择优，只剩翻转/换块可给 J6 让路）自动上调
+    // 一档：起始势 gain ×center_escalation_factor_、额外多给 single_candidate_extra_escalations_ 挡。默认开。
+    bool single_candidate_center_boost_ = true;
+    int single_candidate_extra_escalations_ = 1;
     int transit_j6_samples_ = 8;         // 每段转移采样点数
     double ik_selfcheck_tol_rad_ = 0.05; // 自检：max|ik(fk)−q| 阈值
     bool use_joint_cost_ = true;         // 自检通过/IK 可用才为 true
@@ -401,6 +426,8 @@ private:
         pnh_.param("optimize_order", optimize_order_, optimize_order_);
         pnh_.param("allow_reorder", allow_reorder_, allow_reorder_);
         pnh_.param("reorder_beam_width", reorder_beam_width_, reorder_beam_width_);
+        pnh_.param("refine_two_opt", refine_two_opt_, refine_two_opt_);
+        pnh_.param("two_opt_max_ms", two_opt_max_ms_, two_opt_max_ms_);
         pnh_.param("camera_info_topic", camera_info_topic_, camera_info_topic_);
         pnh_.param("base_frame", base_frame_, base_frame_);
         pnh_.param("camera_frame", camera_frame_, camera_frame_);
@@ -495,11 +522,20 @@ private:
         pnh_.param("omega_per_v_lin_rad_per_m", omega_per_v_lin_rad_per_m_, omega_per_v_lin_rad_per_m_);
         pnh_.param("wrist_soft_penalty_s_per_rad", wrist_soft_penalty_s_per_rad_, wrist_soft_penalty_s_per_rad_);
         pnh_.param("tie_break_weight_s_per_rad", tie_break_weight_s_per_rad_, tie_break_weight_s_per_rad_);
+        pnh_.param("wrist_center_free_rad", wrist_center_free_rad_, wrist_center_free_rad_);
+        pnh_.param("wrist_center_penalty_s_per_rad2", wrist_center_penalty_s_per_rad2_, wrist_center_penalty_s_per_rad2_);
+        pnh_.param("max_center_escalations", max_center_escalations_, max_center_escalations_);
+        pnh_.param("center_escalation_factor", center_escalation_factor_, center_escalation_factor_);
+        pnh_.param("beam_escalation_mult", beam_escalation_mult_, beam_escalation_mult_);
+        pnh_.param("center_escalation_budget_s", center_escalation_budget_s_, center_escalation_budget_s_);
+        pnh_.param("single_candidate_center_boost", single_candidate_center_boost_, single_candidate_center_boost_);
+        pnh_.param("single_candidate_extra_escalations", single_candidate_extra_escalations_, single_candidate_extra_escalations_);
 
         ROS_INFO("[PATH] joint cost=path-time: v_max=[%.2f..] v_lin(empty/loaded)=%.3f/%.3f m/s omega/v_lin=%.2f rad/m "
-                 "wrist_soft=%.0f deg",
+                 "wrist_soft=%.0f deg center_free=%.0f deg center_gain=%.0f",
                  joint_max_vel_[0], transit_lin_speed_m_s_, loaded_lin_speed_m_s_, omega_per_v_lin_rad_per_m_,
-                 wrist_soft_limit_rad_ * 180.0 / M_PI);
+                 wrist_soft_limit_rad_ * 180.0 / M_PI,
+                 wrist_center_free_rad_ * 180.0 / M_PI, wrist_center_penalty_s_per_rad2_);
     }
 
     bool loadBoardPose()
@@ -1384,6 +1420,14 @@ private:
                        tie_break_weight_s_per_rad_ * (trA.joint_travel + trB.joint_travel);
             if (path_max_j6 > wrist_soft_limit_rad_)
                 c += wrist_soft_penalty_s_per_rad_ * (path_max_j6 - wrist_soft_limit_rad_); // 软限位：秒尺度加罚，least-bad
+            // J6 “保余量”势垒：留白带（≈±180°，正常抓放腕角）内为 0，不干扰翻转代价最小化；越出留白带二次加罚，
+            // 越靠硬限位越贵。逼搜索把 J6 留在中段、保住两侧头寸，避免贪心为省几秒把腕部单向绕到边界令后续槽无解
+            // ——把“放满全部方块”置于“省翻转代价”之上（放满前提下再计较翻转）。此项对翻转择优/两 beam/2-opt 同生效。
+            if (wrist_center_penalty_s_per_rad2_ > 0.0 && path_max_j6 > wrist_center_free_rad_)
+            {
+                const double over = path_max_j6 - wrist_center_free_rad_;
+                c += wrist_center_penalty_s_per_rad2_ * over * over;
+            }
             if (c < best.cost)
             {
                 best.ok = true;
@@ -1773,7 +1817,7 @@ private:
             }
         }
 
-        std::vector<char> placed(n, 0), in_frontier(n, 0);
+        std::vector<char> in_frontier(n, 0);
         std::vector<int> frontier;
         for (int i = 0; i < n; ++i)
             if (indeg[i] == 0)
@@ -1782,169 +1826,413 @@ private:
                 in_frontier[i] = 1;
             }
 
-        std::vector<int> order;
-        order.reserve(n);
+        // 有界 beam 搜索（替代逐步贪心）：沿 DAG 拓扑逐步放置，每个 beam 节点携带自身的 DAG 进度
+        // (indeg/frontier/placed)、资源消费 (used)、关节或 XY 起点状态，以及已选顺序+每步的选块/翻转。
+        // 每步为每个 beam 节点枚举「所有 DAG 就绪槽 × 候选块 × 翻转」，各生成一个「多放一个槽」的子节点，
+        // 保留前 B 条最低累计代价前缀——让下游 J6 不可行/高代价能回改上游的放置顺序与选块（贪心逐步择优
+        // 会近视地把 J6 绕到边界令后续槽无解）。所有存活节点深度一致（每步恰好各放一个槽），代价可比。
+        // 保序前缀不破坏 DAG（拓扑序的任意前缀对依赖向下闭合，依赖只会更靠前），故 J6 无完整解时可安全
+        // 执行「第一个全体不可行步之前」的最长合法前缀。
+        struct RNode
+        {
+            double cost = 0.0;
+            Joints q_cur{};                // 关节模式：上一放置落点关节（下段转移 seed）
+            geometry_msgs::Pose cur_pose;  // 关节模式：上一 place_hover 位姿（转移段起点）
+            double cur_x = 0.0, cur_y = 0.0;
+            bool has_cur = false;          // XY 回退模式：是否已有起点 TCP
+            std::vector<int> indeg;        // 逐节点独立的 DAG 入度
+            std::vector<char> placed;      // 已放置标记
+            std::vector<char> in_frontier; // 已入 frontier 标记（防重复入队）
+            std::vector<int> frontier;     // 就绪（依赖已满足）槽，惰性保留已放置项（用 placed 过滤）
+            std::array<std::vector<char>, 7> used; // 逐形状已消费候选块标记
+            std::vector<int> order;        // 已放置槽的顺序（goal 下标）
+            std::vector<int> pick_cand;    // 每步选中的 cand 下标（-1 = 保留策略抓取）
+            std::vector<char> pick_flip;   // 每步翻转
+            std::vector<double> pick_maxj6;// 每步 J6 路径峰值（软限位告警用）
+        };
+
+        RNode root;
+        root.q_cur = q_cur;
+        root.cur_pose = cur_pose;
+        root.cur_x = cur_x;
+        root.cur_y = cur_y;
+        root.has_cur = has_cur;
+        root.indeg = indeg;
+        root.placed.assign(n, 0);
+        root.in_frontier = in_frontier;
+        root.frontier = frontier;
+        if (use_pool)
+            for (int s = 0; s < 7; ++s)
+                root.used[s].assign(cand[s].size(), 0);
+
+        std::vector<RNode> beam;
+        beam.push_back(std::move(root));
+
+        const int B = std::max(1, reorder_beam_width_);
+        int reached = 0; // beam 非空时 = 所有存活节点已放置的槽数（当前深度）
         for (int step = 0; step < n; ++step)
         {
-            double best = std::numeric_limits<double>::max();
-            int best_goal = -1, best_cand = -1;
-            bool best_flip = false;
-            Joints best_qplace = q_cur;
-            geometry_msgs::Pose best_endpose = cur_pose;
-            double best_maxj6 = 0.0;
-
-            for (int g : frontier)
+            std::vector<RNode> next;
+            for (const RNode &st : beam)
             {
-                if (placed[g])
-                    continue;
-                int s = goals[g].shape_type;
-                if (use_pool && s >= 0 && s < 7)
+                for (int g : st.frontier)
                 {
-                    for (int k = 0; k < static_cast<int>(cand[s].size()); ++k)
+                    if (st.placed[g])
+                        continue;
+                    const int s = goals[g].shape_type;
+                    // 生成「在节点 st 上放置槽 g（选块 cand_k、翻转 flip）」的子节点。
+                    auto commit = [&](int cand_k, double add_cost, bool flip,
+                                      const Joints &q_place, const geometry_msgs::Pose &end_pose,
+                                      double maxj6, double nx, double ny)
                     {
-                        if (cand_used[s][k])
-                            continue;
-                        const PoolBlock &b = cand[s][k];
+                        RNode ch = st;
+                        ch.cost += add_cost;
                         if (joint_mode)
                         {
-                            PixelPoint pk{b.u, b.v}, gm{b.geom_u, b.geom_v};
-                            PairEval pe = evalPairJoint(goals[g], pk, b.ang, gm, b.has_geom, q_cur, cur_pose);
-                            if (pe.ok && pe.cost < best)
-                            {
-                                best = pe.cost;
-                                best_goal = g;
-                                best_cand = k;
-                                best_flip = pe.flip;
-                                best_qplace = pe.q_place;
-                                best_endpose = pe.end_pose;
-                                best_maxj6 = pe.max_j6;
-                            }
+                            ch.q_cur = q_place;
+                            ch.cur_pose = end_pose;
                         }
-                        else
-                        {
-                            double d = (has_cur ? std::hypot(cur_x - cand_x[s][k], cur_y - cand_y[s][k]) : 0.0) +
-                                       std::hypot(cand_x[s][k] - place_x[g], cand_y[s][k] - place_y[g]);
-                            if (d < best)
+                        ch.cur_x = nx;
+                        ch.cur_y = ny;
+                        ch.has_cur = true;
+                        if (cand_k >= 0 && s >= 0 && s < 7)
+                            ch.used[s][cand_k] = 1;
+                        ch.placed[g] = 1;
+                        ch.order.push_back(g);
+                        ch.pick_cand.push_back(cand_k);
+                        ch.pick_flip.push_back(flip ? 1 : 0);
+                        ch.pick_maxj6.push_back(maxj6);
+                        for (int v : succ[g]) // 放置 g 解锁其后继（放置依赖 DAG）
+                            if (--ch.indeg[v] == 0 && !ch.in_frontier[v])
                             {
-                                best = d;
-                                best_goal = g;
-                                best_cand = k;
+                                ch.frontier.push_back(v);
+                                ch.in_frontier[v] = 1;
                             }
-                        }
-                    }
-                }
-                else
-                {
-                    if (joint_mode)
+                        next.push_back(std::move(ch));
+                    };
+
+                    if (use_pool && s >= 0 && s < 7)
                     {
-                        PairEval pe = evalPairJoint(goals[g], goals[g].pick_pixel, goals[g].pick_angle_deg,
-                                                    goals[g].geom_pixel, goals[g].has_geom_pixel, q_cur, cur_pose);
-                        if (pe.ok && pe.cost < best)
+                        for (int k = 0; k < static_cast<int>(cand[s].size()); ++k)
                         {
-                            best = pe.cost;
-                            best_goal = g;
-                            best_cand = -1;
-                            best_flip = pe.flip;
-                            best_qplace = pe.q_place;
-                            best_endpose = pe.end_pose;
-                            best_maxj6 = pe.max_j6;
+                            if (st.used[s][k])
+                                continue;
+                            const PoolBlock &b = cand[s][k];
+                            if (joint_mode)
+                            {
+                                PixelPoint pk{b.u, b.v}, gm{b.geom_u, b.geom_v};
+                                PairEval pe = evalPairJoint(goals[g], pk, b.ang, gm, b.has_geom,
+                                                            st.q_cur, st.cur_pose);
+                                if (pe.ok)
+                                    commit(k, pe.cost, pe.flip, pe.q_place, pe.end_pose, pe.max_j6, 0.0, 0.0);
+                            }
+                            else
+                            {
+                                double d = (st.has_cur ? std::hypot(st.cur_x - cand_x[s][k], st.cur_y - cand_y[s][k]) : 0.0) +
+                                           std::hypot(cand_x[s][k] - place_x[g], cand_y[s][k] - place_y[g]);
+                                commit(k, d, false, st.q_cur, st.cur_pose, 0.0, place_x[g], place_y[g]);
+                            }
                         }
                     }
                     else
                     {
-                        double px, py;
-                        if (!pickXYForOpt(goals[g].pick_pixel.u, goals[g].pick_pixel.v, px, py))
+                        // 池不可用：保留策略抓取，仅择翻转（无块重选自由度）。
+                        if (joint_mode)
                         {
-                            px = place_x[g];
-                            py = place_y[g];
+                            PairEval pe = evalPairJoint(goals[g], goals[g].pick_pixel, goals[g].pick_angle_deg,
+                                                        goals[g].geom_pixel, goals[g].has_geom_pixel,
+                                                        st.q_cur, st.cur_pose);
+                            if (pe.ok)
+                                commit(-1, pe.cost, pe.flip, pe.q_place, pe.end_pose, pe.max_j6, 0.0, 0.0);
                         }
-                        double d = (has_cur ? std::hypot(cur_x - px, cur_y - py) : 0.0) +
-                                   std::hypot(px - place_x[g], py - place_y[g]);
-                        if (d < best)
+                        else
                         {
-                            best = d;
-                            best_goal = g;
-                            best_cand = -1;
+                            double px, py;
+                            if (!pickXYForOpt(goals[g].pick_pixel.u, goals[g].pick_pixel.v, px, py))
+                            {
+                                px = place_x[g];
+                                py = place_y[g];
+                            }
+                            double d = (st.has_cur ? std::hypot(st.cur_x - px, st.cur_y - py) : 0.0) +
+                                       std::hypot(px - place_x[g], py - place_y[g]);
+                            commit(-1, d, false, st.q_cur, st.cur_pose, 0.0, place_x[g], place_y[g]);
                         }
                     }
                 }
             }
-            // 关节模式：DAG 就绪槽里没有任何 J6 可行的 (槽,块,翻转) → 重排也救不了 → 规划失败。
-            // 这里已经遍历了所有就绪槽×候选块×翻转（即"先试翻转/换块/重排"），仍无解才报错停。
-            if (joint_mode && best_goal < 0)
+            if (next.empty())
+                break; // 所有存活节点在此步都无 J6 可行放置 → 用上一层最优前缀兜底
+            if (static_cast<int>(next.size()) > B)
             {
-                ROS_ERROR("[PATH] PLANNING FAILED at step %d/%d: no J6-feasible (transit <= %.0f deg) "
-                          "pick/flip for any DAG-ready slot. NOT publishing — re-plan needed.",
-                          step, n, wrist_hard_limit_rad_ * 180.0 / M_PI);
-                return false;
+                std::nth_element(next.begin(), next.begin() + B, next.end(),
+                                 [](const RNode &a, const RNode &b)
+                                 { return a.cost < b.cost; });
+                next.resize(B);
             }
-            if (best_goal < 0)
-            {
-                for (int g : frontier)
-                    if (!placed[g])
-                    {
-                        best_goal = g;
-                        break;
-                    }
-            }
-            if (best_goal < 0)
-                break;
-
-            int s = goals[best_goal].shape_type;
-            if (use_pool && best_cand >= 0 && s >= 0 && s < 7)
-            {
-                const PoolBlock &b = cand[s][best_cand];
-                cand_used[s][best_cand] = 1;
-                goals[best_goal].pick_pixel.u = b.u;
-                goals[best_goal].pick_pixel.v = b.v;
-                goals[best_goal].pick_angle_deg = b.ang;
-                goals[best_goal].geom_pixel.u = b.geom_u;
-                goals[best_goal].geom_pixel.v = b.geom_v;
-                goals[best_goal].has_geom_pixel = b.has_geom;
-            }
-            if (joint_mode)
-            {
-                if (best_maxj6 > wrist_soft_limit_rad_)
-                    ROS_WARN("[PATH] task(goal=%d) J6 path peak %.0f deg exceeds soft %.0f deg (within hard); margin low.",
-                             best_goal, best_maxj6 * 180.0 / M_PI, wrist_soft_limit_rad_ * 180.0 / M_PI);
-                goals[best_goal].flip = best_flip;
-                q_cur = best_qplace;
-                cur_pose = best_endpose;
-            }
-            if (best < std::numeric_limits<double>::max())
-                total_cost += best;
-            placed[best_goal] = 1;
-            order.push_back(best_goal);
-            cur_x = place_x[best_goal];
-            cur_y = place_y[best_goal];
-            has_cur = true;
-            for (int v : succ[best_goal])
-                if (--indeg[v] == 0 && !in_frontier[v])
-                {
-                    frontier.push_back(v);
-                    in_frontier[v] = 1;
-                }
+            beam = std::move(next);
+            reached = step + 1;
         }
 
-        if (static_cast<int>(order.size()) != n)
+        const RNode *bestNode = nullptr;
+        for (const RNode &st : beam)
+            if (!bestNode || st.cost < bestNode->cost)
+                bestNode = &st;
+
+        if (!bestNode || reached == 0)
         {
-            ROS_WARN("[PATH] optimize produced %lu/%d tasks (cycle?); keeping original order.",
-                     order.size(), n);
+            // 一个槽都放不下：关节模式即 J6 全无可行方案 → 规划失败；XY 模式不会到这里（恒可行）。
+            if (joint_mode)
+            {
+                ROS_ERROR("[PATH] PLANNING FAILED: no J6-feasible (transit <= %.0f deg) pick/flip for any "
+                          "DAG-ready slot at step 0. NOT publishing — re-plan needed.",
+                          wrist_hard_limit_rad_ * 180.0 / M_PI);
+                return false;
+            }
+            ROS_WARN("[PATH] optimize produced 0 tasks; keeping original order.");
             return true;
         }
 
+        // 回填选中的抓取块 + 翻转，并按 beam 选出的顺序重排 goals（前缀 reached 个）。
         std::vector<TaskGoal> reordered;
-        reordered.reserve(n);
-        for (int idx : order)
-            reordered.push_back(goals[idx]);
+        reordered.reserve(bestNode->order.size());
+        for (int j = 0; j < static_cast<int>(bestNode->order.size()); ++j)
+        {
+            const int gi = bestNode->order[j];
+            TaskGoal tg = goals[gi];
+            const int s = tg.shape_type;
+            const int k = bestNode->pick_cand[j];
+            if (use_pool && k >= 0 && s >= 0 && s < 7)
+            {
+                const PoolBlock &b = cand[s][k];
+                tg.pick_pixel.u = b.u;
+                tg.pick_pixel.v = b.v;
+                tg.pick_angle_deg = b.ang;
+                tg.geom_pixel.u = b.geom_u;
+                tg.geom_pixel.v = b.geom_v;
+                tg.has_geom_pixel = b.has_geom;
+            }
+            if (joint_mode)
+            {
+                tg.flip = (bestNode->pick_flip[j] != 0);
+                if (bestNode->pick_maxj6[j] > wrist_soft_limit_rad_)
+                    ROS_WARN("[PATH] task %d (goal %d) J6 path peak %.0f deg exceeds soft %.0f deg (within hard); margin low.",
+                             j, gi, bestNode->pick_maxj6[j] * 180.0 / M_PI, wrist_soft_limit_rad_ * 180.0 / M_PI);
+            }
+            reordered.push_back(std::move(tg));
+        }
         goals.swap(reordered);
+        total_cost = bestNode->cost;
 
-        if (!joint_mode)
+        if (joint_mode)
+            refineOrderTwoOpt(goals, total_cost); // beam 出解后 DAG 安全的 2-opt/or-opt 再压一层
+        else
             assignFlipsByYaw(goals); // XY 回退路径：事后用 yaw 启发式选翻转
 
-        ROS_INFO("[PATH] optimized order+assign: %d task(s), pool=%s, cost=%s.",
-                 n, use_pool ? "on" : "off", joint_mode ? "joint" : "xy");
+        const int placed_n = static_cast<int>(goals.size());
+        if (placed_n < n)
+        {
+            // 保险触发：无「全 n 槽」J6 可行的重排，执行拓扑前缀（DAG 安全），丢弃其余。
+            ROS_WARN("[PATH] SAFETY FALLBACK: no full J6-feasible reorder for %d task(s) (beam=%d, pool=%s); "
+                     "running %d legal placement(s), dropping %d task(s).",
+                     n, B, use_pool ? "on" : "off", placed_n, n - placed_n);
+        }
+        else
+        {
+            ROS_INFO("[PATH] optimized order+assign (beam=%d): %d task(s), pool=%s, cost=%.4f (%s cost).",
+                     B, n, use_pool ? "on" : "off", total_cost, joint_mode ? "joint" : "xy");
+        }
         return true;
+    }
+
+    // 对已定序的 goals 做 DAG 安全的 2-opt / or-opt 局部改善（仅重排+关节代价模式调用）。
+    // 代价路径相关（J6 就近解依赖历史），重排后必须沿新历史重放 evalPairJoint 重算（含逐步择翻转）；
+    // 用前缀状态缓存把每候选的重放限制在「首个变化位置」之后，配 two_opt_max_ms 预算保证实时。
+    // 每个任务的抓取块保持不变（beam 已定），只搜放置顺序 + 随历史重择翻转。仍是近似（非全局最优）。
+    void refineOrderTwoOpt(std::vector<TaskGoal> &goals, double &total_cost)
+    {
+        const int n = static_cast<int>(goals.size());
+        if (!refine_two_opt_ || n < 3)
+            return;
+
+        // 放置依赖 DAG 的优先对：parent（正下方块）必须在 child 之前。
+        std::map<std::pair<int, int>, int> cell2goal;
+        for (int i = 0; i < n; ++i)
+            if (goals[i].has_target_cells)
+                for (const auto &c : goals[i].target_cells)
+                    cell2goal[{c.row, c.col}] = i;
+        std::vector<std::pair<int, int>> prec; // (parent, child)：parent 须在 child 前
+        for (int i = 0; i < n; ++i)
+            if (goals[i].has_target_cells)
+                for (const auto &c : goals[i].target_cells)
+                {
+                    auto it = cell2goal.find({c.row + 1, c.col});
+                    if (it != cell2goal.end() && it->second != i)
+                        prec.emplace_back(it->second, i);
+                }
+
+        // 初始起点关节/位姿（与 optimizePlan 一致）。
+        Joints q0 = nominal_seed_;
+        {
+            std::lock_guard<std::mutex> lk(joint_mutex_);
+            if (joint_state_ready_)
+                q0 = q_meas_;
+        }
+        const geometry_msgs::Pose pose0 = fkPose(q0);
+
+        const std::vector<TaskGoal> base = goals; // 稳定任务数组，perm 是其下标排列
+        std::vector<int> perm(n);
+        for (int i = 0; i < n; ++i)
+            perm[i] = i;
+
+        struct PrefState
+        {
+            Joints q;
+            geometry_msgs::Pose pose;
+            double cost;
+        };
+        std::vector<PrefState> pref(n + 1);
+        std::vector<char> flips(n, 0);
+        // 重建当前 perm 的前缀状态（做完 t 个任务后的 q/pose/累计代价）+ 逐步翻转；不可行返回 false。
+        auto rebuildPrefix = [&]() -> bool {
+            pref[0] = {q0, pose0, 0.0};
+            for (int t = 0; t < n; ++t)
+            {
+                const TaskGoal &g = base[perm[t]];
+                PairEval pe = evalPairJoint(g, g.pick_pixel, g.pick_angle_deg,
+                                            g.geom_pixel, g.has_geom_pixel, pref[t].q, pref[t].pose);
+                if (!pe.ok)
+                    return false;
+                pref[t + 1] = {pe.q_place, pe.end_pose, pref[t].cost + pe.cost};
+                flips[t] = pe.flip ? 1 : 0;
+            }
+            return true;
+        };
+        if (!rebuildPrefix())
+            return; // beam 已保证可行，理论不至此；保险起见放弃改善
+
+        // DAG 合法性：候选 perm 的每个优先对须 pos[parent] < pos[child]。
+        std::vector<int> pos(n);
+        auto validate = [&](const std::vector<int> &cand) -> bool {
+            for (int i = 0; i < n; ++i)
+                pos[cand[i]] = i;
+            for (const auto &pr : prec)
+                if (pos[pr.first] >= pos[pr.second])
+                    return false;
+            return true;
+        };
+        // 从首个与当前 perm 不同的位置起重放候选代价（前缀不变，复用缓存）；不可行返回 false。
+        auto evalCand = [&](const std::vector<int> &cand, double &out_cost) -> bool {
+            int start = 0;
+            while (start < n && cand[start] == perm[start])
+                ++start;
+            if (start == n)
+            {
+                out_cost = pref[n].cost;
+                return true;
+            }
+            Joints q = pref[start].q;
+            geometry_msgs::Pose pose = pref[start].pose;
+            double cost = pref[start].cost;
+            for (int t = start; t < n; ++t)
+            {
+                const TaskGoal &g = base[cand[t]];
+                PairEval pe = evalPairJoint(g, g.pick_pixel, g.pick_angle_deg,
+                                            g.geom_pixel, g.has_geom_pixel, q, pose);
+                if (!pe.ok)
+                    return false;
+                cost += pe.cost;
+                q = pe.q_place;
+                pose = pe.end_pose;
+            }
+            out_cost = cost;
+            return true;
+        };
+
+        const double eps = 1e-6;
+        const double budget_s = std::max(0.0, two_opt_max_ms_ / 1000.0);
+        const ros::WallTime t_start = ros::WallTime::now();
+        auto timeUp = [&]() { return (ros::WallTime::now() - t_start).toSec() >= budget_s; };
+
+        const double cost_before = pref[n].cost;
+        int moves = 0;
+        bool improved = true;
+        // 首次改善即接受（accept-first）：接受后 rebuildPrefix 刷新缓存并重启扫描，直到无改善或超时。
+        while (improved && !timeUp())
+        {
+            improved = false;
+            // 2-opt：反转子段 [i..j]（DAG 合法性由 validate 统一判：段内含优先对即非法）。
+            for (int i = 0; i < n - 1 && !improved; ++i)
+            {
+                for (int j = i + 1; j < n; ++j)
+                {
+                    if (timeUp())
+                        break;
+                    std::vector<int> cand = perm;
+                    std::reverse(cand.begin() + i, cand.begin() + j + 1);
+                    if (!validate(cand))
+                        continue;
+                    double c;
+                    if (evalCand(cand, c) && c + eps < pref[n].cost)
+                    {
+                        perm.swap(cand);
+                        rebuildPrefix();
+                        ++moves;
+                        improved = true;
+                        break;
+                    }
+                }
+            }
+            if (improved)
+                continue;
+            // or-opt：把长度 L(1..3) 的连续段从位置 i 挪到位置 k 前。
+            for (int L = 1; L <= 3 && !improved; ++L)
+            {
+                for (int i = 0; i + L <= n && !improved; ++i)
+                {
+                    for (int k = 0; k <= n - L; ++k)
+                    {
+                        if (k >= i && k <= i + L)
+                            continue; // 原位/自重叠，跳过
+                        if (timeUp())
+                            break;
+                        std::vector<int> cand;
+                        cand.reserve(n);
+                        for (int t = 0; t < n; ++t)
+                            if (t < i || t >= i + L)
+                                cand.push_back(perm[t]);
+                        const int insert_at = (k > i) ? k - L : k; // 移除段后修正插入下标
+                        cand.insert(cand.begin() + insert_at, perm.begin() + i, perm.begin() + i + L);
+                        if (!validate(cand))
+                            continue;
+                        double c;
+                        if (evalCand(cand, c) && c + eps < pref[n].cost)
+                        {
+                            perm.swap(cand);
+                            rebuildPrefix();
+                            ++moves;
+                            improved = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (moves == 0)
+            return; // 无改善，保持 beam 原解
+        std::vector<TaskGoal> out;
+        out.reserve(n);
+        for (int t = 0; t < n; ++t)
+        {
+            TaskGoal g = base[perm[t]];
+            g.flip = (flips[t] != 0);
+            out.push_back(std::move(g));
+        }
+        goals.swap(out);
+        total_cost = pref[n].cost;
+        ROS_INFO("[PATH] 2-opt/or-opt refine: cost %.4f -> %.4f (%d move(s), %.0f/%.0f ms).",
+                 cost_before, total_cost, moves,
+                 (ros::WallTime::now() - t_start).toSec() * 1000.0, two_opt_max_ms_);
     }
 
     // XY 回退时的翻转选择：沿用旧 A/B 腕角 travel 启发式（不需 IK，仅 base-yaw）。
@@ -2159,6 +2447,70 @@ private:
                  n_goals, use_joint_cost_ ? "joint" : "xy");
     }
 
+    struct SolveOutcome
+    {
+        bool ok = false;       // 至少产出一个可执行任务（joint 模式非硬失败）
+        int placed = 0;        // 本次实际可执行任务数
+        bool complete = false; // 是否放满（placed >= 任务总数）
+    };
+
+    // J6 保余量势垒升挡重解：solve_once 在「当前成员 gain/beam 设定」下求解一次并「就地保留自身历史最优结果」，
+    // 返回本次 {是否可行, 放置数, 是否放满}。放满即停；否则逐挡加大 gain 与 beam 宽度重跑（拓宽搜索、加强留头寸），
+    // 直到放满或到 max_center_escalations_（+extra_levels）。gain=0（势垒关闭）时不升挡。
+    // start_gain_mult：本次起始势 gain 相对配置值的倍数（少杠杆场景如 K=1 候选可>1，即「一开始就上调一档」）；
+    // extra_levels：在 max_center_escalations_ 之外追加的挡数（少杠杆场景多给几挡搜头寸）。二者恒退回配置原值。
+    // 线程安全：成员(gain/beam)只在此处两次 solve_once 之间被改写；候选并行评估在 solve_once 内部，期间成员恒定。
+    template <typename SolveOnce>
+    bool escalateToPlaceAll(SolveOnce &&solve_once, double start_gain_mult = 1.0, int extra_levels = 0)
+    {
+        const double cfg_gain = wrist_center_penalty_s_per_rad2_; // 配置原值，退出时恢复
+        const int cfg_beam = reorder_beam_width_;
+        const double base_gain = cfg_gain * std::max(1.0, start_gain_mult); // 本次起始势（可为少杠杆场景上调一档）
+        const int levels = (base_gain > 0.0) ? std::max(0, max_center_escalations_ + std::max(0, extra_levels)) : 0;
+        const double beam_mult = std::max(1.0, beam_escalation_mult_);
+        const ros::WallTime t_start = ros::WallTime::now();
+        bool any_ok = false, completed = false;
+        int best_placed = 0;
+        for (int lvl = 0; lvl <= levels; ++lvl)
+        {
+            // 挡间墙钟预算：跑满一挡后若累计已超预算，则停在当前最优（不含 lvl 0，保证至少求解一次）。
+            if (lvl > 0 && center_escalation_budget_s_ > 0.0 &&
+                (ros::WallTime::now() - t_start).toSec() >= center_escalation_budget_s_)
+            {
+                ROS_WARN("[PATH] center-escalation time budget %.1fs reached after lvl %d; stopping (best places %d).",
+                         center_escalation_budget_s_, lvl - 1, best_placed);
+                break;
+            }
+            // lvl 0 用起始势 base_gain；其后 gain 逐挡加大（饱和无害），beam 几何加宽（真正的完备性杠杆）。
+            // start_gain_mult=1 且 lvl 0 时即配置原值 gain/beam（向后兼容）。
+            wrist_center_penalty_s_per_rad2_ = (lvl == 0)
+                ? base_gain
+                : base_gain * std::pow(std::max(1.0, center_escalation_factor_), lvl);
+            reorder_beam_width_ = std::max(1, static_cast<int>(std::lround(cfg_beam * std::pow(beam_mult, lvl))));
+            if (lvl > 0)
+                ROS_WARN("[PATH] center-escalation lvl %d/%d: gain=%.0f beam=%d (retry to place all).",
+                         lvl, levels, wrist_center_penalty_s_per_rad2_, reorder_beam_width_);
+            SolveOutcome o = solve_once();
+            if (o.ok)
+            {
+                any_ok = true;
+                best_placed = std::max(best_placed, o.placed);
+            }
+            if (o.ok && o.complete)
+            {
+                completed = true;
+                break;
+            }
+        }
+        wrist_center_penalty_s_per_rad2_ = cfg_gain; // 恢复配置原值，避免升挡/上调状态泄漏到下一次规划
+        reorder_beam_width_ = cfg_beam;
+        if (any_ok && !completed && levels > 0)
+            ROS_WARN("[PATH] center-escalation exhausted (%d level(s)): best places %d task(s); remaining appear "
+                     "J6-infeasible (likely physical wrist limit). Publishing best-effort plan.",
+                     levels, best_placed);
+        return any_ok;
+    }
+
     void planCallback(const std_msgs::Int32MultiArray::ConstPtr &msg)
     {
         if (msg->data.empty())
@@ -2179,12 +2531,33 @@ private:
 
         if (optimize_order_)
         {
-            double cost = 0.0;
-            if (!optimizePlan(goals, cost))
+            const std::vector<TaskGoal> orig = goals; // optimizePlan 就地重排/截断，每挡需从原始计划重解
+            const int target = static_cast<int>(orig.size());
+            std::vector<TaskGoal> best_goals;
+            double best_cost = 0.0;
+            int best_placed = -1;
+            bool have = false;
+            bool any = escalateToPlaceAll([&]() -> SolveOutcome {
+                std::vector<TaskGoal> trial = orig;
+                double c = 0.0;
+                if (!optimizePlan(trial, c))
+                    return {false, 0, false};
+                const int placed = static_cast<int>(trial.size());
+                if (!have || placed > best_placed || (placed == best_placed && c < best_cost))
+                {
+                    have = true;
+                    best_placed = placed;
+                    best_cost = c;
+                    best_goals = std::move(trial);
+                }
+                return {true, placed, placed >= target};
+            });
+            if (!any || !have)
             {
                 ROS_ERROR("[PATH] Plan ABORTED (J6 infeasible). No MotionPlan published; awaiting re-plan.");
                 return; // fail-stop：不发布任何计划，控制器保持空闲，等待重规划
             }
+            goals = std::move(best_goals);
         }
         else
             assignFlipsByYaw(goals); // 不重排也要定翻转（用 yaw 启发式，不跟踪关节序列）
@@ -2244,77 +2617,113 @@ private:
             int total = 0;
             int stride = 0;
         };
-        std::vector<Eval> evals(raw_plans.size());
+        const int M = static_cast<int>(raw_plans.size());
 
-        auto work = [&](int k)
-        {
-            Eval &e = evals[k];
-            std::vector<TaskGoal> goals;
-            int total = 0, stride = 0;
-            if (!parseGoals(raw_plans[k], goals, total, stride))
-                return;
-            double cost = 0.0;
-            if (optimize_order_)
+        // 跨挡保留的最优候选（best-effort）：放置数最多、平局取运动代价小。
+        std::vector<TaskGoal> best_goals;
+        int best_total = 0, best_stride = 0;
+        double best_cost = std::numeric_limits<double>::max();
+        int best_placed = -1;
+        bool have = false;
+
+        // 少杠杆场景（K=1 候选，多为进阶模式的单一确定解——保序、无候选择优，只剩翻转/换块可给 J6 让路）：
+        // 自动上调一档——起始势 gain ×center_escalation_factor_、额外多给 single_candidate_extra_escalations_ 挡。
+        const bool few_lever = single_candidate_center_boost_ && optimize_order_ && M == 1;
+        const double start_gain_mult = few_lever ? std::max(1.0, center_escalation_factor_) : 1.0;
+        const int extra_levels = few_lever ? std::max(0, single_candidate_extra_escalations_) : 0;
+        if (few_lever)
+            ROS_INFO("[PATH] single-candidate (K=1) J6 headroom boost: start gain x%.1f, +%d escalation level(s).",
+                     start_gain_mult, extra_levels);
+
+        // 每挡：并行(或串行)评估全部候选 → 本挡择优。escalateToPlaceAll 在丢块时逐挡加大势 gain/beam 重跑。
+        // work 内的 optimizePlan/evalPairJoint 只只读势垒成员；成员只在两挡之间(无并行任务时)被改写，故线程安全。
+        bool any = escalateToPlaceAll([&]() -> SolveOutcome {
+            std::vector<Eval> evals(raw_plans.size());
+            auto work = [&](int k)
             {
-                if (!optimizePlan(goals, cost))
-                    return; // 该候选整体 J6 不可行（连首任务都不行），淘汰
+                Eval &e = evals[k];
+                std::vector<TaskGoal> goals;
+                int total = 0, stride = 0;
+                if (!parseGoals(raw_plans[k], goals, total, stride))
+                    return;
+                double cost = 0.0;
+                if (optimize_order_)
+                {
+                    if (!optimizePlan(goals, cost))
+                        return; // 该候选整体 J6 不可行（连首任务都不行），淘汰
+                }
+                else
+                {
+                    assignFlipsByYaw(goals);
+                    cost = 0.0; // 无重排/代价：所有候选并列，取第一个可行
+                }
+                e.ok = true;
+                e.cost = cost;
+                e.placed = static_cast<int>(goals.size()); // 可能因保险前缀 < 原任务数
+                e.goals = std::move(goals);
+                e.total = total;
+                e.stride = stride;
+            };
+
+            if (parallel_candidate_eval_ && M > 1)
+            {
+                std::vector<std::future<void>> futs;
+                futs.reserve(M);
+                for (int k = 0; k < M; ++k)
+                    futs.push_back(std::async(std::launch::async, work, k));
+                for (auto &f : futs)
+                    f.get();
             }
             else
             {
-                assignFlipsByYaw(goals);
-                cost = 0.0; // 无重排/代价：所有候选并列，取第一个可行
+                for (int k = 0; k < M; ++k)
+                    work(k);
             }
-            e.ok = true;
-            e.cost = cost;
-            e.placed = static_cast<int>(goals.size()); // 可能因保险前缀 < 原任务数
-            e.goals = std::move(goals);
-            e.total = total;
-            e.stride = stride;
-        };
 
-        const int M = static_cast<int>(raw_plans.size());
-        if (parallel_candidate_eval_ && M > 1)
-        {
-            std::vector<std::future<void>> futs;
-            futs.reserve(M);
+            // 本挡择优：先比可执行任务数（保险截断后越多越好），同数再比运动代价（越小越好）。
+            int bk = -1;
+            double bc = std::numeric_limits<double>::max();
+            int bp = -1;
+            int feasible = 0;
             for (int k = 0; k < M; ++k)
-                futs.push_back(std::async(std::launch::async, work, k));
-            for (auto &f : futs)
-                f.get();
-        }
-        else
-        {
-            for (int k = 0; k < M; ++k)
-                work(k);
-        }
-
-        // 择优：先比可执行任务数（保险截断后越多越好），同数再比运动代价（越小越好）。
-        int best = -1;
-        double best_cost = std::numeric_limits<double>::max();
-        int best_placed = -1;
-        int feasible = 0;
-        for (int k = 0; k < M; ++k)
-        {
-            if (!evals[k].ok)
-                continue;
-            ++feasible;
-            if (evals[k].placed > best_placed ||
-                (evals[k].placed == best_placed && evals[k].cost < best_cost))
             {
-                best_placed = evals[k].placed;
-                best_cost = evals[k].cost;
-                best = k;
+                if (!evals[k].ok)
+                    continue;
+                ++feasible;
+                if (evals[k].placed > bp || (evals[k].placed == bp && evals[k].cost < bc))
+                {
+                    bp = evals[k].placed;
+                    bc = evals[k].cost;
+                    bk = k;
+                }
             }
-        }
-        if (best < 0)
+            if (bk < 0)
+                return {false, 0, false};
+
+            const int win_placed = evals[bk].placed;
+            const int win_total = evals[bk].total;
+            const double win_cost = evals[bk].cost;
+            ROS_INFO("[PATH] Candidate selection: %d/%d feasible; chose #%d placed=%d/%d cost=%.4f (%s cost).",
+                     feasible, M, bk, win_placed, win_total, win_cost, use_joint_cost_ ? "joint" : "xy");
+
+            if (!have || win_placed > best_placed || (win_placed == best_placed && win_cost < best_cost))
+            {
+                have = true;
+                best_placed = win_placed;
+                best_cost = win_cost;
+                best_total = win_total;
+                best_stride = evals[bk].stride;
+                best_goals = std::move(evals[bk].goals);
+            }
+            return {true, win_placed, win_placed >= win_total};
+        }, start_gain_mult, extra_levels);
+
+        if (!any || !have)
         {
             ROS_ERROR("[PATH] All %d candidate plan(s) infeasible (J6). No MotionPlan published; awaiting re-plan.", M);
             return;
         }
-
-        ROS_INFO("[PATH] Candidate selection: %d/%d feasible; chose #%d placed=%d cost=%.4f (%s cost).",
-                 feasible, M, best, best_placed, best_cost, use_joint_cost_ ? "joint" : "xy");
-        buildAndPublishMotion(evals[best].goals, evals[best].total, evals[best].stride);
+        buildAndPublishMotion(best_goals, best_total, best_stride);
     }
 };
 

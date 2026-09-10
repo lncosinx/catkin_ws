@@ -76,6 +76,7 @@ public:
 
         plan_sub_ = nh_.subscribe(plan_topic_, 1, &XarmTetrisController::planCallback, this);
         continue_sub_ = nh_.subscribe(debug_continue_topic_, 1, &XarmTetrisController::continueCallback, this);
+        ready_sub_ = nh_.subscribe(ready_topic_, 1, &XarmTetrisController::readyCallback, this);
         status_pub_ = nh_.advertise<std_msgs::Bool>(status_topic_, 1, true);
         publishBusy(false);
 
@@ -83,6 +84,9 @@ public:
 
         ROS_INFO("[CTRL] PURE EXECUTOR ready: in=%s, hover from plan, max_tasks=%d",
                  plan_topic_.c_str(), max_tasks_per_plan_);
+        ROS_INFO("[CTRL] ready gate: %s (topic=%s)",
+                 require_ready_ ? "ON — will wait for run=true before executing" : "OFF (execute on plan)",
+                 ready_topic_.c_str());
         if (debug_step_)
             ROS_WARN("[CTRL] DEBUG STEP MODE ON: pauses at pick_hover/pick/place_hover/place. "
                      "Continue with: rostopic pub -1 %s std_msgs/Empty \"{}\"",
@@ -105,6 +109,7 @@ private:
     enum class State
     {
         IDLE,
+        WAIT_FOR_READY,
         TAKE_NEXT_TASK,
         MOVE_TO_PICK_HOVER,
         EXECUTE_PICK,
@@ -118,6 +123,7 @@ private:
     ros::Subscriber plan_sub_;
     ros::Subscriber robot_state_sub_;
     ros::Subscriber continue_sub_;
+    ros::Subscriber ready_sub_;
     ros::Publisher status_pub_;
     ros::Timer control_timer_;
 
@@ -173,6 +179,14 @@ private:
     bool debug_step_ = false;
     std::string debug_continue_topic_ = "/xarm_controller/continue";
     std::atomic<bool> continue_requested_{false};
+
+    // /ready 执行门闸：所有准备工作就绪后，外部在 /ready 发布 Bool(run=true) 才允许开始执行已排队的
+    // 计划。run=false 关闸（仅阻止启动新计划，不打断进行中的动作）。require_ready_=false 可整体旁路，
+    // 保持旧的“收到计划即执行”行为（供不发布 /ready 的测试 launch 使用）。run_gate_ 由 spinner 线程
+    // 写、控制线程读，用 atomic。
+    bool require_ready_ = true;
+    std::string ready_topic_ = "/ready";
+    std::atomic<bool> run_gate_{false};
 
     bool robot_state_ready_ = false;
     std::vector<float> native_pose_{0, 0, 0, 3.14159f, 0, 0};
@@ -237,6 +251,8 @@ private:
 
         pnh_.param("debug_step", debug_step_, debug_step_);
         pnh_.param("debug_continue_topic", debug_continue_topic_, debug_continue_topic_);
+        pnh_.param("require_ready", require_ready_, require_ready_);
+        pnh_.param("ready_topic", ready_topic_, ready_topic_);
         pnh_.param("suction_io_num", suction_io_num_, suction_io_num_);
         pnh_.param("suction_on_wait", suction_on_wait_, suction_on_wait_);
         pnh_.param("suction_off_wait", suction_off_wait_, suction_off_wait_);
@@ -269,6 +285,18 @@ private:
     void continueCallback(const std_msgs::Empty::ConstPtr &)
     {
         continue_requested_ = true;
+    }
+
+    // /ready 执行门闸回调：外部准备就绪后发布 run=true 开闸，run=false 关闸。仅置位原子标志，
+    // 实际的状态推进由控制线程在 WAIT_FOR_READY 状态轮询完成（不跨线程直接改 state_）。
+    void readyCallback(const std_msgs::Bool::ConstPtr &msg)
+    {
+        const bool prev = run_gate_.exchange(msg->data);
+        if (msg->data && !prev)
+            ROS_INFO("[CTRL] /ready run=true: execution gate OPEN.");
+        else if (!msg->data && prev)
+            ROS_WARN("[CTRL] /ready run=false: execution gate CLOSED (won't start new plans; "
+                     "in-progress task keeps running).");
     }
 
     // Debug 单步：到达某路点后暂停，直到用户在 continue 话题发一条消息才返回。
@@ -331,7 +359,16 @@ private:
         if (!tasks_.empty())
         {
             publishBusy(true);
-            state_ = State::TAKE_NEXT_TASK;
+            if (!require_ready_ || run_gate_.load())
+            {
+                state_ = State::TAKE_NEXT_TASK;
+            }
+            else
+            {
+                ROS_INFO("[CTRL] Plan queued; holding until /ready publishes run=true on %s.",
+                         ready_topic_.c_str());
+                state_ = State::WAIT_FOR_READY;
+            }
         }
     }
 
@@ -515,6 +552,24 @@ private:
         switch (state_)
         {
         case State::IDLE:
+            return;
+
+        case State::WAIT_FOR_READY:
+            if (tasks_.empty())
+            {
+                publishBusy(false);
+                state_ = State::IDLE;
+                return;
+            }
+            if (!require_ready_ || run_gate_.load())
+            {
+                ROS_INFO("[CTRL] Ready gate open; starting execution of queued plan.");
+                state_ = State::TAKE_NEXT_TASK;
+            }
+            else
+            {
+                ROS_INFO_THROTTLE(5.0, "[CTRL] Waiting for /ready run=true on %s ...", ready_topic_.c_str());
+            }
             return;
 
         case State::TAKE_NEXT_TASK:

@@ -7,9 +7,9 @@
     <arg name="place_z_extra_margin" default="0.005" />
     <!-- 视觉实现: vision_processor_node_cpp (经典轮廓+模板) 或
          vision_processor_node_dexined (神经网络边缘检测) -->
-    <arg name="vision_node" default="vision_processor_node_cpp" />
+    <arg name="vision_node" default="vision_processor_node_dexined" />
     <!-- 进阶任务模式: true 则策略按 shape_sequence 求解(详见 strategy_node) -->
-    <arg name="advanced_mode" default="true" />
+    <arg name="advanced_mode" default="false" />
     <!-- 非进阶任务: 策略节点保留的同分最优候选布局数(>1 时由 path_planner 按关节运动代价择优)。
          1=旧行为(单解直发)。 roslaunch lucky lucky.launch num_candidates:=10 -->
     <arg name="num_candidates" default="8" />
@@ -78,7 +78,7 @@
     <arg name="min_template_iou" default="0.75" /><!-- 收回正常值:挡掉粘连大blob/边缘错配(之前0.25是放块的临时档) -->
      <!--  启动后加载固定曝光/白平衡（camera_config 里调好的，避免每次手调）。 -->
     <node pkg="dynamic_reconfigure" type="dynparam" name="load_rgb_cfg" output="screen"
-          args="load /camera/rgb_camera $(find lucky)/config/camera_config_1.yaml"
+          args="load /camera/rgb_camera $(find lucky)/config/camera_config.yaml"
           launch-prefix="bash -c 'sleep 6; exec $0 $@'" />
     <!-- 7. 视觉节点 -->
     <node pkg="lucky" type="$(arg vision_node)" name="vision_processor_node" output="screen">
@@ -97,10 +97,15 @@
         <rosparam param="distance_pick_shapes">[3, 4]</rosparam>
 
         <!-- ROI -->
-        <param name="roi_x_min" value="335" />
-        <param name="roi_y_min" value="88" />
-        <param name="roi_x_max" value="969" />
-        <param name="roi_y_max" value="711" />
+        <!-- <param name="roi_x_min" value="377" />
+        <param name="roi_y_min" value="37" />
+        <param name="roi_x_max" value="910" />
+        <param name="roi_y_max" value="524" /> -->
+
+        <param name="roi_x_min" value="362" />
+        <param name="roi_y_min" value="66" />
+        <param name="roi_x_max" value="930" />
+        <param name="roi_y_max" value="659" />
 
         <!-- 黑白分割 -->
         <param name="threshold_mode" value="otsu" />
@@ -188,22 +193,22 @@
          节点，单位 m/s = 此处 mm/s ÷ 1000)保持一致——代价模型用它作"关节饱和"门槛的 v_lin，两处不同则算错。
          注意：path_planner 的 omega_per_v_lin_rad_per_m 是"比值"，与线速度档位无关，改速度不用动它。 -->
     <param name="transit_speed_mm_s" value="500.0" />
-    <param name="transit_acc_mm_s2" value="2000.0" />
+    <param name="transit_acc_mm_s2" value="2500.0" />
     <param name="loaded_transit_speed_mm_s" value="500.0" />
-    <param name="loaded_transit_acc_mm_s2" value="2000.0" />
+    <param name="loaded_transit_acc_mm_s2" value="2500.0" />
     <param name="pick_down_speed_mm_s" value="500" />
-    <param name="pick_down_acc_mm_s2" value="2000" />
+    <param name="pick_down_acc_mm_s2" value="2500" />
     <param name="place_down_speed_mm_s" value="500" />
-    <param name="place_down_acc_mm_s2" value="2000" />
+    <param name="place_down_acc_mm_s2" value="2500" />
     <param name="lift_speed_mm_s" value="500" />
-    <param name="lift_acc_mm_s2" value="2000" />
+    <param name="lift_acc_mm_s2" value="2500" />
 
-    <param name="enable_place_shake" value="false" />
+    <param name="enable_place_shake" value="true" />
     <param name="place_shake_cycles" value="1" />
     <param name="place_shake_dx_m" value="0.005" />
     <param name="place_shake_dy_m" value="0.005" />
-    <param name="place_shake_speed_mm_s" value="100.0" />
-    <param name="place_shake_acc_mm_s2" value="5000.0" />
+    <param name="place_shake_speed_mm_s" value="1000.0" />
+    <param name="place_shake_acc_mm_s2" value="3000.0" />
     <!-- 激进 -->
     <!-- <param name="transit_speed_mm_s" value="1000.0" />
     <param name="transit_acc_mm_s2" value="50000.0" />
@@ -230,6 +235,9 @@
          rostopic pub -1 /xarm_controller/continue std_msgs/Empty "{}" 才继续。 -->
     <param name="debug_step" value="false" />
     <param name="debug_continue_topic" value="/xarm_controller/continue" />
+
+    <param name="require_ready" value="true" />
+    <param name="ready_topic" value="/ready" />
 
     <!-- First verify one block only -->
     <param name="max_tasks_per_plan" value="34" />
@@ -286,17 +294,41 @@
              规划失败、不发布、报错待重规划。
              wrist_soft_penalty_s_per_rad: 越软限位每 rad 的时间罚(秒尺度，压过真实时间差但仍有序)。
              tie_break_weight_s_per_rad: 平局次级项 Σ|Δq| 的极小权重(不饱和平局时偏好腕部少甩)。 -->
-        <param name="wrist_soft_limit_rad" value="4.7" />
-        <param name="wrist_hard_limit_rad" value="6.10" />
+        <param name="wrist_soft_limit_rad" value="3.7" />
+        <param name="wrist_hard_limit_rad" value="6.14" />
         <param name="wrist_soft_penalty_s_per_rad" value="1000.0" />
         <param name="tie_break_weight_s_per_rad" value="0.001" />
         <param name="transit_j6_samples" value="8" />
+        <!-- J6 保余量势垒 + 自动升挡重解(防"为省几秒翻转把腕部单向绕到边界、只放几个就卡限位"，放满优先)：
+             wrist_center_free_rad: 留白带(rad)。|J6| 在带内(≈±180°，正常抓放腕角)不加势、纯按翻转/时间择优。
+             wrist_center_penalty_s_per_rad2: 越出留白带的二次"保余量"势(s/rad²)，越靠硬限位越贵，逼搜索留头寸
+                    以放满全部方块。调大→更保守留头寸、更倾向放满；调小→更省翻转但更易绕到边界丢块；置 0 关闭。
+             升挡：某次求解丢块(放置数<总数)时，逐挡加大势 gain、并把 beam 宽度按倍率几何加宽重跑，取放置数最多
+                    者；只在物理(J6 硬限位)确实不可行时才丢块并日志报出 center-escalation exhausted。
+             center_escalation_budget_s: 升挡墙钟预算(秒)——真正的耗时闸门。挡间累计超此即停、留当前最优；
+                    与场上方块数(候选池大小)无关地兜住耗时。这里给 12s(可接受 10~20s)。0=不限，仅按挡数。
+             max_center_escalations: 升挡最大挡数(预算通常先触发；0=关闭升挡退回单次求解)。
+             center_escalation_factor: 每升一挡 gain 乘的倍数(升几挡即饱和)。
+             beam_escalation_mult: 每升一挡 beam 宽度的倍率(几何增长；beam 才是完备性真杠杆，故几何而非加法)。
+             reorder_beam_width: 重排/保序 beam 的基础宽度(第0挡；升挡时按 beam_escalation_mult 逐挡几何加宽)。 -->
+        <param name="wrist_center_free_rad" value="3.14159" />
+        <param name="wrist_center_penalty_s_per_rad2" value="40.0" />
+        <param name="reorder_beam_width" value="120" />
+        <param name="max_center_escalations" value="8" />
+        <param name="center_escalation_factor" value="3.0" />
+        <param name="beam_escalation_mult" value="2" />
+        <param name="center_escalation_budget_s" value="20.0" />
+        <!-- 少杠杆场景(K=1 候选，多为进阶模式的单一确定解——保序、无候选择优，只剩翻转/换块给 J6 让路)自动
+             上调一档：起始势 gain ×center_escalation_factor、并多给 single_candidate_extra_escalations 挡搜头寸。
+             single_candidate_center_boost=false 关闭该自动上调。 -->
+        <param name="single_candidate_center_boost" value="true" />
+        <param name="single_candidate_extra_escalations" value="1" />
         <param name="ik_selfcheck_tol_rad" value="0.05" />
 
         <param name="place_release_z_margin" value="0.006" />
         <!-- tcp_*_offset_z(波纹管补偿)默认从标定写入的 /tetris/TCP_*_OFFSET_Z 读取；
              如需手动覆盖，取消下面两行注释即可。 -->
-        <param name="tcp_pick_offset_z" value="0.012" />
+        <param name="tcp_pick_offset_z" value="0.01" />
         <param name="tcp_place_offset_z" value="0.0" />
         <param name="tcp_pick_offset_x" value="0.0" />
         <param name="tcp_pick_offset_y" value="0.0" />
@@ -354,14 +386,25 @@
         <param name="advanced_mode" value="$(arg advanced_mode)" />
         <!-- 进阶「峰值保持」：稳定后仍等识别数不再上升才发；等此秒数仍达不到峰值则用最优稳定帧兜底。 -->
         <param name="advanced_peak_max_wait_sec" value="10.0" />
+        <!-- 进阶新默认策略：分组(先放完一种形状的全部库存再到下一种)。set false 回退旧交错序列。 -->
+        <param name="seq_group_by_shape" value="true" />
+        <!-- 支撑口径：false(默认)=逐步支撑，每块放置当场即需支撑，分组求解序本身即先底后顶合法执行序
+             → 直接按分组发布、不重排，机器人真正"放完一种形状再到下一种"，真机不悬空。
+             true=终态支撑：允许中途悬空、其底由后续形状填(装填更自由)，但执行须按支撑 DAG 先底后顶
+             重排、会跨形状交错。 -->
+        <param name="seq_final_support" value="false" />
+        <!-- 分组求解束宽：默认 120 太小会明显欠搜索(满行数腰斩)。方案只算一次再执行，可用大束宽换分：
+             实测 600≈0.8s(8满行)、1200≈1.9s(此后基本到顶)。 -->
+        <param name="seq_beam_width" value="1200" />
+        <!-- 下列 3 项仅在 seq_group_by_shape=false(旧交错模式)生效；分组模式忽略 cyclic/require_support，
+             且恒关闭四色加分(seq_reward_four_colors)。 -->
         <param name="seq_cyclic" value="true" />
         <param name="seq_require_support" value="true" />
-        <!-- 满行且≥4色额外加分(竞赛规则②)。默认 false：实际比赛可能没有此约束，
-             开启时设 true -->
         <param name="seq_reward_four_colors" value="false" />
-        <rosparam param="shape_sequence">[2,3,5,6,4,0,1]</rosparam>
+        <!-- 分组模式：shape_sequence 作为形状完成顺序(去重取首次出现)，每种放满其库存/pick_limit。 -->
+        <rosparam param="shape_sequence">[3,6,2,1,4,0,5]</rosparam>
         <!-- 可选：每种形状“可吸取上限”，长度 7 对应形状 id；<0=不限制(默认)。
              例：场上有 4 个 id=0 但只允许吸 2 个 -> [2,-1,-1,-1,-1,-1,-1]。缺省整行删掉。 -->
-        <rosparam param="shape_pick_limits">[4,4,2,1,5,4,5]</rosparam>
+        <rosparam param="shape_pick_limits">[-1,-1,-1,-1,-1,-1,-1]</rosparam>
     </node>
 </launch>

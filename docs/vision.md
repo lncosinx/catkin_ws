@@ -1,275 +1,324 @@
-# 视觉模块说明
+# 视觉感知子系统技术文档（vision_processor_node）
 
-本文档介绍 `lucky` 的视觉感知子系统：它在背光板上识别黑色/彩色的多联骨牌
-（俄罗斯方块），分类形状、估计朝向、确定抓取点，并把库存与逐块信息发布给
-策略节点。
+本文档从**数据处理**角度说明 `lucky` 视觉节点：输入一帧彩色图，经过哪些步骤、每
+步用什么方法、方法的**数学原理与公式**是什么，最终输出库存计数与逐块抓取信息给策
+略节点。
 
-参考文件：
-- 启动：[test_vision.launch](../src/lucky/launch/test_vision.launch)
+参考代码：
+- DexiNed 实现（生产默认）：[vision_processor_node_dexined.cpp](../src/lucky/src/vision_processor_node_dexined.cpp)
 - 经典实现：[vision_processor_node.cpp](../src/lucky/src/vision_processor_node.cpp)
-- DexiNed 实现：[vision_processor_node_dexined.cpp](../src/lucky/src/vision_processor_node_dexined.cpp)
+- 共享深度采样器：[include/lucky/depth_sampler.hpp](../src/lucky/include/lucky/depth_sampler.hpp)
+- 启动：[test_vision.launch](../src/lucky/launch/test_vision.launch)
+
+> 检测对象是**彩色**多联骨牌（红/橙/棕/紫/黄/蓝/绿），不是黑色。
 
 ---
 
-## 1. 两套实现，一份契约
+## 0. 数据流总览
 
-视觉节点有两个可互换的 C++ 实现，**话题 / 消息 / 服务契约完全一致**，只在
-“如何从图像里分割出方块前景”这一步不同：
-
-| 节点（`type=`）                  | 分割方式                                | 何时用 |
-|----------------------------------|-----------------------------------------|--------|
-| `vision_processor_node_cpp`      | 经典：灰度阈值（OTSU/自适应/手动）+ 形态学 | 纯黑块、对比度好、无 GPU |
-| `vision_processor_node_dexined`  | DexiNed ONNX（CUDA）边缘 + Lab 颜色边界切割 | 彩色块、贴碰块多、有 GPU（生产默认） |
-
-在 launch 里用 `vision_node:=...` 切换：
-
-```bash
-roslaunch lucky test_vision.launch vision_node:=vision_processor_node_dexined
+```
+彩色图 I(x,y)∈ℝ^{H×W×3}
+   │
+   ▼ [1] 预处理          缩放 / 灰度 / 高斯模糊 / EMA / 发光板掩膜
+   ▼ [2] 前景分割        DexiNed 边缘 + Lab 颜色边界切割 → 二值前景 M_fg
+   ▼ [3] 轮廓提取        findContours + 面积/填充率过滤 → {C_i}
+   ▼ [4] 模板匹配分类    归一化 + IoU/Chamfer/签名/网格 加权 → (shape, angle, score)
+   ▼ [5] 抓取点+朝向     质心/距离变换 + 主轴/有向轴
+   ▼ [5.5] 同帧 NMS      质心去重
+   ▼ [6] 跨帧跟踪/稳定   循环均值 + 抖动标准差门控
+   ▼ [7] 深度采样        对齐深度中值 + 反投影（debug 通路）
+   ▼ 发布 /vision/board_state
 ```
 
-> 两个实现各配一套相机曝光/色彩档：DexiNed 用 `camera_config.yaml`、经典用
-> `camer_config_1.yaml`。**切换实现时相机档也要一并换**，详见 [§5.0](#50-两套曝光色彩档按视觉实现配对)。
+两套实现（DexiNed / 经典）**只有步骤 2 不同**，其余共用。生产用 DexiNed 版，下文以它
+为主，经典分割在 §2.4 单列。
 
-形状 ID 是跨节点共享的硬契约（见 `SHAPE_NAMES` / `BASE_SHAPES`）：
-`0` 一字、`1` 田、`2` T、`3` L_left、`4` L_right、`5` Z_left、`6` Z_right。
-改这个枚举必须同步 `strategy_node.cpp`、Python 视觉节点等所有使用方。
+形状 ID 契约（跨节点共享）：`0` 一字、`1` 田、`2` T、`3` L 左、`4` L 右、`5` Z 左、
+`6` Z 右。
 
 ---
 
-## 2. 数据流水线
+## 1. 步骤 1 — 预处理
 
-两个实现的整体管线相同，差别仅在步骤 2 的“前景分割”：
+### 1.1 缩放
+按 `scale_percent` 用 `INTER_AREA`（区域平均）下采样，缩放因子 $s=\text{scale\_percent}/100$。
+区域插值输出像素是源区域的面积加权均值，等价于抗混叠的降采样：
 
-```
-彩色图(image_raw/rect) ──▶ [1 预处理] ──▶ [2 前景分割] ──▶ [3 轮廓提取]
-                                                                  │
-                       ┌──────────────────────────────────────────┘
-                       ▼
-   [4 模板匹配分类] ──▶ [5 抓取点+朝向] ──▶ [6 跨帧跟踪/稳定] ──▶ [7 发布]
-                                              │
-                          对齐深度采样抓取点 Z ┘（仅 debug 通路）
-```
+$$I'(x,y)=\frac{1}{|R|}\sum_{(p,q)\in R}I(p,q)$$
 
-### 步骤 1 — 预处理
-- 可选缩放 `scale_percent`，按 `roi_*` 裁出 ROI（避开画面边缘干扰）。
-- 转灰度 + 高斯模糊（`blur_kernel`）。
-- **发光板掩码**（`use_lightboard_mask`）：对灰度做 OTSU 取最大连通域，得到背光板
-  区域；后续前景与之相交，挡掉板外的反光/手/边框。`lightboard_*` 控制形态学与
-  最小面积比。
-- DexiNed 版还可选 **输入帧时间平均**（`temporal_alpha`，EMA）：静止料堆下抑制
-  传感器噪声与背光闪烁，越小越稳但越滞后，0=关闭。
+其中 $R$ 是目标像素反投影回源图覆盖的矩形区域。之后按 `roi_*` 裁出感兴趣区，避开画
+面边缘干扰。所有像素坐标最后乘 $s^{-1}$ 还原到原图尺度。
 
-### 步骤 2 — 前景分割（两版分歧点）
+### 1.2 灰度化
+`COLOR_BGR2GRAY` 按 ITU-R BT.601 亮度加权：
 
-**经典版**（`vision_processor_node.cpp`，`process_foreground`）：
-1. 灰度阈值取暗色前景：`threshold_mode` = `otsu` / `adaptive` / 手动
-   (`manual_dark_threshold`)。
-2. 可选 **饱和度前景**（`use_saturation_foreground`）：用 HSV 的 S/V 抓彩色块
-   （含偏亮的红/黄），并到暗阈值结果上，避免灰度暗阈值漏掉彩色块。
-3. 与发光板掩码相交 → 形态学闭/开（`close_kernel` / `open_kernel`）→ Canny 出边缘。
+$$Y = 0.299\,R + 0.587\,G + 0.114\,B$$
 
-**DexiNed 版**（`vision_processor_node_dexined.cpp`）：
-1. 初始化时把 `dexined.onnx` 强制加载到 **CUDA** 后端（失败则回退经典分支）。
-2. 每帧把 ROI（pad 到 16 的倍数、扣 ImageNet 均值）送 `dexined_net_.forward()`，
-   得边缘热力图并归一化到 0–255。
-3. 前景 = 灰度 OTSU 暗块 ∪ HSV 高饱和彩色块。
-4. **切割贴碰块**的核心是 **Lab 颜色边界**：对 Lab 的 a、b 通道做形态学梯度取
-   `max` 作为切割线（`color_edge_thresh`）。块内均匀色无 a/b 梯度→不内切；眩光只
-   改亮度 L→对 a/b 免疫；异色块边界色度突变→切开。
-5. 可选 `use_dexined_for_split` 把高阈值 DexiNed 强边或上来，专补**同色**贴碰块
-   （颜色无边界处）。
-6. `color_edge_min_area` 按连通域面积滤掉掉漆/划痕产生的零碎短边，避免把单块切碎。
-7. 前景减去（加粗后的）颜色边界 → 得到彼此分开的前景掩码。
-   `debug_edges` 显示的就是这条颜色边界。
+### 1.3 高斯模糊
+用 `blur_kernel`（强制奇数 $k$）做高斯卷积 $I_b = I * G_\sigma$，二维高斯核
 
-> 注意：DexiNed 版的 `dexined_thresh` 现在只参与“同色切割”与 debug，主切割已改走
-> 颜色边界；纯黑白竞赛场景可设 `use_dexined_for_split:=false` 走纯颜色（最稳）。
+$$G_\sigma(x,y)=\frac{1}{2\pi\sigma^2}\exp\!\left(-\frac{x^2+y^2}{2\sigma^2}\right)$$
 
-### 步骤 3 — 轮廓提取与过滤
-对前景掩码 `findContours`，按面积（`min_area` / `max_area`）、bbox 填充率
-（`min/max_contour_fill_ratio`）、最小宽高过滤掉噪声与粘连大 blob。
+当传入 $\sigma=0$，OpenCV 由核宽推算 $\sigma = 0.3\big((k-1)\cdot 0.5 - 1\big)+0.8$。作用是压
+高频传感器噪声，稳定后续阈值/边缘。
 
-### 步骤 4 — 模板匹配分类（`TemplateBank`）
-- 启动时为 7 个形状 × 360° 预渲染二值模板（`template_size`，
-  `template_angle_step` 粗扫 + `template_refine_step` 细化）。
-- 每个候选轮廓归一化后与模板库匹配，综合多项打分：硬/软 IoU、Chamfer 距离、
-  4×4 与 8×8 网格占用签名；L 形额外用逐格占用模式分（`l_cell_pattern_score`）。
-- 返回 `(shape_id, angle, score)`；`score < min_template_iou` 的候选丢弃。
-- 匹配前可用 `poly_approx_eps_ratio` 对轮廓做多边形近似，拉直分割留下的波纹边，
-  提高分类准度（DexiNed 版）。
+### 1.4 时间平均（EMA，仅 DexiNed 版）
+静止料堆下对连续帧做指数滑动平均，抑制背光闪烁与传感器噪声：
 
-### 步骤 5 — 抓取点与朝向
-- **抓取点**（`pick_point_mode`）：`centroid` 用质心；`distance` 用距离变换的内点
-  （最大内切圆心，远离边缘，吸盘更稳）；`hybrid` 仅对 `distance_pick_shapes`
-  （默认 L_left/L_right）用距离变换、其余用质心。
-- **朝向**：模板角给出基础朝向；可选 `use_contour_axis_yaw` 用轮廓主轴
-  （minAreaRect / Hough 直线）细化，并按形状做**有向**判定（T/L/Z 各有专门的
-  `directed_*_axis_angle` 函数定出 0–360° 的唯一方向）。
-- `publish_angle_in_table_frame` 控制把图像角投影成桌面/board 系偏航再发布（需要
-  相机→`table_frame` 的 TF；该 TF 已弃用，默认 `link_base`，仅 debug/PoseArray 用，
-  `board_state` 不依赖）。
+$$\bar I_t = (1-\alpha)\,\bar I_{t-1} + \alpha\,I_t,\qquad \alpha=\texttt{temporal\_alpha}\in(0,1)$$
 
-### 步骤 5.5 — 同帧 NMS（仅 DexiNed 版）
-分割过切可能让一个块出多个框。按分数降序贪心，质心距小于
-`nms_center_dist_px` 的视为同块、只留高分。
+$\alpha$ 越小越稳但越滞后（等效时间常数 $\tau\approx 1/\alpha$ 帧）；$\alpha=0$ 关闭。
 
-### 步骤 6 — 跨帧跟踪与稳定（`BlockTrack`）
-- 用像素/桌面坐标 + 形状把检测关联到历史轨迹（`track_match_gate_px/m`），
-  保留 `track_history_len` 帧历史。
-- 形状按周期对角度取循环均值（田 90°、一字/Z 180°、其余 360°）。
-- 仅当轨迹**稳定**才发布（`publish_only_stable`）：帧数 ≥ `stable_min_frames`、
-  位置抖动 ≤ `stable_max_px_std`、角度抖动 ≤ `stable_max_angle_std_deg`。
-- `stable_publish_max_missed` 允许已稳定的边缘块偶尔漏检仍保持发布，稳住库存计数；
-  `max_missed_frames` 后彻底删除轨迹。
+### 1.5 发光板掩膜
+只在背光板区域内检测，挡掉板外反光/手/边框。方法：对灰度图做 **Otsu 二值化** →
+形态学闭+开 → 取**最大连通域** → 腐蚀收边。
 
-### 步骤 7 — 深度抓取 Z（debug 通路）
-`use_depth_pick_z` 开启时，订阅对齐深度
-（`/camera/aligned_depth_to_color/image_raw`），在抓取点采样相机系 Z（米），
-半径 `depth_sample_radius_px`。检测像素是 rect 坐标、对齐深度在 raw 彩色坐标，
-采样前用 `rectified_to_raw` 映射回去（`depth_sample_in_raw_color`）。
-目前仅打 log + 发 `/vision/pick_depth_debug`，**尚未写入 board_state**。
+**Otsu 阈值**（类间方差最大化）：设灰度直方图归一化为概率 $p(i)$，阈值 $t$ 把像素分
+成两类，类概率与类均值
+
+$$\omega_0(t)=\sum_{i\le t}p(i),\quad \omega_1(t)=1-\omega_0(t),\quad
+\mu_k(t)=\frac{1}{\omega_k}\sum_{i\in \text{class }k} i\,p(i)$$
+
+Otsu 取使类间方差最大的 $t^*$：
+
+$$t^*=\arg\max_t\ \sigma_B^2(t),\qquad \sigma_B^2(t)=\omega_0(t)\,\omega_1(t)\,\big(\mu_0(t)-\mu_1(t)\big)^2$$
+
+**形态学**闭运算 $I\bullet B=(I\oplus B)\ominus B$ 填小洞、开运算 $I\circ B=(I\ominus
+B)\oplus B$ 去小刺，其中膨胀 $\oplus$、腐蚀 $\ominus$ 为
+
+$$(I\oplus B)(x)=\max_{b\in B}I(x-b),\qquad (I\ominus B)(x)=\min_{b\in B}I(x-b)$$
+
+**最大连通域**：8-邻接连通标注后保留面积占比 $\ge$ `lightboard_min_area_ratio` 的最
+大分量，得到干净的发光板 ROI 掩膜 $M_\text{board}$。
 
 ---
 
-## 3. 输出话题与契约
+## 2. 步骤 2 — 前景分割（DexiNed 版）
+
+目标：从 ROI 里分出**彼此分开**的方块前景 $M_\text{fg}$。难点是贴碰在一起的异色块要切
+开、块内眩光/掉漆不能误切。方法是「暗/彩前景」**减去**「Lab 颜色边界切割线」。
+
+### 2.1 DexiNed 神经网络边缘
+DexiNed 是一个全卷积边缘检测 CNN（ONNX，强制 CUDA 后端）。预处理：ROI 尺寸 pad 到
+16 的倍数，扣 ImageNet BGR 均值 $\mu=(103.939,116.779,123.68)$ 构造网络输入张量
+
+$$X = I_\text{roi} - \mu$$
+
+前向 $Y=f_\text{DexiNed}(X)$ 得边缘响应图，裁回 ROI 尺寸后**min–max 归一化**到 $[0,255]$：
+
+$$E(x,y)=255\cdot\frac{Y(x,y)-\min Y}{\max Y-\min Y}$$
+
+DexiNed 边逐帧会抖、且块内眩光处会产生假边，故**不直接**作主切割线（见 2.3）。
+
+### 2.2 前景掩膜（暗块 ∪ 彩色块）
+兼顾黑块与彩色块：
+
+- 暗块：灰度 Otsu 反二值 $M_\text{dark}=[\,\text{gray} < t^*_\text{otsu}\,]$。
+- 彩色块：转 HSV，取高饱和高明度像素 $M_\text{color}=[\,S>S_\text{min}\,]\wedge[\,V>V_\text{min}\,]$，
+  开运算去噪。
+
+$$M_\text{obj}=M_\text{dark}\ \cup\ M_\text{color}$$
+
+BGR→HSV：$V=\max(R,G,B)$，$S=(V-\min(R,G,B))/V$（$V>0$），色相 $H$ 由主导通道定义。
+
+### 2.3 Lab 颜色边界切割（核心）
+把 BGR 转 **CIE Lab**（$L$ 亮度、$a$ 绿-红、$b$ 蓝-黄色度）。对**色度通道** $a,b$ 各做
+**形态学梯度**取边缘强度，再取两者较大者作颜色边界：
+
+$$g_a=(a\oplus B_3)-(a\ominus B_3),\quad g_b=(b\oplus B_3)-(b\ominus B_3)$$
+$$E_\text{color}=\big[\ \max(g_a,g_b) > \texttt{color\_edge\_thresh}\ \big]$$
+
+**为什么用 $a,b$ 而非亮度**：块内均匀色 → $a,b$ 无梯度 → 不内部过切；眩光只改亮度
+$L$、不动 $a,b$ → 对眩光免疫；异色块交界色度突变 → 强梯度 → 切开。这正是它比逐帧抖
+动的 DexiNed 边稳的原因。
+
+- **同色贴碰补切**（`use_dexined_for_split`）：对同色相邻块（$a,b$ 无边界），或上高阈值
+  DexiNed 强边 $[E>\texttt{dexined\_thresh}]$。
+- **掉漆滤除**：对 $E_\text{color}$ 做连通域分析，只保留面积 $\ge$ `color_edge_min_area`
+  的分量——真边界是成片长线，掉漆是孤立小斑点，按面积一筛即分开。
+- 膨胀 $E_\text{color}$ 一圈（保证 8-连通切透），最后**相减**得前景：
+
+$$M_\text{fg}=\big(M_\text{obj}\setminus (E_\text{color}\oplus B_3)\big)\circ B_\text{open}\ \cap\ M_\text{board}$$
+
+### 2.4 经典分割（`vision_processor_node.cpp`）
+不用 CNN，直接对灰度做阈值前景：`threshold_mode` = `otsu`（§1.5 公式）/ `adaptive`
+（高斯自适应阈值 $T(x,y)=\text{gauss-mean}_{31\times31}(x,y)-7$）/ 手动常数；并上饱和度彩
+色前景，与发光板掩膜相交，形态学闭/开，Canny 出边缘。适合纯黑块、无 GPU 场景。
+
+---
+
+## 3. 步骤 3 — 轮廓提取与过滤
+
+对 $M_\text{fg}$ 用 `findContours`（Suzuki–Abe 边界跟踪，`RETR_EXTERNAL` 只取外轮廓）。
+每个轮廓 $C$ 按几何量过滤：
+
+- **面积**（Green 公式，多边形有向面积）：
+  $$A(C)=\tfrac12\Big|\sum_i \big(x_i\,y_{i+1}-x_{i+1}\,y_i\big)\Big|,\qquad \texttt{min\_area}\le A\le\texttt{max\_area}$$
+- **bbox 填充率**：$\text{fill}=A/(w_\text{bb}\,h_\text{bb})$，要求 $\texttt{min\_fill}\le\text{fill}\le\texttt{max\_fill}$
+  （滤掉细长噪声与粘连大 blob）。
+- 最小宽高 $\ge 10$ px。
+
+---
+
+## 4. 步骤 4 — 模板匹配分类
+
+为 7 形状 × 360° 预渲染二值模板；每个候选轮廓归一化后与模板库打分，取最高分。
+
+### 4.1 归一化
+`normalize_binary_mask`：裁到 bbox，等比缩放使长边填满 $(\text{size}-10)$ 像素，居中贴到
+$\text{size}\times\text{size}$ 画布。缩放因子
+
+$$\rho=\min\!\Big(\frac{\text{size}-10}{w_\text{bb}},\ \frac{\text{size}-10}{h_\text{bb}}\Big)$$
+
+保证平移/尺度不变，只剩形状与旋转差异。匹配前可用 `approxPolyDP`（Douglas–Peucker，
+容差 $\varepsilon=\texttt{eps\_ratio}\cdot\text{arcLength}$）拉直分割波纹边。
+
+### 4.2 打分项（`topology_score`）
+候选掩膜 $A$ 与模板掩膜 $T$ 的综合相似度由多项加权：
+
+**① 硬 IoU / 软 IoU**（交并比，软 = 各膨胀 3×3 后）：
+$$\text{IoU}(A,T)=\frac{|A\cap T|}{|A\cup T|}$$
+
+**② Chamfer 双向距离**：用距离变换 $D_T(p)=\min_{q\in T}\lVert p-q\rVert$（`distanceTransform`,
+DIST_L2 欧氏），对称平均候选→模板、模板→候选：
+$$d=\tfrac12\Big(\underbrace{\tfrac{1}{|A|}\!\sum_{p\in A}\!D_T(p)}_{d_{ct}}+\underbrace{\tfrac{1}{|T|}\!\sum_{p\in T}\!D_A(p)}_{d_{tc}}\Big),\qquad
+s_\text{chamfer}=e^{-d/3.5}$$
+
+**③ 网格占用签名相似度**：把掩膜分成 $g\times g$ 格，签名 $\text{sig}[k]=(\text{格 }k\text{ 内前景像素数})/(\text{总前景})$，
+用 $L_1$ 距离转相似度（$4\times4$ 与 $8\times8$ 两套）：
+$$s_\text{sig}=\max\!\Big(0,\ 1-\tfrac12\lVert \text{sig}_A-\text{sig}_T\rVert_1\Big)$$
+
+**④ L 形逐格占用分**（仅 sid∈{3,4}）：把候选反旋 $-\theta$ 摆正，按形状的 $g_w\times g_h$
+理论占用格逐格核对，占用格看 $\text{ratio}/0.22$、空格看 $1-\text{ratio}/0.12$，平均。
+
+**加权综合**（权重按形状定制，L 重逐格分、T 与其他各一套）：
+
+$$\text{score}=\begin{cases}
+0.12\,\text{IoU}_h+0.08\,\text{IoU}_s+0.08\,s_\text{ch}+0.17\,s_\text{sig4}+0.25\,s_\text{sig8}+0.30\,s_\text{cell} & \text{L 左/右}\\[2pt]
+0.24\,\text{IoU}_h+0.18\,\text{IoU}_s+0.18\,s_\text{ch}+0.20\,s_\text{sig4}+0.20\,s_\text{sig8} & \text{T}\\[2pt]
+0.30\,\text{IoU}_h+0.25\,\text{IoU}_s+0.20\,s_\text{ch}+0.15\,s_\text{sig4}+0.10\,s_\text{sig8} & \text{其他}
+\end{cases}$$
+
+### 4.3 粗扫 + 细化
+先对所有 `coarse_templates`（步进 `angle_step`）取最高分角 $\hat\theta$，再在
+$[\hat\theta-\texttt{angle\_step},\ \hat\theta+\texttt{angle\_step}]$ 内以 `refine_step`
+逐度细化。返回 $(\text{shape},\ \theta\bmod 360,\ \text{score})$；$\text{score}<\texttt{min\_template\_iou}$ 丢弃。
+
+---
+
+## 5. 步骤 5 — 抓取点与朝向
+
+### 5.1 抓取点
+`pick_point_mode` 三选一：
+
+- **质心** `centroid`：图像矩 $m_{pq}=\sum_{x,y}x^p y^q\,\mathbf 1_C(x,y)$，
+  $$\bar x=m_{10}/m_{00},\quad \bar y=m_{01}/m_{00}$$
+- **距离变换内点** `distance`：填充掩膜的距离变换极大点
+  $$p^*=\arg\max_{p\in C} D_{\partial C}(p),\qquad D_{\partial C}(p)=\min_{q\notin C}\lVert p-q\rVert$$
+  即**最大内切圆圆心**，远离边缘，吸盘最稳。
+- **hybrid**：仅对 `distance_pick_shapes`（默认 L 左/右）用距离变换，其余用质心。
+- Z/S 形（sid∈{5,6}）几何中心用 `minAreaRect` 的中心（质心可能落在缺口外）。
+
+### 5.2 朝向
+模板角给基础朝向；可选 `use_contour_axis_yaw` 用轮廓主轴细化：
+
+- **minAreaRect 主轴**：最小外接矩形的长边方向。
+- **Hough 直线**：边缘图霍夫变换，直线参数化 $\rho=x\cos\theta+y\sin\theta$，累加器峰值定
+  主方向。
+- **有向轴**（T/L/Z 各一个 `directed_*` 函数）：主轴只给 0–180° 的无向角，T/L/Z 需区分
+  正反 180°——用质心相对轮廓质量分布的偏置（如 T 的凸出臂、L 的拐角、Z 的手性）把角
+  唯一定到 0–360°。
+
+`publish_angle_in_table_frame` 时把图像角经相机→board 的 TF 投影成板面偏航再发布（默
+认关，board_state 不依赖它）。
+
+---
+
+## 5.5 步骤 5.5 — 同帧 NMS（仅 DexiNed 版）
+
+分割过切会让一个块出多个框。按 score 降序贪心：新框若质心与任一已保留框的平方距离
+小于门限，判为同块抑制：
+
+$$(\Delta x)^2+(\Delta y)^2 < \texttt{nms\_center\_dist\_px}^2\ \Rightarrow\ \text{抑制}$$
+
+---
+
+## 6. 步骤 6 — 跨帧跟踪与稳定
+
+把检测按（像素/桌面距离门 + 同形状）关联到历史轨迹（最近匹配），保留
+`track_history_len` 帧历史，只有**稳定**轨迹才发布。
+
+### 6.1 角度的循环均值/标准差
+角度是周期量（田周期 90°、一字/Z 180°、其余 360°），不能算术平均。设周期 $P$、
+$k=360/P$，把角度映到单位圆求**循环均值**：
+
+$$\bar\theta=\frac1k\cdot\operatorname{atan2}\!\Big(\sum_i\sin(k\theta_i),\ \sum_i\cos(k\theta_i)\Big)$$
+
+**循环标准差**（对每个样本取到均值的圆周最短角差 $d_i=\operatorname{atan2}(\sin,\cos)$）：
+
+$$\sigma_\theta=\frac1k\sqrt{\frac1N\sum_i d_i^2}$$
+
+### 6.2 位置标准差
+$$\sigma_\text{px}=\sqrt{\frac1N\Big(\sum_i(x_i-\bar x)^2+\sum_i(y_i-\bar y)^2\Big)}$$
+
+### 6.3 稳定判据
+$$\text{stable}\iff \text{count}\ge\texttt{stable\_min\_frames}\ \wedge\ \text{missed}\le\texttt{allowed}\ \wedge\ \sigma_\text{px}\le\texttt{max\_px\_std}\ \wedge\ \sigma_\theta\le\texttt{max\_angle\_std}$$
+
+`stable_publish_max_missed` 容忍已稳定的边缘块偶尔漏检仍保持发布（稳住库存计数），
+超 `max_missed_frames` 才彻底删轨迹。
+
+---
+
+## 7. 步骤 7 — 深度抓取 Z（debug 通路）
+
+`use_depth_pick_z` 开启时，订阅对齐深度（16UC1，毫米），在抓取点邻域取深度：
+
+- **rect→raw 映射**：检测像素是去畸变（rect）坐标，对齐深度在原始彩色坐标。先反投影
+  归一化 $(x,y)=((u-c_x)/f_x,(v-c_y)/f_y)$，再经 `projectPoints`（用畸变系数 $D$）投回
+  raw 像素。
+- **邻域中值**：半径 `depth_sample_radius_px` 方形窗内所有非零深度取中值（抗空洞/噪声），
+  $Z=\operatorname{median}\{d>0\}/1000$（米）。
+- **反投影到 board 系**：相机系点 $p_\text{cam}=Z\cdot(x,y,1)$，再 $p_\text{table}=R\,p_\text{cam}+T$。
+
+目前仅打 log + 发 `/vision/pick_depth_debug`，**尚未写入 board_state**（Z 的生产解算在
+path_planner，见 [path_plan.md](path_plan.md)）。
+
+---
+
+## 8. 输出契约
 
 | 话题 | 类型 | 内容 |
 |------|------|------|
 | `/vision/board_state` | `Int32MultiArray` | **主输出**，见下 |
-| `/vision/tracked_blocks_table` | `PoseArray` | 稳定块在 `table_frame` 的位姿（debug） |
-| `/vision/debug_image` | `Image` | 叠加轮廓/抓取点/标签的可视化 |
-| `/vision/debug_foreground` | `Image` | 前景掩码 |
-| `/vision/debug_edges` | `Image` | 边缘 / 颜色边界（DexiNed 版） |
-| `/vision/preprocess/*` | `Image` | rgb / gray / gaussian_blur / otsu_binary / morphology |
-| `/vision/pick_depth_debug` | `Float32MultiArray` | 每块 `[shape, u, v, z_m, valid]` |
+| `/vision/tracked_blocks_table` | `PoseArray` | 稳定块位姿（debug） |
+| `/vision/debug_image` / `debug_foreground` / `debug_edges` | `Image` | 可视化 / 前景 / 颜色边界 |
+| `/vision/preprocess/*` | `Image` | rgb/gray/gaussian/otsu/morphology |
+| `/vision/pick_depth_debug` | `Float32MultiArray` | 每块 `[shape,u,v,z_m,valid]` |
 
-`/vision/board_state` 布局（`strategy_node` 要求 `size() >= 147` 再读其余）：
+`/vision/board_state` 布局（`strategy_node` 要求 `size()>=147` 才读其余）：
 ```
 [0..6]    7 个形状的库存计数
-[7..146]  140 格棋盘占用栅格（14×10，视觉端当前置 0，占位）
+[7..146]  140 格棋盘占用栅格（14×10，视觉端置 0 占位，占用判定在下游）
 [147]     num_blocks
 [148..]   每块 6 元组: [shape_id, pick_u, pick_v, angle_deg, geom_u, geom_v]
 ```
-
-> 当前没有节点调用视觉服务 `/vision/get_precise_pose`，它仅供未来/手动使用。
+`geom_u/v`（几何中心）供下游补偿 hybrid 吸点偏离几何中心的放置平移。
 
 ---
 
-## 4. 单独运行视觉（test_vision.launch）
-
-`test_vision.launch` **只起视觉链路**：RealSense 相机 + 视觉节点，不含臂 / TF /
-策略 / 控制，便于单独调参。
+## 9. 运行与调参
 
 ```bash
-roslaunch lucky test_vision.launch                       # 默认 DexiNed
-roslaunch lucky test_vision.launch vision_node:=vision_processor_node_cpp
-# 命令行可覆盖调参，对照 debug 图边看边调：
+roslaunch lucky test_vision.launch                                  # 默认 DexiNed
+roslaunch lucky test_vision.launch vision_node:=vision_processor_node_cpp   # 经典
 roslaunch lucky test_vision.launch color_edge_thresh:=16 min_template_iou:=0.6
 ```
 
-launch 要点：
-- 带 `align_depth:=true` 起相机，供抓取点 Z 采样。
-- 启动 6s 后用 `dynparam` 加载 `config/camera_config.yaml` 的固定曝光/白平衡，
-  避免每次手调、消除自动曝光带来的检测抖动。
-- 默认 `image_topic=/camera/color/image_raw` + `assume_image_rectified:=true`
-  （免单独跑 `image_proc`）。
+对照 debug 话题调参：块没切开→调小 `color_edge_thresh`（12~16）；块被切碎→调大
+（28~35）；掉漆零碎边→调大 `color_edge_min_area`；粘连误分类→调高 `min_template_iou`；
+彩色块漏检→确认 `use_saturation_foreground`；静止抖动→调小 `temporal_alpha`。
 
-常用调参对照（边看对应 debug 话题边调）：
-- 块没切开（粘连）→ 调小 `color_edge_thresh`（12~16）；块被切碎 → 调大（28~35）。
-- 掉漆零碎边还在切 → 调大 `color_edge_min_area`。
-- 粘连大 blob 误分类 → 调高 `min_template_iou`。
-- 彩色块漏检 → 确认 `use_saturation_foreground:=true`。
-- 静止料堆抖动/背光闪 → 调小 `temporal_alpha`（更稳更滞后）。
-
----
-
-## 5. 相机参数：实时调整 / 保存 / 加载
-
-视觉检测对**曝光与白平衡**很敏感：开自动曝光时背光板亮度会浮动，检测会抖。所以本
-项目把相机参数固定下来存进 [config/camera_config.yaml](../src/lucky/config/camera_config.yaml)，
-`test_vision.launch` 启动时自动加载。相机参数的 dynamic_reconfigure 命名空间是
-**`/camera/rgb_camera`**（深度/红外在 `stereo_module` 等其它分支，别选错）。
-
-### 5.0 两套曝光/色彩档（按视觉实现配对）
-
-两个视觉实现对图像风格的需求不同，因此各配**一份** `dynamic_reconfigure` 档，都灌进
-`/camera/rgb_camera`：
-
-| 档案 | 配套节点 | 风格取向（关键差异） |
-|------|----------|----------------------|
-| [config/camera_config.yaml](../src/lucky/config/camera_config.yaml) | `vision_processor_node_dexined`（**默认**） | **保留色彩**：saturation 64、gamma 300、contrast 50、hue 0；供 DexiNed 边缘 + Lab 颜色边界切割用 |
-| [config/camer_config_1.yaml](../src/lucky/config/camer_config_1.yaml) | `vision_processor_node_cpp` | **高对比去饱和**：contrast 100、saturation 0、sharpness 100、brightness −64、hue 180；突出明暗轮廓，适配经典灰度阈值 |
-
-> 文件名 `camer_config_1.yaml` 确实少了个 `a`，是磁盘上的真实名字，别当笔误改掉。
-
-两档的共同点：都**关自动曝光/自动白平衡**（`exposure=180`、`white_balance=6000`、
-`power_line_frequency=3`），保证亮度/色温稳定。
-
-> ⚠️ **切换视觉实现时，相机档也要一并换。** `test_vision.launch` / `lucky.launch` 里
-> `load_rgb_cfg` 那行**硬编码加载 `camera_config.yaml`**（DexiNed 档）。改用经典节点
-> （`vision_node:=vision_processor_node_cpp`）时，需把该行的文件名换成
-> `camer_config_1.yaml`，或启动后手动 `dynparam load`（见 §5.3）——否则相机档与视觉
-> 实现不匹配，检测质量会明显变差。
-
-### 5.1 实时调整（rqt_reconfigure）
-
-先起带相机的 launch（如 `test_vision.launch`），再开 GUI：
-
-```bash
-rosrun rqt_reconfigure rqt_reconfigure
-```
-
-- 左侧树展开 `camera` → 选 **`rgb_camera`**，右侧拖滑块/改数值即**实时生效**，
-  配合 `/vision/debug_*` 图边看边调。
-- 关键项（对应 yaml）：
-  - `enable_auto_exposure` / `exposure` —— **务必先关自动曝光**再手调 `exposure`，
-    否则背光亮度浮动让检测抖。
-  - `enable_auto_white_balance` / `white_balance` —— 关自动白平衡、固定色温
-    （彩色块识别尤其重要）。
-  - `gain`、`gamma`、`brightness`、`contrast`、`saturation`、`sharpness`、
-    `power_line_frequency`（防工频闪，国内取 `3`=50Hz）。
-
-### 5.2 保存参数
-
-调满意后用 `dynparam dump` 导出当前命名空间的全部参数，**覆盖**仓库里的 yaml：
-
-```bash
-rosrun dynamic_reconfigure dynparam dump /camera/rgb_camera \
-  $(rospack find lucky)/config/camera_config.yaml
-```
-
-> 统一用 `dynparam dump` 保存，别用 rqt_reconfigure 自带的 “Save” 按钮——两者格式
-> 略有差异，而 launch 是用 `dynparam load` 读取的。`dump` 出来的就是
-> `camera_config.yaml` 那种结构。
-
-### 5.3 加载参数
-
-手动加载到运行中的相机：
-
-```bash
-rosrun dynamic_reconfigure dynparam load /camera/rgb_camera \
-  $(rospack find lucky)/config/camera_config.yaml
-```
-
-而 `test_vision.launch` / `lucky.launch` 里**已自动加载**——相机起来 6 秒后执行：
-
-```xml
-<node pkg="dynamic_reconfigure" type="dynparam" name="load_rgb_cfg"
-      args="load /camera/rgb_camera $(find lucky)/config/camera_config.yaml"
-      launch-prefix="bash -c 'sleep 6; exec $0 $@'" />
-```
-
-`sleep 6` 是等相机的 dynamic_reconfigure server 注册完再灌参，避免抢跑加载失败。
-所以正常跑这些 launch 时无需手动 load，开机即恢复到调好的固定曝光/白平衡。
-
----
-
-## 6. 注意事项
-
-- 只有 `vision_processor_node_cpp`（由 `vision_processor_node.cpp` 编译）与
-  `vision_processor_node_dexined` 在 `CMakeLists.txt` 里被构建。生产
-  （`lucky.launch`）默认用 DexiNed 版。
-- `scripts/vision_processor_node.py` 是同契约的 Python 重实现，仅供
-  `affine.launch` 标定使用，不进生产。
-- `board_state` 的 140 格棋盘占用由视觉端置 0 占位；“某格是否已摆块”的真正判定在
-  下游用逐格白板凸起高度完成，不由视觉负责。
+> 相机曝光/白平衡固定档见 `config/camera_config.yaml`（DexiNed）与 `camer_config_1.yaml`
+> （经典，高对比去饱和）；`test_vision.launch` 启动 6s 后自动 `dynparam load`。**切换视觉实
+> 现时相机档要一并换**，否则检测质量明显变差。命名空间 `/camera/rgb_camera`，务必先关自
+> 动曝光/自动白平衡再调。

@@ -539,6 +539,14 @@ struct SeqConfig
     bool require_support = true; // true=竞赛规则③(下方有方块支撑/第一层除外)；false=宽松实验
     bool reward_four_colors = false; // 满行且≥4色 +10 的竞赛加分(规则②)。默认 false：
                                      // 实际比赛可能没有此约束，关掉则只追求满行不强求配色。
+    // 进阶(分组)模式：先放完一种形状的全部库存，再到下一种。形状完成顺序 = sequence
+    // 去重(按首次出现)；此时忽略 cyclic。见 seqBuildEffective。
+    bool group_by_shape = false;
+    // 终态支撑模式：支撑按"终态整盘"判(允许中途某块悬空，其底由后续形状/组填上)，而非
+    // 每步放置即需支撑。合法解要求终态每格受支撑且支撑依赖 DAG 无环(存在先底后顶执行序)，
+    // 由 seqFinalValid 统一校验；物理执行序交由 path_planner 按该 DAG 拓扑重排(先底后顶)。
+    bool final_support = false;
+    long float_penalty = 1000;   // 终态支撑模式：每个"悬空格"的启发惩罚(仅排序，不改计分)
     int board_rows = 14;
     int board_cols = 10;
     int beam_width = 120;         // 束宽
@@ -621,8 +629,10 @@ struct SeqState
     long heuristic = 0;
 };
 
-// 枚举形状 shape 在 st 上的全部合法放置。
-inline vector<SeqPlacement> seqEnumPlacements(const SeqState &st, int shape, const SeqConfig &cfg)
+// 枚举形状 shape 在 st 上的全部合法放置。allow_float 仅在终态支撑模式生效：
+// true 时允许放置一个"当前无任何格受支撑"的纯悬空块(其底留待后续形状填)，false(末步)则不允许。
+inline vector<SeqPlacement> seqEnumPlacements(const SeqState &st, int shape, const SeqConfig &cfg,
+                                              bool allow_float = true)
 {
     vector<SeqPlacement> out;
     const int rows = cfg.board_rows, cols = cfg.board_cols;
@@ -640,7 +650,7 @@ inline vector<SeqPlacement> seqEnumPlacements(const SeqState &st, int shape, con
             for (int c0 = 0; c0 + max_x <= cols - 1; ++c0)
             {
                 vector<Point> cells;
-                bool ok = true, connected = false, supported = false;
+                bool ok = true, connected = false, supported = false, anchored = false;
                 for (auto &p : var.coords)
                 {
                     int nr = r0 + p.y; // 行
@@ -658,13 +668,27 @@ inline vector<SeqPlacement> seqEnumPlacements(const SeqState &st, int shape, con
                     if ((nr - 1 >= 0 && st.board[(nr - 1) * cols + nc]) ||
                         (nr + 1 < rows && st.board[(nr + 1) * cols + nc]))
                         connected = true;
+                    // 终态支撑模式的"锚定"：触底或任一四邻已被现有结构占据(本块自身格未入盘，
+                    // 故不会误计)。用于把放置限制在贴着已有结构/地面处，避免凭空悬浮。
+                    if ((nr + 1 >= rows) ||
+                        (nr + 1 < rows && st.board[(nr + 1) * cols + nc]) ||
+                        (nr - 1 >= 0 && st.board[(nr - 1) * cols + nc]) ||
+                        (nc + 1 < cols && st.board[nr * cols + (nc + 1)]) ||
+                        (nc - 1 >= 0 && st.board[nr * cols + (nc - 1)]))
+                        anchored = true;
                 }
                 if (!ok)
                     continue;
-                // 规则③ = 下方支撑(第一层/触底除外)。require_support=true 即竞赛规则；
-                // false 为宽松实验(支撑或上方相连)。第一个方块在两种模式下都因"需支撑"
-                // 而被迫落在最底行(此时仅盘面可支撑)。
-                bool valid = cfg.require_support ? supported : (supported || connected);
+                bool valid;
+                if (cfg.final_support)
+                    // 终态支撑：本块须与现有结构/地面相连(anchored)；纯悬空块(无 supported 格)
+                    // 仅在后面还有方块可填其底(allow_float)时允许。整盘终态是否受支撑由
+                    // solveSequence 的 seqFinalValid 统一校验，此处仅做搜索空间剪枝。
+                    valid = anchored && (supported || allow_float);
+                else
+                    // 规则③ = 下方支撑(第一层/触底除外)。require_support=true 即竞赛规则；
+                    // false 为宽松实验(支撑或上方相连)。第一个方块两种模式都因"需支撑"落最底行。
+                    valid = cfg.require_support ? supported : (supported || connected);
                 if (!valid)
                     continue;
                 out.push_back({shape, var.real_way, cells});
@@ -689,6 +713,24 @@ inline vector<int> seqBuildEffective(const SeqConfig &cfg)
     if (cfg.sequence.empty() || total <= 0)
         return eff;
 
+    // 分组模式：先放完第一个形状(其全部库存)，再到下一个。形状完成顺序=sequence 去重
+    // (按首次出现)；忽略 cyclic。总数仍受 total(库存之和 / max_total_placements)约束。
+    if (cfg.group_by_shape)
+    {
+        vector<char> seen(7, 0);
+        for (int s : cfg.sequence)
+        {
+            if (s < 0 || s >= 7 || seen[s])
+                continue;
+            seen[s] = 1;
+            for (int k = 0; k < inv[s] && (int)eff.size() < total; ++k)
+                eff.push_back(s);
+            if ((int)eff.size() >= total)
+                break;
+        }
+        return eff;
+    }
+
     if (!cfg.cyclic)
     {
         eff = cfg.sequence; // finite：超出库存的项会在搜索中无处可放而自然终止
@@ -710,6 +752,59 @@ inline vector<int> seqBuildEffective(const SeqConfig &cfg)
     return eff;
 }
 
+// 统计终态"悬空格"：非最底行且正下方为空的已填格数。用于终态支撑模式的启发惩罚。
+inline int seqCountUnsupported(const vector<int> &board, int rows, int cols)
+{
+    int cnt = 0;
+    for (int r = 0; r < rows - 1; ++r)
+        for (int c = 0; c < cols; ++c)
+            if (board[r * cols + c] && board[(r + 1) * cols + c] == 0)
+                cnt++;
+    return cnt;
+}
+
+// 终态合法性(仅终态支撑模式)：整盘每个已填格都受支撑(触底或正下方有块)，且方块级
+// "下先放"支撑依赖 DAG 无环——即存在先底后顶的可执行放置序(与 path_planner/strategy 的
+// 拓扑排序口径一致)。无环用 Kahn 计数校验(能排完所有块即无环)。
+inline bool seqFinalValid(const SeqState &st, int rows, int cols)
+{
+    if (seqCountUnsupported(st.board, rows, cols) != 0)
+        return false;
+    const int n = (int)st.placements.size();
+    if (n == 0)
+        return true;
+    vector<int> owner(rows * cols, -1);
+    for (int i = 0; i < n; ++i)
+        for (auto &p : st.placements[i].cells)
+            owner[p.x * cols + p.y] = i;
+    vector<vector<int>> adj(n);
+    vector<int> indeg(n, 0);
+    for (int r = 0; r < rows - 1; ++r)
+        for (int c = 0; c < cols; ++c)
+        {
+            int cur = owner[r * cols + c], bel = owner[(r + 1) * cols + c];
+            if (cur >= 0 && bel >= 0 && cur != bel) // 边 bel->cur(下方块先放)，去重
+            {
+                bool ex = false;
+                for (int t : adj[bel])
+                    if (t == cur) { ex = true; break; }
+                if (!ex) { adj[bel].push_back(cur); indeg[cur]++; }
+            }
+        }
+    vector<int> q;
+    for (int i = 0; i < n; ++i)
+        if (indeg[i] == 0) q.push_back(i);
+    int done = 0;
+    for (size_t h = 0; h < q.size(); ++h)
+    {
+        int u = q[h];
+        done++;
+        for (int v : adj[u])
+            if (--indeg[v] == 0) q.push_back(v);
+    }
+    return done == n;
+}
+
 inline SeqResult solveSequence(const SeqConfig &cfg)
 {
     SeqResult best;
@@ -726,6 +821,9 @@ inline SeqResult solveSequence(const SeqConfig &cfg)
     {
         if (st.score > best.score || (st.score == best.score && st.placed > best.placed))
         {
+            // 终态支撑模式：仅接受整盘受支撑且支撑 DAG 无环(可先底后顶执行)的解为候选。
+            if (cfg.final_support && !seqFinalValid(st, rows, cols))
+                return;
             best.score = st.score;
             best.placed = st.placed;
             best.placements = st.placements;
@@ -735,11 +833,12 @@ inline SeqResult solveSequence(const SeqConfig &cfg)
     for (size_t step = 0; step < eff.size() && !beam.empty(); ++step)
     {
         int shape = eff[step];
+        const bool allow_float = (step + 1 < eff.size()); // 末步不再允许留纯悬空块(无后续可填其底)
         vector<SeqState> next;
         next.reserve(beam.size() * 8);
         for (auto &st : beam)
         {
-            vector<SeqPlacement> places = seqEnumPlacements(st, shape, cfg);
+            vector<SeqPlacement> places = seqEnumPlacements(st, shape, cfg, allow_float);
             if (places.empty())
             {
                 consider(st); // 该状态无法继续，记为候选解
@@ -754,6 +853,9 @@ inline SeqResult solveSequence(const SeqConfig &cfg)
                 ns.placed = st.placed + 1;
                 ns.score = seqScore(ns.board, rows, cols, cfg.reward_four_colors);
                 ns.heuristic = seqHeuristic(ns.board, rows, cols, ns.score, cfg.reward_four_colors);
+                // 终态支撑模式：对悬空格轻度惩罚(仅排序，不改计分)，引导束优先选可被支撑的布局。
+                if (cfg.final_support)
+                    ns.heuristic -= cfg.float_penalty * seqCountUnsupported(ns.board, rows, cols);
                 consider(ns);
                 next.push_back(std::move(ns));
             }
