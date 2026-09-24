@@ -63,7 +63,10 @@ u_\text{flat}=c_x+(u-c_x)\,\text{ratio},\quad v_\text{flat}=c_y+(v-c_y)\,\text{r
 
 （仅当 $z_\text{cam}>z_\text{blk}+0.05$ 时启用。）
 
-### A.3 抓取 Z — 深度优先、平面回退
+### A.3 抓取 Z — 抓取平面（生产）/ 深度（可选）
+> 生产 [lucky.launch](../src/lucky/launch/lucky.launch) 设 `use_depth_pick_z=false`（代码默认 true）：抓取 Z 来自
+> 标定的抓取平面 `PICK_SURFACE_PLANE_BASE`（射线-平面求交，见下），深度话题不订阅。
+
 - **深度**（`use_depth_pick_z`）：对齐深度邻域中值 $Z$，反投影 $p_\text{cam}=Z\,\mathbf r_\text{cam}$，
   再 $p_\text{table}=R\,p_\text{cam}+T$，取其 $z$。
 - **真实抓取平面回退**（`use_true_pick_plane`）：标定的触面平面（点 $\mathbf p_0$、法向
@@ -115,7 +118,8 @@ $$x\mathrel{+}=o_x\cos\theta-o_y\sin\theta,\qquad y\mathrel{+}=o_x\sin\theta+o_y
 - roll/pitch：默认取收到 plan 时**臂此刻位姿**（即单应性标定位姿）的工具朝向换算到 board
   系固定（来源固件 `xarm_states.pose`，消 URDF↔固件 ~1° 差）；关掉则用 `fixed_roll/pitch`
   （默认 $\pi,0$）。yaw 每任务算。
-- 悬停 `hoverFromTable`：把位姿抬到 `HOVER_Z`（board +Z 即板面法向），至少高出目标 10mm。
+- 悬停 `hoverFromTable`：把位姿抬到 `HOVER_Z`（读 `/tetris/HOVER_Z`，缺省 0.08m；board +Z 即板面法向），
+  至少高出目标 10mm。
 
 ---
 
@@ -174,7 +178,7 @@ $$\mathbf q(t)=\frac{\sin((1{-}t)\Omega)}{\sin\Omega}\,\mathbf q_A+\frac{\sin(t\
 
 $$\Delta t_\text{nom}=\max\!\Big(\frac{\Delta d}{N\,v},\ \frac{\Delta\theta}{N\,\omega}\Big),\qquad \omega=\texttt{omega\_per\_v\_lin}\cdot v$$
 
-$\omega$ 随线速度自适应（实测比值 $\approx\pi$，与档位无关，`measure_tcp_omega` 标定）。后果：
+$\omega$ 随线速度自适应（实测比值 $\approx\pi$，与档位无关，[measure_tcp_omega.launch](../src/lucky/launch/measure_tcp_omega.launch) 标定）。后果：
 一个 $180°$ 翻转 $\approx 1\text{m}$ 平移的时间代价。
 
 **逐段对关节饱和取 max**（每点从连续 seed 做 IK，得 $\Delta\mathbf q$）：
@@ -202,13 +206,21 @@ $$\Delta t_k'=\max\!\Big(\Delta t_\text{nom},\ \max_i\frac{|\Delta q_{k,i}|}{v_{
 $v_\text{loaded}$）。设路径 $\max|J_6|=M$：
 
 $$\text{cost}=\text{time}_A+\text{time}_B+\underbrace{w_\text{tie}(\text{travel}_A+\text{travel}_B)}_{\text{平局项}}
-+\underbrace{w_\text{soft}\,\max(0,\ M-\theta_\text{soft})}_{\text{软限位罚}}$$
++\underbrace{w_\text{soft}\,\max(0,\ M-\theta_\text{soft})}_{\text{软限位罚}}
++\underbrace{g\,\max(0,\ M-\theta_\text{free})^2}_{\text{保余量势垒}}$$
 
 **硬限位** $M>\texttt{wrist\_hard\_limit}$（到 $\pm2\pi$ 留余量）→ 绝对拒绝该方案；软限位越
 界仍可用但秒尺度加罚（least-bad 有序）；平局用 $\sum|\Delta q|$ 偏好腕部少甩。
 
+**J6 保余量势垒**（headroom barrier）：$|J_6|$ 在留白带 $[0,\theta_\text{free}]$（`wrist_center_free_rad`，
+默认 $\pi$）内势为 0，正常抓放腕角完全按翻转/时间代价择优；越出留白带按二次势
+$g\,(M-\theta_\text{free})^2$ 加罚（$g$=`wrist_center_penalty_s_per_rad2`，默认 40 s/rad²，例：269° 处
+≈97s），越靠硬限位越贵——逼搜索把 J6 留在中段、保住两侧头寸，避免为省几秒翻转把腕部单向绕到
+边界、令后续槽无解。即**放满优先、再省翻转**。$g=0$ 关闭。此项对翻转择优、两种 beam、2-opt 同样生效。
+
 ### D.3 顺序优化
-两种模式**共用有界 beam 搜索**（宽度 `reorder_beam_width`，默认 12；$B{=}1$ 退化为原贪心）。
+两种模式**共用有界 beam 搜索**（宽度 `reorder_beam_width`，代码默认 24，[lucky.launch](../src/lucky/launch/lucky.launch)
+设 120；$B{=}1$ 退化为原贪心）。
 因 J6 可行性**路径相关**（某步能否可行取决于此前所有步的就近解落点），逐步贪心会近视地把
 J6 绕到边界令后续无解，beam 保留前 $B$ 条最低累计代价前缀，让下游不可行/高代价能回改上游。
 - **允许重排**（`allow_reorder`）：构造放置**依赖 DAG**——格 $(r,c)$ 之下 $(r{+}1,c)$ 是别的
@@ -222,9 +234,26 @@ J6 绕到边界令后续无解，beam 保留前 $B$ 条最低累计代价前缀�
 - **XY 回退**（IK 不可用）：代价退化为 $\sum(\lVert\text{cur}\!\to\!\text{pick}\rVert+\lVert\text{pick}\!\to\!\text{place}\rVert)$
   的贪心，事后用 `assignFlipsByYaw` 的 A/B 腕角 travel 启发式定翻转。
 
+### D.3.1 自动升挡重解（`escalateToPlaceAll`）
+势垒是启发式、beam 有界，都不保证放满。若某次求解**丢块**（可放置数 < 任务总数），就逐挡加大势
+gain 与 beam 宽度重跑，取「**放置数最多**、平局取代价小」的结果：
+
+$$g_\ell=g_0\cdot f^{\ell},\qquad B_\ell=\operatorname{round}\big(B_0\cdot m^{\ell}\big),\qquad \ell=1,\dots,L$$
+
+其中 $f$=`center_escalation_factor`（默认 3）、$m$=`beam_escalation_mult`（代码默认 1.5，[lucky.launch](../src/lucky/launch/lucky.launch) 设 2；
+beam 是完备性的真杠杆，故几何增长）、$L$=`max_center_escalations`（默认 8，0=关闭升挡）。放满即停；
+挡间累计墙钟超 `center_escalation_budget_s`（代码默认 12s，[lucky.launch](../src/lucky/launch/lucky.launch) 设 20s；0=不限）也停、留当前最优。
+只有物理上确实不可行（J6 硬限位）时才丢块，并打印 `center-escalation exhausted`。退出时 gain/beam
+恢复配置原值。$g_0=0$（势垒关闭）时不升挡。
+
+**少杠杆场景自动上调**（`single_candidate_center_boost`，默认 true）：只有 $K{=}1$ 个候选时（多为进阶
+模式的单一确定解，保序、无候选择优），起始 gain 先乘 $f$，并额外多给
+`single_candidate_extra_escalations`（默认 1）挡。
+
 ### D.4 多候选择优
 `use_plan_candidates` 时，策略节点把若干同分布局发到 `/tetris_plan_candidates`，本节点逐个
-求总代价（`parallel_candidate_eval` 多线程），选**总代价最小**者执行。
+求总代价（`parallel_candidate_eval` 多线程），选**放置数最多、其次总代价最小**者执行；升挡时每一挡都
+重新评估全部候选。
 
 ### D.5 起点关节与自检
 起点 $\mathbf q_\text{cur}$ 取自 `/xarm/joint_states`（缺则标称种子）。启动用 FK/IK 对照
@@ -234,7 +263,7 @@ J6 绕到边界令后续无解，beam 保留前 $B$ 条最低累计代价前缀�
 
 本问题 = **带优先约束（DAG）的最小代价序列 + 选块 + 翻转**，是 NP-hard 的带优先 TSP 变体。
 更棘手的是**代价路径相关**：J6 是「就近解」，每步落点关节 $\mathbf q$ 由上一位形 seed 出来
-（见 CLAUDE.md 腕部圈数 lore、`xarm6_kinematics.hpp` seeded-DLS IK），故某步的代价**乃至可行性**
+（见 [CLAUDE.md](../CLAUDE.md) 腕部圈数 lore、[xarm6_kinematics.hpp](../src/lucky/include/lucky/xarm6_kinematics.hpp) seeded-DLS IK），故某步的代价**乃至可行性**
 取决于此前全部选择的历史。已实证三条路线都**绕不开这个根本障碍**：
 
 | 方案 | 组合层 | 为何仍非全局最优 |
@@ -261,19 +290,19 @@ mask、图的固定 $\mathbf q_\text{end}$）都只得到**近似模型的最优
    `pos[parent]<pos[child]` 才评估。逼近局部最优，仍多项式、仍非全局最优。
 2. **加宽 + 多样性 beam**：调大 `reorder_beam_width`（代价线性增长），并对前缀去重/保多样
    （避免 $B$ 条都挤在同一分支），降低「早剪掉最优前缀」概率。
-3. **CP-SAT 当「离线上界/校验器」而非实时求解器**：修掉两个已知实现缺陷后离线跑，用来
-   **量化 beam 与图模型最优的差距**，指导调参——但别上真机实时（50ms 证不到 OPTIMAL，
-   代码却把 `FEASIBLE` 当成功，等于没有最优证书）。修法：
-   - **翻转 bug**：`evalPairJoint` 只返回它自选的较优 flip，`pe.flip==nv.flip` 过滤会把另一个
+3. **CP-SAT 当「离线上界/校验器」而非实时求解器**（**当前代码中已无 CP-SAT 实现**，试验版已移除；
+   以下是若重新引入时须避开的两个已知缺陷）：离线跑来**量化 beam 与图模型最优的差距**、指导调参——
+   但别上真机实时（50ms 证不到 OPTIMAL，旧实现把 `FEASIBLE` 当成功，等于没有最优证书）。
+   - **翻转 bug**：`evalPairJoint` 只返回它自选的较优 flip，若按 `pe.flip==nv.flip` 过滤会把另一个
      flip 节点的入边全删 → CP-SAT 无法自由选翻转（而翻转正是 J6 唯一杠杆）。预计算须**强制
      指定 `nv.flip`** 单独算代价，而非让 `evalPairJoint` 自己挑。
    - **求解预算**：要真最优须 `status==OPTIMAL`（非 `FEASIBLE`）且给足时间。
-4. **降低路径相关性本身**（治本但涉及标定/策略）：若能约束每步落点远离 J6 软限位、让 IK
+4. **降低路径相关性本身**（治本但涉及标定/策略；D.2 的保余量势垒即朝此方向的一步）：若能约束每步落点远离 J6 软限位、让 IK
    分支稳定（$\mathbf q_\text{end}$ 近似历史无关），离散化误差就小，图/DP 模型才逼近真实——
    本质是把「连续状态」压回「可离散」。
 
-**当前落地建议**：先做 (1) 2-opt 后处理（对现有 beam 直接加尾，风险最低、收益明确），把
-(3) 的 CP-SAT 留作离线基准；(2)(4) 视实测差距再定。
+**现状**：(1) 2-opt 后处理已落地（仅重排模式生效）；(2) 已部分落地为「丢块时 beam 几何加宽重解」
+（D.3.1）；(3) 未实现；(4) 以 J6 保余量势垒的形式部分落地。
 
 ---
 
@@ -289,21 +318,29 @@ mask、图的固定 $\mathbf q_\text{end}$）都只得到**近似模型的最优
 
 ### 关键参数
 
-| 组 | 参数 | 默认 | 作用 |
-| --- | --- | --- | --- |
-| 抓取 | `pick_xy_source` / `use_true_pick_plane` / `use_depth_pick_z` | homography / true / true | XY 源 / 平面回退 / 深度 Z |
-| 抓取 | `tcp_pick_offset_x/y/z` / `pick_yaw_offset_deg` | 0 | TCP 补偿 / yaw 偏置 |
-| 放置 | `use_cell_max_place_z` / `place_release_z_margin` | true / 0.004 | 逐格取最高 / 离面余量 |
-| 优化 | `optimize_order` / `allow_reorder` / `use_plan_candidates` | true / true / false | 顺序 / 重排 / 多候选 |
-| 优化 | `reorder_beam_width` / `refine_two_opt` / `two_opt_max_ms` | 12 / true / 40 | beam 宽度 / 2-opt 开关 / 局部改善预算(ms) |
-| 代价 | `transit_lin_speed_m_s` / `loaded_lin_speed_m_s` | 0.06 / 0.045 | 空载/负载线速度（须与控制器一致）|
-| 代价 | `omega_per_v_lin_rad_per_m` | 3.14（lucky 3.23）| $\omega/v$ 比值，`measure_tcp_omega` 标定 |
-| 代价 | `wrist_soft_limit_rad` / `wrist_hard_limit_rad` | 4.7 / 6.10 | J6 软/硬限位 |
-| 代价 | `wrist_soft_penalty_s_per_rad` / `tie_break_weight` / `transit_j6_samples` | 见源码 | 越限罚 / 平局项 / 采样数 |
+| 组 | 参数 | 代码默认 | [lucky.launch](../src/lucky/launch/lucky.launch) | 作用 |
+| --- | --- | --- | --- | --- |
+| 抓取 | `pick_xy_source` / `use_true_pick_plane` / `use_depth_pick_z` | homography / true / true | homography / true / **false** | XY 源 / 抓取平面 Z / 深度 Z |
+| 抓取 | `tcp_pick_offset_x/y` / `tcp_pick_offset_z` | 0 / `/tetris/TCP_PICK_OFFSET_Z` | 0 / **0.01** | TCP 补偿（私有参数覆盖标定值）|
+| 抓取 | `pick_yaw_offset_deg` / `yaw_homography_v_sign` | 0 / 1 | −90 / −1 | yaw 偏置 / 单应性测角 v 符号 |
+| 放置 | `use_cell_max_place_z` / `place_release_z_margin` / `tcp_place_offset_z` | true / 0.004 / `/tetris/TCP_PLACE_OFFSET_Z` | true / 0.006 / 0.0 | 逐格取最高 / 离面余量 / 波纹管补偿 |
+| 优化 | `optimize_order` / `allow_reorder` / `use_plan_candidates` / `parallel_candidate_eval` | true / true / false / true | true / **false** / true / true | 顺序 / 重排 / 多候选 / 多线程 |
+| 优化 | `reorder_beam_width` / `refine_two_opt` / `two_opt_max_ms` | 24 / true / 40 | 120 / — / — | beam 宽度 / 2-opt 开关 / 局部改善预算(ms) |
+| 代价 | `transit_lin_speed_m_s` / `loaded_lin_speed_m_s` | 0.06 / 0.045 | 0.5 / 0.5 | 空载/负载线速度（须与控制器一致）|
+| 代价 | `omega_per_v_lin_rad_per_m` | 3.14 | 3.001 | $\omega/v$ 比值，[measure_tcp_omega.launch](../src/lucky/launch/measure_tcp_omega.launch) 标定 |
+| 代价 | `joint_max_vel_rad_s` | 6×3.14 | — | 各轴关节限速（轨迹关节饱和阈值）|
+| 代价 | `wrist_soft_limit_rad` / `wrist_hard_limit_rad` | 4.7 / 6.10 | 3.7 / 6.14 | J6 软/硬限位 |
+| 代价 | `wrist_soft_penalty_s_per_rad` / `tie_break_weight_s_per_rad` / `transit_j6_samples` | 1000 / 0.001 / 8 | 同 | 越限罚 / 平局项 / 每段采样数 |
+| 势垒 | `wrist_center_free_rad` / `wrist_center_penalty_s_per_rad2` | π / 40 | 3.14159 / 40 | 留白带 / 二次势 gain（0=关）|
+| 升挡 | `max_center_escalations` / `center_escalation_factor` / `beam_escalation_mult` / `center_escalation_budget_s` | 8 / 3 / 1.5 / 12 | 8 / 3 / 2 / 20 | 挡数 / gain 倍率 / beam 倍率 / 墙钟预算(s) |
+| 升挡 | `single_candidate_center_boost` / `single_candidate_extra_escalations` | true / 1 | true / 1 | K=1 少杠杆自动上调 |
+| 其他 | `ik_selfcheck_tol_rad` / `read_tool_tilt_from_initial_pose` / `max_tasks_per_plan` | 0.05 / true / 0 | 0.05 / — / 0 | IK 自检阈值 / 现读初始位姿倾角 / 发布任务上限(0=全部) |
+
+"[lucky.launch](../src/lucky/launch/lucky.launch)" 列中 "—" 表示该 launch 未设置、沿用代码默认。
 
 标定数据（`BOARD_POSE_BASE`、`BOARD_CENTERS_14x10_BOARD`、`PLACE_Z_MAP_14x10`、
-`PICK_SURFACE_PLANE_BASE`、`PICK_HOMOGRAPHY`）从 `/tetris/*` 读，由 `tetris_config.yaml`
-加载，**当作数据勿手改**（生成见 [calibrate.md](calibrate.md)）。
+`PICK_SURFACE_PLANE_BASE`、`PICK_HOMOGRAPHY`、`PICK_Z`、`HOVER_Z`、`TCP_*_OFFSET_Z`）从 `/tetris/*` 读，由
+[tetris_config.yaml](../src/lucky/config/tetris_config.yaml) 加载，**当作数据勿手改**（生成见 [calibrate.md](calibrate.md)）。
 
 > 速度类参数须与控制器 `transit_speed_mm_s` / `loaded_transit_speed_mm_s` 对应，否则代价与
 > 实际运动脱节；`omega_per_v_lin_rad_per_m` 是**比值**、与速度档无关，改速度不用动它。
@@ -313,18 +350,19 @@ mask、图的固定 $\mathbf q_\text{end}$）都只得到**近似模型的最优
 ## F. 运行与测试
 
 ```bash
-# 感知→策略→路径链路（需臂提供 TF，绝不命令运动）
+# 感知→策略→路径链路（需臂提供 TF 与 joint_states，不起控制节点、绝不命令运动）
 roslaunch lucky test_path.launch robot_ip:=192.168.1.216
 rostopic echo /motion_cmds
 ```
 
-生产 `lucky.launch` 端到端起感知/策略/路径/控制（`use_plan_candidates=true`、
-`optimize_order=true`、`omega_per_v_lin_rad_per_m=3.23`）。配合控制器单块抓放见
-`test_controller.launch`（**会驱动真机**，见 [control.md](control.md)）。
+生产 [lucky.launch](../src/lucky/launch/lucky.launch) 端到端起感知/策略/路径/控制（`use_plan_candidates=true`、
+`optimize_order=true`、`allow_reorder=false`、`omega_per_v_lin_rad_per_m=3.001`）。注意生产为**保序**模式，
+故 2-opt/or-opt（仅重排模式运行）在生产中不生效。配合控制器单块抓放见
+[test_controller.launch](../src/lucky/launch/test_controller.launch)（**会驱动真机**，见 [control.md](control.md)）。
 
 ### F.1 验证 2-opt/or-opt 局部改善（`refineOrderTwoOpt`）
 
-改动逻辑已审、编译通过，但**尚未在真机/仿真跑过**。接臂后用 `test_path.launch`（只发
+改动逻辑已审、编译通过，但**尚未在真机/仿真跑过**。接臂后用 [test_path.launch](../src/lucky/launch/test_path.launch)（只发
 `/motion_cmds`、绝不命令运动）跑一组 `allow_reorder=true` 的任务，看 `path_planner` 日志：
 
 ```bash

@@ -33,7 +33,7 @@
 
 避免视觉只识别到一部分就提前出方案。设当前总块数 $N=\sum_{i=0}^{6}\text{inv}[i]$：
 
-1. **数量门槛**（普通模式）：$N<\texttt{min\_usable\_total\_blocks}$（默认 34）不规划。
+1. **数量门槛**（普通模式）：$N<\texttt{min\_usable\_total\_blocks}$（代码默认 34，[lucky.launch](../src/lucky/launch/lucky.launch) 设 35）不规划。
 2. **库存稳定**：库存向量 $\mathbf{inv}$ 需连续 $K$ 帧完全不变；所需帧数
    $$K=\begin{cases}\texttt{inventory\_stable\_required\_frames}=5 & N=\texttt{expected\_total\_blocks}=35\\ \texttt{min\_usable\_stable\_required\_frames}=3 & N=34\ (\text{差 1 兜底})\end{cases}$$
 3. 一次任务只规划一次（`task_completed` 锁死），`is_robot_busy` 期间不规划。
@@ -207,7 +207,7 @@ $$\text{supported}=\bigvee_{k}\big(r_k+1\ge R\ \vee\ \text{board}[r_k{+}1][c_k]\
 
 计分同普通模式（§4.3）。配色加分（规则②）由 `seq_reward_four_colors` 控制，但**分组模式恒关闭
 四色约束**。输出沿用 17-int 格式，以单候选集（$K{=}1$）发到候选话题，供 `path_planner` 在 DAG 内
-二次择优（`lucky.launch` 默认 `allow_reorder=false`，即保留策略给的顺序）。
+二次择优（[lucky.launch](../src/lucky/launch/lucky.launch) 默认 `allow_reorder=false`，即保留策略给的顺序）。
 
 ---
 
@@ -221,7 +221,7 @@ $\ge 6\,\text{num\_blocks}$ 按 6 解析（带 `geom_u/v`），否则按 4。`da
 
 | 参数 | 默认 | 含义 |
 |---|---|---|
-| `expected_total_blocks` / `min_usable_total_blocks` | 35 / 34 | 满量 / 差 1 兜底门槛 |
+| `expected_total_blocks` / `min_usable_total_blocks` | 35 / 34 | 满量 / 差 1 兜底门槛（[lucky.launch](../src/lucky/launch/lucky.launch) 把兜底也设为 35，即关闭兜底）|
 | `inventory_stable_required_frames` / `min_usable_stable_required_frames` | 5 / 3 | 稳定帧数 $K$ |
 | `num_strategy_candidates` | 8 | 同分最优候选布局数（$>1$ 交 path_planner 择优）|
 | `advanced_mode` | false | 进阶开关 |
@@ -230,8 +230,11 @@ $\ge 6\,\text{num\_blocks}$ 按 6 解析（带 `geom_u/v`），否则按 4。`da
 | `seq_beam_width` | 1200 | 分组束搜索束宽。**默认求解器内 120 太小会明显欠搜索**（满行数腰斩）；方案只算一次再执行，可用大束宽换分（实测 600≈0.8s→8 满行，1200≈1.9s 到顶）|
 | `seq_cyclic` / `seq_require_support` | false / true | 循环（仅旧交错模式）/ 逐步支撑是否用竞赛规则③ |
 | `seq_reward_four_colors` | false | 进阶配色加分（规则②）；**分组模式恒关闭** |
-| `float_penalty` | 1000 | 终态支撑模式悬空格启发惩罚（仅 `tetris_solver.hpp`，非 rosparam）|
+| `float_penalty` | 1000 | 终态支撑模式悬空格启发惩罚（仅 [tetris_solver.hpp](../src/lucky/include/lucky/tetris_solver.hpp)，非 rosparam）|
 | `shape_sequence` | — | 进阶形状 id 序列（`rosparam`）；分组模式作形状完成顺序（去重）|
+| `shape_pick_limits` | 全 −1 | 进阶模式每种形状"可吸取上限"（长度 7，<0=不限）|
+| `advanced_peak_max_wait_sec` | 10.0 | 进阶「峰值保持」门控的等待预算（秒）|
+| `plan_candidates_topic` | `/tetris_plan_candidates` | 候选集话题 |
 
 DLX 内部：34 块方案 `max_search_nodes=5×10⁶, max_restarts=10, max_sols=400`；通用方案
 `10⁶ / 5 / 100`。

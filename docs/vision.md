@@ -12,6 +12,11 @@
 
 > 检测对象是**彩色**多联骨牌（红/橙/棕/紫/黄/蓝/绿），不是黑色。
 
+> 输入图像：节点参数 `image_topic` 代码默认 `/camera/color/image_rect_color`（`image_proc` 输出），但
+> [lucky.launch](../src/lucky/launch/lucky.launch) 与 [test_vision.launch](../src/lucky/launch/test_vision.launch)
+> 都显式喂 `/camera/color/image_raw` 并设 `assume_image_rectified=true`（即把原图当作已去畸变处理；
+> [test_vision.launch](../src/lucky/launch/test_vision.launch) 里 `image_proc` 已注释掉）。
+
 ---
 
 ## 0. 数据流总览
@@ -99,7 +104,8 @@ $$(I\oplus B)(x)=\max_{b\in B}I(x-b),\qquad (I\ominus B)(x)=\min_{b\in B}I(x-b)$
 开、块内眩光/掉漆不能误切。方法是「暗/彩前景」**减去**「Lab 颜色边界切割线」。
 
 ### 2.1 DexiNed 神经网络边缘
-DexiNed 是一个全卷积边缘检测 CNN（ONNX，强制 CUDA 后端）。预处理：ROI 尺寸 pad 到
+DexiNed 是一个全卷积边缘检测 CNN（ONNX 模型 [dexined.onnx](../src/lucky/module/dexined.onnx)，`use_dexined` 开启时
+加载并强制设 CUDA 后端；加载/配置抛异常则关闭 DexiNed、退回经典分割）。预处理：ROI 尺寸 pad 到
 16 的倍数，扣 ImageNet BGR 均值 $\mu=(103.939,116.779,123.68)$ 构造网络输入张量
 
 $$X = I_\text{roi} - \mu$$
@@ -140,7 +146,7 @@ $L$、不动 $a,b$ → 对眩光免疫；异色块交界色度突变 → 强梯�
 
 $$M_\text{fg}=\big(M_\text{obj}\setminus (E_\text{color}\oplus B_3)\big)\circ B_\text{open}\ \cap\ M_\text{board}$$
 
-### 2.4 经典分割（`vision_processor_node.cpp`）
+### 2.4 经典分割（[vision_processor_node.cpp](../src/lucky/src/vision_processor_node.cpp)）
 不用 CNN，直接对灰度做阈值前景：`threshold_mode` = `otsu`（§1.5 公式）/ `adaptive`
 （高斯自适应阈值 $T(x,y)=\text{gauss-mean}_{31\times31}(x,y)-7$）/ 手动常数；并上饱和度彩
 色前景，与发光板掩膜相交，形态学闭/开，Canny 出边缘。适合纯黑块、无 GPU 场景。
@@ -318,7 +324,9 @@ roslaunch lucky test_vision.launch color_edge_thresh:=16 min_template_iou:=0.6
 （28~35）；掉漆零碎边→调大 `color_edge_min_area`；粘连误分类→调高 `min_template_iou`；
 彩色块漏检→确认 `use_saturation_foreground`；静止抖动→调小 `temporal_alpha`。
 
-> 相机曝光/白平衡固定档见 `config/camera_config.yaml`（DexiNed）与 `camer_config_1.yaml`
-> （经典，高对比去饱和）；`test_vision.launch` 启动 6s 后自动 `dynparam load`。**切换视觉实
+> 相机曝光/白平衡固定档见 [camera_config.yaml](../src/lucky/config/camera_config.yaml)（DexiNed）与
+> [camera_config_1.yaml](../src/lucky/config/camera_config_1.yaml)（经典，高对比去饱和）；
+> [test_vision.launch](../src/lucky/launch/test_vision.launch) 与 [lucky.launch](../src/lucky/launch/lucky.launch)
+> 启动 6s 后自动 `dynparam load` 前者（硬编码）。**切换视觉实
 > 现时相机档要一并换**，否则检测质量明显变差。命名空间 `/camera/rgb_camera`，务必先关自
 > 动曝光/自动白平衡再调。

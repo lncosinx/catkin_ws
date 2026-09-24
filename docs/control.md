@@ -8,6 +8,7 @@
 
 参考代码：
 - 节点：[xarm_controller_node.cpp](../src/lucky/src/xarm_controller_node.cpp)
+- 消息：[MotionPlan.msg](../src/lucky/msg/MotionPlan.msg) / [MotionTask.msg](../src/lucky/msg/MotionTask.msg)
 - 测试：[test_controller.launch](../src/lucky/launch/test_controller.launch)
 
 ---
@@ -17,6 +18,7 @@
 ```
 /motion_cmds (MotionTask[]：每任务 4 个 base 位姿)
    │
+   ▼ [0] /ready 门闸     require_ready=true 时等 /ready 发 true 才开始执行
    ▼ [1] 状态机逐任务   IDLE→PICK_HOVER→PICK→PLACE_HOVER→PLACE→…→FINISH
    ▼ [2] 位姿→native    四元数→RPY，米→毫米
    ▼ [3] 逐轴就近解绕   相对当前上报位姿 unwrap，避免整圈回绕
@@ -39,10 +41,11 @@
 ## 1. 执行状态机
 
 `controlLoop`（定时器 `control_period` 默认 50ms）驱动逐任务状态机，单方案最多执行
-`max_tasks_per_plan` 个（默认 1，安全闸）：
+`max_tasks_per_plan` 个（代码默认 1 作安全闸；[lucky.launch](../src/lucky/launch/lucky.launch) 设 34）。
+收到新 `MotionPlan` 会**清空旧队列**再入队，并发布 `/robot_status`=true（忙）：
 
 ```
-IDLE ──(收到 MotionPlan)──► TAKE_NEXT_TASK
+IDLE ──(收到 MotionPlan)──► WAIT_FOR_READY ──(/ready=true 或 require_ready=false)──► TAKE_NEXT_TASK
   → MOVE_TO_PICK_HOVER   直线到 pick_hover_pose（transit 速度）
   → EXECUTE_PICK         下压到 pick_pose → 吸盘 ON → 抬回 pick_hover
   → MOVE_TO_PLACE_HOVER  负载搬运到 place_hover_pose（loaded 速度）
@@ -50,6 +53,10 @@ IDLE ──(收到 MotionPlan)──► TAKE_NEXT_TASK
   → TAKE_NEXT_TASK       取下一个任务
 FINISH  发布 busy=false，回 IDLE
 ```
+
+- **`/ready` 执行门闸**（`require_ready`，默认 true）：计划入队后停在 `WAIT_FOR_READY`，直到
+  `ready_topic`（默认 `/ready`，`std_msgs/Bool`）收到 `true` 才开始执行；若门闸早已打开则直接执行。
+  发 `false` 只阻止启动新计划，不打断进行中的动作。`require_ready=false` 恢复"收到计划即执行"。
 
 - **悬停位姿**直接用任务里的 `*_hover_pose`（planner 已沿 board 法向抬升算好）。
 - **失败处理** `failOrFinish`：`stop_on_motion_failure=true` 清队停机回 IDLE，否则跳过取下
@@ -94,7 +101,7 @@ $$\operatorname{unwrap}(c,t)=c+\operatorname{wrap}(t-c),\qquad \operatorname{wra
 （下发角与当前姿态的差不超过半圈，故绝不整圈回绕）。对 $r,p,y$ 三轴各做一次：
 $\text{tgt}[3..5]\leftarrow\operatorname{unwrap}(\text{native}[3..5],\ \text{tgt}[3..5])$。
 
-> J6 的圈数 / 是否翻转已由 planner 预先决策，固件按「就近解」执行（见 CLAUDE.md 腕部踩坑）；
+> J6 的圈数 / 是否翻转已由 planner 预先决策，固件按「就近解」执行（见 [CLAUDE.md](../CLAUDE.md) 腕部踩坑）；
 > 本节点的解绕只保证下发角相对当前姿态连续，**不改变** planner 的翻转选择。
 
 ---
@@ -146,7 +153,10 @@ geometry_msgs/Pose place_hover_pose   放置悬停 (base, 沿 board 法向)
 
 | 参数 | 默认 | 作用 |
 | --- | --- | --- |
-| `max_tasks_per_plan` | 1 | 单方案最多执行任务数（安全闸）|
+| `plan_topic` / `status_topic` | `/motion_cmds` / `/robot_status` | 输入计划 / 忙闲标志（latched）|
+| `max_tasks_per_plan` | 1 | 单方案最多执行任务数（安全闸；0=不限）|
+| `require_ready` / `ready_topic` | true / `/ready` | 执行门闸（见 §1）|
+| `control_period` / `xarm_wait_for_finish` | 0.05 / true | 状态机周期 / 写 `/xarm/wait_for_finish` |
 | `stop_on_motion_failure` | true | 失败即清队停机 |
 | `verify_native_xyz_after_motion` / `native_xyz_tolerance_mm` | true / 6.0 | 到位校验 / 容差 |
 | `native_verify_timeout_s` / `native_verify_poll_hz` | 1.0 / 50 | 校验超时 / 频率 |
@@ -159,17 +169,19 @@ geometry_msgs/Pose place_hover_pose   放置悬停 (base, 沿 board 法向)
 
 ---
 
-## 7. 用 test_controller.launch 单独测试
+## 7. 用 [test_controller.launch](../src/lucky/launch/test_controller.launch) 单独测试
 
-`test_controller.launch` 起控制器所需最小依赖（含 path_planner，不起 vision/strategy）。
+[test_controller.launch](../src/lucky/launch/test_controller.launch) 起控制器所需最小依赖（含 path_planner，不起 vision/strategy）。
 
 ```bash
 roslaunch lucky test_controller.launch robot_ip:=192.168.1.216
 # 手动喂一个方案（17-int，经 path_planner 解算成 /motion_cmds 触发一次抓放）
 rostopic pub -1 /tetris_plan std_msgs/Int32MultiArray "..."
+# 该 launch 未设 require_ready，控制节点按默认 true 等门闸：放行执行
+rostopic pub -1 /ready std_msgs/Bool "{data: true}"
 # 单步模式逐点放行
 rostopic pub -1 /xarm_controller/continue std_msgs/Empty "{}"
 ```
 
-> ⚠️ 本 launch **会驱动真机**。运行前确认工作区无人、急停可达；默认仅执行 1 个任务。test
-> 文件里各段速度上调到了较高值（如 transit 500mm/s），按现场酌情调整。
+> ⚠️ 本 launch **会驱动真机**。运行前确认工作区无人、急停可达；`max_tasks_per_plan=1`，仅执行 1 个
+> 任务。launch 里 transit/loaded 速度设为 500mm/s（与 [lucky.launch](../src/lucky/launch/lucky.launch) 一致），按现场酌情调整。
