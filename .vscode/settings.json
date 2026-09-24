@@ -1,5 +1,5 @@
 {
-    "cmake.sourceDirectory": "/root/catkin_ws/src/tly",
+    "cmake.sourceDirectory": "/root/catkin_ws/src/lucky",
     "ros.distro": "humble",
     "ROS2.distro": "humble",
     "python.autoComplete.extraPaths": [

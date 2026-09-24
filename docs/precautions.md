@@ -1,7 +1,7 @@
 # 注意事项与踩坑汇总
 
 本文汇总操作安全、机械臂运动学、标定、坐标系、代码结构等各方面的**注意事项**与**已踩过的坑**。
-来源：`CLAUDE.md` + 历次真机排查记录。多数条目给出「现象 → 根因 → 做法」，遇到相关症状先来这里查。
+来源：[CLAUDE.md](../CLAUDE.md) + 历次真机排查记录。多数条目给出「现象 → 根因 → 做法」，遇到相关症状先来这里查。
 
 ---
 
@@ -12,14 +12,17 @@
 - **电磁阀（吸盘）**：控制口 **CO0**，对应服务 `/xarm/set_controller_dout`，`io_num=1`。
 - **容器内开 GUI**：宿主机终端先执行 `xhost +local:docker`。
 - **看相机原始画面**：`realsense-viewer`。
+- **执行前检查是否开启空气压缩机**
 
 ---
 
 ## 2. 机械臂关节与运动学（最容易出事的一类）
 
 ### 2.1 启动 MoveIt / realMove_exec 前，J1/J4/J6 必须远离 ±360° 边界
-凡包含 `xarm6_moveit_config/realMove_exec.launch` 的 launch（`calibrate_tool.launch`、旧
-`test_pick.launch` 等），在打印 `Started controllers: xarm6_traj_controller, joint_state_controller`
+凡包含 `xarm6_moveit_config/realMove_exec.launch` 的 launch（[calibrate_tool.launch](../src/lucky/launch/calibrate_tool.launch)、
+[pixel_touch_check.launch](../src/lucky/launch/pixel_touch_check.launch)、
+[xarm_calibration_setup_moveit.launch](../src/lucky/launch/xarm_calibration_setup_moveit.launch)、旧
+[test_pick.launch](../src/lucky/launch/test_pick.launch)），在打印 `Started controllers: xarm6_traj_controller, joint_state_controller`
 那一刻，MoveIt 会把臂从 UF Studio 位姿模式切到 **SERVO 关节伺服模式**。
 - **现象**：若某个 ±2π 关节（J1/J4/J6）此时绕在接近 ±360° 处，切模式瞬间会触发一次**未经规划的
   大幅摆动**。实测 J4=−358.4°（距硬限仅 1.6°）启动 → J4 甩约 180°、触发保护停止（state 5）。
@@ -37,16 +40,18 @@ J6 落哪一圈。
 - **一旦 J6 越过约 ±180° 就再也无法用笛卡尔指令拉回**（就近解会往更远那圈走）→ 策略只能**预防**。
 - 唯一能主动用的自由度是 **180° 翻转**（`flip`，真正改变 `R`，固件照做；吸盘对 180° 对称，
   pick/place 同步翻转后落点不变）。
-- **谁在做择优（注意 CLAUDE.md 此段已过时）**：A（不翻）/B（翻 180°）的选择现在由
-  **`path_planner_node`** 负责（不再是控制节点 `buildTask`）。目标是**关节空间路程最小**
-  （各轴同时到达，多转的角会成为整段速度瓶颈）；J6 软/硬限位（`wrist_soft_limit_rad` /
-  `wrist_hard_limit_rad`）作为惩罚/排除**约束**。详见 [path_plan.md](path_plan.md)。
+- **谁在做择优**：A（不翻）/B（翻 180°）的选择由 **`path_planner_node`** 负责（控制节点是纯执行器，
+  旧的 `buildTask` 已删）。目标是**沿 `move_line` 路径积分的关节时间最小**（各轴同时到达，多转的角会成为
+  整段速度瓶颈）；J6 软/硬限位（`wrist_soft_limit_rad` / `wrist_hard_limit_rad`）作为惩罚/排除**约束**，
+  另有 `wrist_center_*` 保余量势垒 + 丢块时自动升挡重解，防止为省翻转把 J6 单向绕到边界。详见
+  [path_plan.md](path_plan.md) §D.2、§D.3.1。
 
 ### 2.3 J6 可能在「运输途中」越限（不只端点）
 只在端点检查 J6 限位不够：直线 `move_line` 上 J1 非线性摆动（近底座快），J6≈heading−J1 会在**途中**
 超过两端点。`path_planner` 已改为**沿运输段采样 J6**（`transit_j6_samples`，IK 连续 seed）取路径
-`max|J6|`。若没有任何 flip/换块/重排能把运输段压进硬限位，`optimizePlan` 直接 **fail-stop**
-（打印 `PLANNING FAILED` 不发布、不清错，让问题在调试期暴露）。
+`max|J6|`。若自动升挡用尽后仍没有任何 flip/换块/重排能把运输段压进硬限位：首个任务即不可行时 **fail-stop**
+（打印 `PLANNING FAILED`、不发布）；中途不可行则只发布最长合法前缀并告警
+（`center-escalation exhausted`），让问题在调试期暴露。
 
 ### 2.4 关节空间运动已被否决
 显式用关节空间（`set_servo_angle` / `move_joint`）虽能确定性指定 J6 圈数，但**关节运动的 TCP 轨迹
@@ -58,7 +63,7 @@ J6 落哪一圈。
 - **根因**：同一关节角下 **ROS/URDF 正运动学 ≠ xArm 固件出厂逐台标定运动学**。本机实测固件
   `/xarm/xarm_states.pose` 与 ROS TF `link_base→link_tcp` 差 **~4.4mm XY + ~1.2°**。标定用 ROS TF
   记录、执行用 `move_line`（固件系）→ 记录源≠执行源，偏差进链路。
-- **做法**：`calibrate_board.py` 已加 `~use_firmware_pose`（默认 true）：订阅 `/xarm/xarm_states`、
+- **做法**：[calibrate_board.py](../src/lucky/scripts/calibrate_board.py) 已加 `~use_firmware_pose`（默认 true）：订阅 `/xarm/xarm_states`、
   用固件 TCP 记录触点。改此项后**必须重跑步骤 3 + 步骤 7**。下游无需改代码（controller 纯执行器；
   path_planner 放置走常量 `BOARD_POSE_BASE`、抓取 XY 被单应性覆盖）。
 
@@ -103,26 +108,29 @@ OpenCV 鼠标回调返回的是**显示坐标**而非图像坐标。
 - **量级**：本机初始点工具轴离白板法向仅 **2.08°**，杠杆 67mm → 抓取横向**至多 ~2.44mm**，是次要项，
   别指望它根治吸偏。
 
-### 3.5 改了 board 坐标系，必须重跑 pick_affine
-`calibrate_board` 重定坐标系后，抓取单应性 `PICK_HOMOGRAPHY` 也失效，**必须重跑 `pick_affine`**
-（`affine.launch`）。同理凡涉及固件 pose/TCP 的改动，都要重跑步骤 3 + 步骤 7。详见 [calibrate.md](calibrate.md)。
-
-> ⚠️ **待办（clean cut）**：base 化重构后，旧标定失效，须在真机重跑 `calibrate_board` → `pick_affine`，
-> 再用 `test_controller.launch`（限 1 任务）验证放置朝向——X 轴自动对齐尚未硬件验证。
+### 3.5 改了 board 坐标系，必须重跑步骤 7（抓取单应性）
+`calibrate_board` 重跑步骤 3（重定坐标系）后，抓取单应性 `PICK_HOMOGRAPHY` 也失效，**必须重跑步骤 7**
+（旧的独立工具 `pick_affine_calibration_tool.py` / `affine.launch` 已删除，其功能并入
+[calibrate_board.py](../src/lucky/scripts/calibrate_board.py) 步骤 7）。同理凡涉及固件 pose/TCP 的改动，
+都要重跑步骤 3 + 步骤 7。详见 [calibrate.md](calibrate.md)。改完用
+[test_controller.launch](../src/lucky/launch/test_controller.launch)（限 1 任务）验证放置朝向。
 
 ---
 
 ## 4. 抓取高度 / 深度 / 视差
 
-### 4.1 pick Z = 固定 `PICK_Z`；视差只改 X/Y
-- 控制/路径里的视差补偿**只改 X/Y，从不动 Z**，不可能造成「抓取偏高」这种纯高度误差。
-- 当前 `tetris_config.yaml` **没有** `PICK_SURFACE_PLANE_BASE`，pick Z 被钉死为常量 `PICK_Z`（≈0.01，
-  board 系）+ 波纹管下压（`tcp_pick_offset_z`）。前提：散料**单层平铺**、不叠层。
-- 「有些块偏高」是逐块厚度/坐落差异 + 单一 `PICK_Z` 盖不住，不是视差或手眼。
+### 4.1 pick Z = 标定抓取平面；视差只改 X/Y
+- `path_planner` 里的视差补偿**只改 X/Y，从不动 Z**，不可能造成「抓取偏高」这种纯高度误差。
+- 当前 [tetris_config.yaml](../src/lucky/config/tetris_config.yaml) **已有** `PICK_SURFACE_PLANE_BASE`，且
+  `use_true_pick_plane=true`，pick Z = 相机射线与该标定平面的交点（逐点随平面倾斜变化）+ 波纹管补偿
+  （`tcp_pick_offset_z`，[lucky.launch](../src/lucky/launch/lucky.launch) 设 0.01）；平面缺失时才回退常量 `PICK_Z`（≈0.0097，board 系）。
+  前提：散料**单层平铺**、不叠层。
+- 「有些块偏高」是逐块厚度/坐落差异 + 单一平面盖不住，不是视差或手眼。
 
 ### 4.2 RealSense 逐块深度已关（±8mm 太不准）
-`path_planner` 的 `use_depth_pick_z` **已于 2026-06-28 关闭**：RealSense 逐块深度实测有时差到 ~8mm，
-比单一常量还糟；关掉后 path 节点连深度话题都不订阅。视觉节点 `lucky.launch` 里的 `use_depth_pick_z=true`
+`path_planner` 的 `use_depth_pick_z` **已于 2026-06-28 在 [lucky.launch](../src/lucky/launch/lucky.launch) 里关闭**
+（代码默认仍为 true）：RealSense 逐块深度实测有时差到 ~8mm，比单一平面还糟；关掉后 path 节点连深度话题都不订阅。
+视觉节点在 [lucky.launch](../src/lucky/launch/lucky.launch) 里的 `use_depth_pick_z=true`
 是 **debug-only**（只发 `/vision/pick_depth_debug`，从不写 `board_state`）。**别再建议靠深度修逐块高度。**
 
 ---
@@ -140,33 +148,40 @@ OpenCV 鼠标回调返回的是**显示坐标**而非图像坐标。
 
 ### 5.2 base 原生；`table_frame` 已删
 流水线已全部 base 原生：旧 `table_frame` TF 与 `table_tf_broadcaster.py` 已删，坐标系由白板网格派生、
-存为常量 `BOARD_POSE_BASE`。控制/路径节点把它当常量 `tf2::Transform` 加载，唯一动态 TF 是 `camera→base`。
+存为常量 `BOARD_POSE_BASE`。`path_planner_node` 把它当常量 `tf2::Transform` 加载，唯一动态 TF 是 `camera→base`；控制节点是纯执行器、
+不需要任何 TF。
 视觉的 `table_frame` 参数只用于 debug（默认 `link_base`），`board_state` 从不依赖它。
 
 > `way`/放置朝向约定脆弱：放置 yaw = `−way*90°`；`calibrate_board` 会把坐标系 X 轴贴合到最接近旧系的
 > 网格轴以保约定。搞错这个符号/轴 → 放置朝向翻 90°/180°、方块错位。
 
 ### 5.3 方块是彩色的
-放置/抓取的多联骨牌是**彩色**的，不是黑色（`CLAUDE.md` 及部分旧描述里的「黑色」不准确）。写文档/注释
+放置/抓取的多联骨牌是**彩色**的，不是黑色（部分旧描述/代码注释里的「黑色」不准确）。写文档/注释
 一律用「彩色」。
 
 ---
 
 ## 6. 代码结构（改动前必查）
 
-- **只有部分 `.cpp` 被编译**：按 `CMakeLists.txt`，只有 `strategy_node`、`xarm_controller_node`、
-  `vision_processor_node_cpp`、`vision_processor_node_dexined`、`path_planner_node` 会被构建。
-  `src/vision_processor_node_cuda.cpp`、`src/xarm_controller_node_pliz.cpp` **不在构建里**（参考用旧变体）。
-  改它们对运行无影响——**认定某个 `.cpp` 是活的之前，先查 `CMakeLists.txt`**。
-- **`scripts/vision_processor_node.py`** 是同契约的 Python 重实现，仅供 `affine.launch` 标定使用，
-  不进生产（`lucky.launch` 用 C++ 节点）。
-- **两套相机曝光/色彩档要配对**：DexiNed 用 `config/camera_config.yaml`、经典 `_cpp` 用
-  `config/camer_config_1.yaml`；launch 硬编码加载前者，切换视觉实现时相机档要一并换。详见
-  [vision.md](vision.md) §5.0。
-- **配置文件当数据、别手改**：`config/tetris_config.yaml` 由标定工具生成/覆盖；同名 `.bak_before_*`
-  是时点备份，供参考/回滚。
+- **编译哪些节点以 [CMakeLists.txt](../src/lucky/CMakeLists.txt) 为准**：[CMakeLists.txt](../src/lucky/CMakeLists.txt) 构建
+  `strategy_node`、`xarm_controller_node`、`vision_processor_node_cpp`、`vision_processor_node_dexined`、
+  `path_planner_node` 五个可执行文件（旧变体 `vision_processor_node_cuda.cpp`、`xarm_controller_node_pliz.cpp`
+  已从仓库删除）。[test_tetris_solver.cpp](../src/lucky/test/test_tetris_solver.cpp) 未接入构建。
+- **[vision_processor_node.py](../src/lucky/scripts/vision_processor_node.py)** 是同契约的 Python 重实现，
+  **当前没有任何 launch 使用**（原用它的 `affine.launch` 已删），不进生产（生产用 C++ 节点）。
+- **[test_pick.launch](../src/lucky/launch/test_pick.launch) 已不可用**：它不起 `path_planner_node`，而控制节点
+  只消费 `/motion_cmds`，[single_block_test.py](../src/lucky/scripts/single_block_test.py) 发的 `/tetris_plan`
+  无人解算。
+- **两套相机曝光/色彩档要配对**：DexiNed 用 [camera_config.yaml](../src/lucky/config/camera_config.yaml)、经典
+  `_cpp` 用 [camera_config_1.yaml](../src/lucky/config/camera_config_1.yaml)；launch 硬编码加载前者，切换视觉
+  实现时相机档要一并换。详见 [vision.md](vision.md) §9。
+- **速度参数两处同步**：控制节点 `transit_speed_mm_s` / `loaded_transit_speed_mm_s` 必须等于 path_planner 的
+  `transit_lin_speed_m_s` / `loaded_lin_speed_m_s` ×1000，否则关节代价模型失真（见
+  [lucky.launch](../src/lucky/launch/lucky.launch) 里的"同步点"注释）。
+- **配置文件当数据、别手改**：[tetris_config.yaml](../src/lucky/config/tetris_config.yaml) 由标定工具生成/覆盖；
+  回滚靠 git 历史（仓库里已无 `.bak_before_*` 备份文件）。
 
 ---
 
-> 更底层的机制与最新架构以 `CLAUDE.md`、[path_plan.md](path_plan.md)、[control.md](control.md)、
+> 更底层的机制与最新架构以 [CLAUDE.md](../CLAUDE.md)、[path_plan.md](path_plan.md)、[control.md](control.md)、
 > [calibrate.md](calibrate.md)、[vision.md](vision.md) 为准；本文只做「注意事项 + 踩坑」的集中索引。

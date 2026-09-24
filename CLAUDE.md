@@ -13,7 +13,7 @@
 ## 项目概览
 
 ROS 1 (Noetic) catkin 工作区，用于一台 xArm6 机械臂：用 RealSense 相机识别
-背光板上的黑色多联骨牌（"俄罗斯方块"），再用真空吸盘把它们抓取并放入固定的
+背光板上的彩色俄罗斯方块，再用真空吸盘把它们抓取并放入固定的
 14x10 网格，目标是放进尽可能多的方块（一个精确覆盖装箱问题）。
 
 物理叠放关系（容易踩坑，务必记清）：**白板（14x10 放置网格，带 140 个 2~3mm 凸起）
@@ -23,11 +23,10 @@ ROS 1 (Noetic) catkin 工作区，用于一台 xArm6 机械臂：用 RealSense �
 是否摆了方块"必须以**逐格白板凸起顶面**（`BOARD_BUMP_HEIGHT_MAP_14x10`，步骤3采）
 为基准，不能用发光板平面 `BOARD_SURFACE_Z`。
 
-所有活跃开发都在 `src/lucky`。`src/` 下其余内容（`xarm_ros`、`realsense-ros`、
-`vision_opencv`、`easy_handeye`）都是引入的第三方依赖——`.gitignore` 已把
-`src/xarm_ros`、`src/realsense-ros`、`src/easy_handeye`、`OpenCV_Source/`、
-`build/`、`devel/` 排除在本仓库历史之外。一般不需要改它们，当作已安装的包对待。
-根目录的 `docs/`为各个部分的介绍
+所有活跃开发都在 [src/lucky](src/lucky)。`src/` 下其余内容（`xarm_ros`、`realsense-ros`、
+`vision_opencv`、`easy_handeye`）都是引入的第三方依赖——[.gitignore](.gitignore) 已把
+它们以及 `OpenCV_Source/`、`build/`、`devel/` 排除在本仓库历史之外。一般不需要改它们，
+当作已安装的包对待。根目录的 [docs/](docs/) 为各个部分的介绍（入口 [docs/readme.md](docs/readme.md)）。
 
 
 ## 构建 / 运行
@@ -38,80 +37,101 @@ catkin_make            # 在 /root/catkin_ws 下执行 —— 唯一在用的构
 source devel/setup.bash
 ```
 
-`src/lucky/CMakeLists.txt` 全局强制 `-std=c++14` 和 `-O3`——`-O3` 是专门为
+[src/lucky/CMakeLists.txt](src/lucky/CMakeLists.txt) 全局强制 `-std=c++14` 和 `-O3`——`-O3` 是专门为
 `strategy_node` 的 DLX 搜索（计算密集）加的，改构建配置时别去掉。`lucky` 本身没有
-lint/测试套件。
+lint/测试套件（[src/lucky/test/test_tetris_solver.cpp](src/lucky/test/test_tetris_solver.cpp) 未接入 CMake，需手动编译）。
 
 对真机跑完整流水线：
 
 ```bash
-roslaunch lucky lucky.launch robot_ip:=192.168.1.228
+roslaunch lucky lucky.launch robot_ip:=192.168.1.216   # launch 默认 IP
+rostopic pub -1 /ready std_msgs/Bool "{data: true}"    # 控制节点默认 require_ready=true，需放行
 ```
 
-按节点划分的 `test_*.launch`（只起某个节点需要的东西，省得跑整个 `lucky.launch`
-流水线）。所有带视觉的都可用 `vision_node:=vision_processor_node_dexined` 切换
-视觉实现。
-- `test_vision.launch` —— **仅视觉**：相机 + `image_proc` + 视觉节点。无臂/TF/
+按节点划分的 `test_*.launch`（只起某个节点需要的东西，省得跑整个
+[lucky.launch](src/lucky/launch/lucky.launch) 流水线）。带视觉的默认用 DexiNed 版，可用
+`vision_node:=vision_processor_node_cpp` 切到经典实现。
+- [test_vision.launch](src/lucky/launch/test_vision.launch) —— **仅视觉**：相机 + 视觉节点。无臂/TF/
   策略。查看 `/vision/board_state`、`/vision/debug_image`、`/vision/pick_depth_debug`。
-- `test_strategy.launch` —— **仅策略**，无硬件。发一个假的 `/vision/board_state`
-  驱动它；看 `/tetris_plan`。
-- `test_path.launch` —— **感知→策略→路径**链路。需要臂提供 TF（`robot_ip:=`），
-  但绝不命令运动。发布 `/motion_cmds`；对比 `[PATH][TASK]` 的 `z_plane`/`z_depth` 日志。
-- `test_controller.launch` —— **仅控制器** + 臂 + 相机。手动喂 `/tetris_plan`；
-  **会驱动真机**（限 1 个任务）。原生驱动，非 MoveIt。
-- `test_pick.launch` —— 较旧的基于 MoveIt 的集成测试：视觉 + `xarm_controller_node`
-  + `single_block_test.py`，一次抓放循环。
+- [test_strategy.launch](src/lucky/launch/test_strategy.launch) —— **仅策略**，无硬件。发一个假的
+  `/vision/board_state` 驱动它；看 `/tetris_plan` 与 `/tetris_plan_candidates`。
+- [test_path.launch](src/lucky/launch/test_path.launch) —— **感知→策略→路径**链路。需要臂提供 TF 与
+  `joint_states`（`robot_ip:=`），但没有控制节点、绝不命令运动。发布 `/motion_cmds`；看 `[PATH]` 日志。
+- [test_controller.launch](src/lucky/launch/test_controller.launch) —— **path_planner + 控制器** + 臂 + 相机；
+  手动喂 `/tetris_plan`，经 path_planner 解算成 `/motion_cmds`。**会驱动真机**（限 1 个任务）；
+  控制节点默认 `require_ready=true`，还需发 `/ready`。原生驱动，非 MoveIt。
+- [test_pick.launch](src/lucky/launch/test_pick.launch) —— 旧的基于 MoveIt 的单块集成测试（视觉 +
+  `xarm_controller_node` + [single_block_test.py](src/lucky/scripts/single_block_test.py)）。**已与现架构脱节、不可用**：
+  它不起 `path_planner_node`，而控制节点只消费 `/motion_cmds`，[single_block_test.py](src/lucky/scripts/single_block_test.py) 发的
+  `/tetris_plan` 无人解算；其中的 MoveIt/速度比例参数控制节点也已不读。
 
-`src/lucky/launch/` 下其它 launch：
-- `lucky.launch` —— 生产运行。仅用 xArm 原生驱动（明确*不用* MoveIt/Pilz）。端到端
-  起相机、手眼 TF、视觉、控制器、策略、`path_planner_node`。
-- `affine.launch` / `calibrate_tool.launch` / `calibrate_xarm.launch` /
-  `xarm_calibration_setup.launch` —— 标定工具，见下文。
+[src/lucky/launch/](src/lucky/launch/) 下其它 launch：
+- [lucky.launch](src/lucky/launch/lucky.launch) —— 生产运行。仅用 xArm 原生驱动（明确*不用* MoveIt/Pilz）。
+  端到端起相机、手眼 TF、视觉、策略、`path_planner_node`、控制器。
+- 标定/诊断工具（见下文与 [docs/calibrate.md](docs/calibrate.md)）：
+  [xarm_calibration_setup.launch](src/lucky/launch/xarm_calibration_setup.launch)、
+  [xarm_calibration_setup_moveit.launch](src/lucky/launch/xarm_calibration_setup_moveit.launch)、
+  [calibrate_xarm.launch](src/lucky/launch/calibrate_xarm.launch)、
+  [calibrate_tool.launch](src/lucky/launch/calibrate_tool.launch)、
+  [verify_camera.launch](src/lucky/launch/verify_camera.launch)、
+  [pixel_touch_check.launch](src/lucky/launch/pixel_touch_check.launch)、
+  [measure_tcp_omega.launch](src/lucky/launch/measure_tcp_omega.launch)。
 
 ## 节点流水线 (src/lucky)
 
-三个自定义节点通过固定的话题/服务契约通信：
+四个自定义节点通过固定的话题契约串联：
+`/vision/board_state` → `/tetris_plan` + `/tetris_plan_candidates` → `/motion_cmds` → 真机。
 
-**1. `vision_processor_node` / `vision_processor_node_cpp`**
-（由 `src/vision_processor_node.cpp` 编译）
-- 订阅校正后的彩色图（`image_proc` 输出）与相机内参；在亮板上分割暗色方块
-  （Otsu/手动阈值 + 发光板掩膜），提取轮廓，并按步进旋转的 7 个多联骨牌模板
-  逐一分类（`template_angle_step` / `template_refine_step`）。
-- 可选地用在 CUDA 上跑的 DexiNed ONNX 模型细化方块边缘（`module/dexined.onnx`，
-  由 `use_dexined` 开关）——这是替代旧经典边缘检测的神经网络边缘检测器。
+**1. 视觉：`vision_processor_node_dexined` / `vision_processor_node_cpp`**
+（分别由 [vision_processor_node_dexined.cpp](src/lucky/src/vision_processor_node_dexined.cpp) 与
+[vision_processor_node.cpp](src/lucky/src/vision_processor_node.cpp) 编译；两者话题/消息契约一致，
+launch 用 `vision_node:=` 选择，生产默认 DexiNed 版）
+- 订阅彩色图与相机内参；在亮板上分割方块（Otsu/手动阈值 + HSV 饱和度彩色前景 + 发光板
+  掩膜），提取轮廓，并按步进旋转的 7 个多联骨牌模板逐一分类（`template_angle_step` /
+  `template_refine_step`）。
+- DexiNed 版另用 ONNX 边缘检测网络（[module/dexined.onnx](src/lucky/module/dexined.onnx)，强制 CUDA 后端，失败回退经典
+  流程）+ Lab 颜色边界切割分开贴碰块，并有输入帧 EMA（`temporal_alpha`）与同帧 NMS。
 - 跨帧跟踪检测（`track_history_len`、`stable_min_frames`、`stable_max_px_std`…），
   方块稳定后才发布。
 - 发布：
   - `/vision/board_state`（`std_msgs/Int32MultiArray`）：7 个形状库存 + 140 个
-    棋盘占用栅格（`BOARD_ROWS` x `BOARD_COLS` = 14x10）+ `num_blocks` + 每个检测
-    方块一个扁平的 `[shape, u, v, angle]` 元组。`strategy_node` 要求
-    `data.size() >= 147`（7+140）后再读其余部分。
-  - `/vision/tracked_blocks_table`（`geometry_msgs/PoseArray`）以及 `/vision/debug_*`
-    和 `/vision/preprocess/*` 下的调试图话题。
-  - 服务 `/vision/get_precise_pose`（`lucky/GetPrecisePose`）：给定 `target_shape_type`，
-    返回细化的 `dx`/`dy`/`angle`。注意：本仓库当前没有节点调用此服务——它仅供
-    未来/手动使用。
+    棋盘占用栅格（`BOARD_ROWS` x `BOARD_COLS` = 14x10，视觉端置 0）+ `num_blocks` + 每个检测
+    方块一个扁平的 `[shape, pick_u, pick_v, angle, geom_u, geom_v]` 六元组。`strategy_node`
+    要求 `data.size() >= 147`（7+140）后再读其余部分。
+  - `/vision/tracked_blocks_table`（`geometry_msgs/PoseArray`）、`/vision/pick_depth_debug`
+    （`Float32MultiArray`），以及 `/vision/debug_*` 和 `/vision/preprocess/*` 下的调试图话题。
+  - 不提供任何服务。
 
-**2. `strategy_node`**（`src/strategy_node.cpp`）
+**2. `strategy_node`**（[strategy_node.cpp](src/lucky/src/strategy_node.cpp)，求解引擎在
+[tetris_solver.hpp](src/lucky/include/lucky/tetris_solver.hpp)）
 - 等 `/vision/board_state`，直到库存在 `expected_total_blocks`（默认 35）稳定
-  `inventory_stable_required_frames` 帧；若稳定帧数不够，有兜底接受
-  `min_usable_total_blocks`（默认 34-35）。
+  `inventory_stable_required_frames` 帧；若只差 1 个，有兜底接受
+  `min_usable_total_blocks`（代码默认 34，[lucky.launch](src/lucky/launch/lucky.launch) 设 35）。
 - 把放置当作精确覆盖问题求解，用手写的 Dancing Links（DLX）引擎在
-  `BASE_SHAPES`（7 个类俄罗斯方块）及其 4 种旋转上，带重启地搜索最高分覆盖
-  （`max_search_nodes` / `max_restarts`）。
-- 在 `/tetris_plan`（`std_msgs/Int32MultiArray`，latched）上发布一次方案。
+  `BASE_SHAPES`（7 个类俄罗斯方块）及其 4 种旋转上，带重启地搜索最高分覆盖，并收集
+  最多 `num_strategy_candidates`（默认 8）套同分布局。进阶模式（`advanced_mode`）改用
+  束搜索按 `shape_sequence` 求解。
+- 发布（latched）：`/tetris_plan` 为首选方案（17-int/任务），`/tetris_plan_candidates` 为
+  全部同分候选 `[K, len0, plan0, len1, plan1, ...]`。
 
-**3. `xarm_controller_node`**（`src/xarm_controller_node.cpp`）
+**3. `path_planner_node`**（[path_planner_node.cpp](src/lucky/src/path_planner_node.cpp)，运动学在
+[xarm6_kinematics.hpp](src/lucky/include/lucky/xarm6_kinematics.hpp)）
+- 消费 `/tetris_plan_candidates`（`use_plan_candidates=true`，否则 `/tetris_plan`）与
+  `/vision/board_state`（同形状抓取候选池），加载 `/tetris/*` 标定，把像素抓取点（单应性 XY +
+  抓取平面 Z + 高度视差补偿）与目标格（格心双线性 + 逐格最高放置 Z）全部解算成 **base 系**位姿。
+- 读 `/xarm/joint_states`，用 xArm6 FK/IK 沿 `move_line` 直线路径积分关节时间代价，联合优化
+  放置顺序（DAG 内，`allow_reorder`）× 同形状抓取分配 × 腕部 180° 翻转，并做 J6 限位约束与
+  "保余量"势垒 + 自动升挡重解；多候选时逐个评估取总代价最小者。
+- 发布 `/motion_cmds`（`lucky/MotionPlan`，见 [MotionPlan.msg](src/lucky/msg/MotionPlan.msg) /
+  [MotionTask.msg](src/lucky/msg/MotionTask.msg)，每任务 4 个 base 位姿）与调试用 `/tetris_plan_opt`。
+
+**4. `xarm_controller_node`**（[xarm_controller_node.cpp](src/lucky/src/xarm_controller_node.cpp)）
+- **纯执行器**：只消费 `/motion_cmds`，**不加载任何标定、不做坐标换算或腕部决策**。
 - 仅通过 xArm 的*原生*服务驱动臂——`/xarm/set_mode`、`/xarm/set_state`、
-  `/xarm/move_line`，加上吸盘的数字 IO 服务（`suction_io_num`）——绝不用 MoveIt。
-- 消费 `/tetris_plan` 一次，跑逐任务状态机（`IDLE` → `TAKE_NEXT_TASK` →
-  `MOVE_TO_PICK_HOVER` → `EXECUTE_PICK` → `MOVE_TO_PLACE_HOVER` → `EXECUTE_PLACE`
-  → `FINISH`），上限 `max_tasks_per_plan`。
-- 用 `tetris_config.yaml` 里的标定数据（抓取面平面、棋盘映射、抓取单应性）结合
-  easy_handeye 的 eye-on-hand TF，把像素检测转成机器人 base 坐标。整条流水线是
-  **base 原生**的：它把 `BOARD_POSE_BASE`（board_frame 在 base 系的位姿）作为常量
-  `tf2::Transform` 加载，所有抓放计算都在 `link_base` 系完成；唯一需要的动态 TF 是
-  `camera->base`。已无 `table_frame` TF。
+  `/xarm/move_line`，加上吸盘的数字 IO 服务 `/xarm/set_controller_dout`（`suction_io_num`）——绝不用 MoveIt。
+- 逐任务状态机：`IDLE` → `WAIT_FOR_READY`（`require_ready=true` 时等 `/ready` 发 `true`）→
+  `TAKE_NEXT_TASK` → `MOVE_TO_PICK_HOVER` → `EXECUTE_PICK` → `MOVE_TO_PLACE_HOVER` →
+  `EXECUTE_PLACE` → … → `FINISH`，上限 `max_tasks_per_plan`（代码默认 1，[lucky.launch](src/lucky/launch/lucky.launch) 设 34）。
 - 发布 `/robot_status`（`std_msgs/Bool`，latched）作为忙/闲标志。
 
 腕部 yaw / J6 处理（**重要踩坑，务必记清**）：xArm 笛卡尔接口（`move_line`/原生
@@ -123,67 +143,80 @@ roslaunch lucky lucky.launch robot_ip:=192.168.1.228
 J6 绕圈 DP `assignYaws` 因此被撤除）；(2) **一旦 J6 越过约 ±180° 就再也无法用笛卡尔
 指令拉回**（就近解会朝更远那一圈走），所以策略只能"预防"不能"补救"。能动的唯一自由度
 是 **180° 翻转**（`flip`，真正改变了 `R`，固件会照做；吸盘对 180° 对称，pick/place
-**同步**翻转后落点不变）。控制节点 `buildTask` 对每个任务在 A（不翻）/B（翻 180°）两套
-方案里选择，目标是**腕部转角最小**——因为 xArm 各轴**同时到达**，多转的 yaw 会成为
-整段运动的速度瓶颈（例：只需 +1° 却反向转 179° 就会拖慢全程）；J6 限位仅作**约束**
-（`wrist_soft_limit_rad`，默认 ≈315°，硬限 ±2π），越软限位的方案才被排除。注意这里
-**不是**"把 J6 往 0 居中"——居中虽不撞限位但会制造大量多余转角。显式用关节空间
+**同步**翻转后落点不变）。翻转决策现在由 **`path_planner_node`** 负责（`evalPairJoint` 对每个
+（放置槽, 抓取块）在 A 不翻 / B 翻 180° 间择优）：代价是沿 `move_line` 路径积分的**关节时间**
+（xArm 各轴**同时到达**，多转的 yaw 会成为整段运动的速度瓶颈），J6 限位作约束——
+`wrist_soft_limit_rad`（代码默认 4.7≈269°，[lucky.launch](src/lucky/launch/lucky.launch) 设 3.7）越界秒尺度加罚、
+`wrist_hard_limit_rad`（代码默认 6.10，[lucky.launch](src/lucky/launch/lucky.launch) 设 6.14）越界直接排除；另有
+`wrist_center_*` 二次势垒让 |J6| 超出约 ±180° 时加罚、保住头寸以放满全部方块。注意这里
+**不是**"把 J6 往 0 居中"——留白带内不加势，居中会制造大量多余转角。控制节点的逐轴
+`unwrapAngle` 只保证下发角与当前姿态连续，不改翻转选择。显式用关节空间
 （`set_servo_angle`/`move_joint`）控制 J6 虽能确定性指定圈数，但**关节运动的 TCP 轨迹
 不可预测、有撞机风险，已否决**。
 
 坐标系：`board_frame` 完全由白板网格标定派生（原点=网格原点，X≈行轴，Z=板面法向），
-以常量 `BOARD_POSE_BASE`（`{origin, rpy}`）存于 `tetris_config.yaml`。旧的
-`table_frame` TF 与 `table_tf_broadcaster.py` 已删除（base 化重构）——
-`path_planner_node` 和 `pick_affine_calibration_tool.py` 同样加载 `BOARD_POSE_BASE`；
-视觉的 `table_frame` 参数现在只用于 debug（默认 `link_base`），`board_state` 从不
-依赖它。
+以常量 `BOARD_POSE_BASE`（`{origin, rpy}`）存于 [tetris_config.yaml](src/lucky/config/tetris_config.yaml)。
+旧的 `table_frame` TF 与 `table_tf_broadcaster.py` 已删除（base 化重构）——`path_planner_node`
+把 `BOARD_POSE_BASE` 作为常量 `tf2::Transform` 加载，所有抓放计算都在 `link_base` 系完成，
+唯一需要的动态 TF 是 `camera->base`；控制节点不需要任何 TF。视觉的 `table_frame` 参数现在只用于
+debug（默认 `link_base`），`board_state` 从不依赖它。
 
 ## 标定数据与形状契约
 
-`config/tetris_config.yaml`（`tetris:` 键下的全部）保存所有标定状态：手眼坐标系、
-`BOARD_POSE_BASE`（board_frame 在 base 系的位姿——原点=网格原点，Z=白板平面法向
+[tetris_config.yaml](src/lucky/config/tetris_config.yaml)（`tetris:` 键下的全部）保存所有标定状态：
+`BOARD_POSE_BASE`（board_frame 在 base 系的位姿——原点=网格原点，Z=板面法向
 `BOARD_SURFACE_NORMAL_BASE`，因为 base-Z 并不垂直于桌面）、14x10 棋盘网格的
 采样/原点/步长（board 局部坐标：`BOARD_SAMPLES_BOARD`、`BOARD_ORIGIN_BOARD`、
-`BOARD_CENTERS_14x10_BOARD`…）、抓取单应性（`PICK_HOMOGRAPHY`，`pixel -> board-XY`）、
-以及一个棋盘"凸起高度"模型（`BOARD_BUMP_HEIGHT_MODEL`、`USE_BUMP_HEIGHT_FOR_PLACE`），
-用于在方块坐落高度略有不同时修正 2.5D 高度视差。此文件由下述标定工具生成/覆盖——
-当作数据，别手改。同名的 `.bak_before_*` 是过去标定运行的时点备份，留作参考/回滚。
+`BOARD_CENTERS_14x10_BOARD`…）、逐格放置高度 `PLACE_Z_MAP_14x10`、抓取平面
+`PICK_SURFACE_PLANE_BASE`、抓取单应性（`PICK_HOMOGRAPHY`，`pixel -> board-XY`）、
+波纹管补偿 `TCP_PICK_OFFSET_Z`/`TCP_PLACE_OFFSET_Z`、以及棋盘"凸起高度"模型
+（`BOARD_BUMP_HEIGHT_MODEL` 等）。此文件由标定工具生成/覆盖——当作数据，别手改。
+手眼结果不在此文件里，由 `easy_handeye` 存到其自身目录。
 
-形状 ID 是 `strategy_node.cpp`、`vision_processor_node.cpp`/`.py`、
-`single_block_test.py` 共享的契约——见 `BASE_SHAPES`：`0` 一字、`1` 方块、`2` T、
-`3` L_left、`4` L_right、`5` Z_left、`6` Z_right。改这个枚举需要同步更新所有这些。
+形状 ID 是 [strategy_node.cpp](src/lucky/src/strategy_node.cpp)（`BASE_SHAPES` 在
+[tetris_solver.hpp](src/lucky/include/lucky/tetris_solver.hpp)）、两个 C++ 视觉节点、
+[vision_processor_node.py](src/lucky/scripts/vision_processor_node.py)、
+[single_block_test.py](src/lucky/scripts/single_block_test.py) 共享的契约：`0` 一字、`1` 方块（田）、
+`2` T、`3` L_left、`4` L_right、`5` Z_left、`6` Z_right。改这个枚举需要同步更新所有这些。
 
-标定流程：
-- `xarm_calibration_setup.launch` + `calibrate_xarm.launch` —— 通过 `easy_handeye`
-  做 ArUco 标记的 eye-on-hand 标定，产出 `xarm6_realsense_calibration_eye_on_hand`
-  数据，供 `lucky.launch` 里的 `easy_handeye/publish.launch` 使用。
-- `calibrate_tool.launch` → `scripts/calibrate_board.py` —— 交互式白板标定
-  （6 步；可用 `~steps` 只跑子集）。步骤 3 在 base 系采棋盘网格并**由网格派生
-  `board_frame`**（不再手动选原点/X），使放置朝向自动跟随棋盘网格；产出
-  `BOARD_POSE_BASE`、board 局部几何、逐格 place-Z 图、凸起高度，以及可选的波纹管 Z
-  补偿（步骤 6 → `TCP_PICK_OFFSET_Z`/`TCP_PLACE_OFFSET_Z`，由控制/路径节点自动读取）。
-  X 轴方向会贴合到现有坐标系以保持策略的 `way` 约定；**改坐标系后必须一并重跑
-  `pick_affine`。** 抓取 Z 来自 RealSense 深度，而非平面拟合。
-- `affine.launch` → `scripts/pick_affine_calibration_tool.py`（配合 Python 版
-  `vision_processor_node.py`）—— 标定抓取侧单应性（`pixel -> board-XY`）。记录
-  `base<-eef` 并经加载的 `BOARD_POSE_BASE` 换算；每当 `calibrate_board` 重定坐标系
-  都必须重跑。
-- `scripts/hsv_tuner.py`、`scripts/test_hsv.py`、`scripts/test_aruco.py` ——
-  独立的手动调试工具，未接入任何 launch。
+标定流程（详见 [docs/calibrate.md](docs/calibrate.md)）：
+- [xarm_calibration_setup.launch](src/lucky/launch/xarm_calibration_setup.launch)（原生驱动，手动 freehand）或
+  [xarm_calibration_setup_moveit.launch](src/lucky/launch/xarm_calibration_setup_moveit.launch)（MoveIt 自动采样）
+  → [calibrate_xarm.launch](src/lucky/launch/calibrate_xarm.launch) —— 以 ChArUco 板
+  （[charuco_tracker.py](src/lucky/scripts/charuco_tracker.py) 检测）做 eye-on-hand 手眼标定，产出
+  `xarm6_realsense_calibration_eye_on_hand`，供 `easy_handeye/publish.launch` 运行时广播。
+- [calibrate_tool.launch](src/lucky/launch/calibrate_tool.launch) → [calibrate_board.py](src/lucky/scripts/calibrate_board.py)
+  —— 交互式白板标定，**7 步**（可用 `~steps` 私有参数只跑子集，launch 未暴露该 arg，默认交互选择）：
+  1 拍照起点位姿；2 深度拟合发光板平面（Z 轴 + z=0 基准）；3 在 base 系采棋盘网格并**由网格派生
+  `board_frame`**（产出 `BOARD_POSE_BASE`、board 局部几何、凸起高度），X 轴贴合现有坐标系以保持策略的
+  `way` 约定；4 方块厚度；5 逐格放置 Z；6 可选波纹管 Z 补偿（`TCP_PICK_OFFSET_Z`/`TCP_PLACE_OFFSET_Z`，
+  由 `path_planner_node` 读取，但会被节点私有参数 `tcp_pick_offset_z`/`tcp_place_offset_z` 覆盖——
+  [lucky.launch](src/lucky/launch/lucky.launch) 当前显式设了这两项）；7 抓取单应性 `PICK_HOMOGRAPHY`。**重跑步骤 3（改坐标系）后必须一并
+  重跑步骤 7。** 另有专项模式 `edit_cells` / `verify_cells` / `depth_offset_check`。
+- 诊断/验证：[verify_camera_intrinsics.py](src/lucky/scripts/verify_camera_intrinsics.py)（相机内参，
+  [verify_camera.launch](src/lucky/launch/verify_camera.launch)）、
+  [pixel_touch_check.py](src/lucky/scripts/pixel_touch_check.py)（抓偏来源诊断）、
+  [measure_tcp_omega.py](src/lucky/scripts/measure_tcp_omega.py)（`omega_per_v_lin_rad_per_m` 测量）。
 
 ## 注意事项
 
-- 按 `CMakeLists.txt`，只有 `strategy_node`、`xarm_controller_node` 和
-  `vision_processor_node_cpp`（由 `src/vision_processor_node.cpp` 编译）会被编译。
-  `src/vision_processor_node_cuda.cpp` 和 `src/xarm_controller_node_pliz.cpp`
-  **不在**构建里——是留作参考的旧变体。改它们对运行无影响；在认定某个 `.cpp`
-  是活的之前，先查 `CMakeLists.txt`。
-- `scripts/vision_processor_node.py` 是同一节点/话题/服务契约的 Python 重实现
-  （与 `strategy_node.cpp` 保持形状 ID 兼容，见其模块 docstring），仅供
-  `affine.launch` 使用。生产（`lucky.launch`）用 C++ 节点。
+- 按 [CMakeLists.txt](src/lucky/CMakeLists.txt)，编译 5 个可执行文件：`strategy_node`、`xarm_controller_node`、
+  `vision_processor_node_cpp`、`vision_processor_node_dexined`、`path_planner_node`；安装的 Python 脚本只有
+  [vision_processor_node.py](src/lucky/scripts/vision_processor_node.py) 与
+  [single_block_test.py](src/lucky/scripts/single_block_test.py)（标定/诊断脚本直接以源码运行）。
+- [vision_processor_node.py](src/lucky/scripts/vision_processor_node.py) 是同一节点/话题契约的 Python
+  重实现（与 `strategy_node` 保持形状 ID 兼容），**当前没有任何 launch 使用它**；生产用 C++ 节点。
+- 两个视觉节点各配一套 RealSense 相机档：DexiNed 用 [camera_config.yaml](src/lucky/config/camera_config.yaml)
+  （lucky/test_vision launch 硬编码加载），经典 `_cpp` 用 [camera_config_1.yaml](src/lucky/config/camera_config_1.yaml)；
+  切换视觉实现时相机档要一并换。
+- **速度同步点**：控制节点的 `transit_speed_mm_s` / `loaded_transit_speed_mm_s` 必须与 path_planner 的
+  `transit_lin_speed_m_s` / `loaded_lin_speed_m_s`（÷1000）一致，否则关节代价模型失真。
 - **启动 MoveIt/realMove_exec 前，±360° 关节（J1/J4/J6）必须远离 ±360° 边界**
   （**重要踩坑**）：凡包含 `xarm6_moveit_config/realMove_exec.launch` 的 launch
-  （如 `calibrate_tool.launch`、旧的 `test_pick.launch`），在打印
+  （[calibrate_tool.launch](src/lucky/launch/calibrate_tool.launch)、
+  [pixel_touch_check.launch](src/lucky/launch/pixel_touch_check.launch)、
+  [xarm_calibration_setup_moveit.launch](src/lucky/launch/xarm_calibration_setup_moveit.launch)、旧的
+  [test_pick.launch](src/lucky/launch/test_pick.launch)），在打印
   `Started controllers: xarm6_traj_controller, joint_state_controller` 那一刻，
   MoveIt 会把臂从 UF Studio 位姿模式切到 **SERVO 关节伺服模式**
   （`xarm_driver.cpp` `set_mode(SERVO)+set_state(START)`）。若某个 ±2π 关节此时
