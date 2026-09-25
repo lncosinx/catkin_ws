@@ -1,10 +1,11 @@
 # 标定指南
 
-本文档介绍 `lucky` 工作区的全部标定流程：**手眼标定**（相机↔机械臂）、**白板标定**
+本文档介绍 `lucky` 工作区的全部标定流程：**末端 TCP 标定**（吸嘴尖↔法兰）、**手眼标定**（相机↔机械臂）、**白板标定**
 （放置网格几何 + 放置高度 + 抓取单应性）、以及若干**验证/对齐辅助工具**。
 
 所有标定结果最终都写入 [src/lucky/config/tetris_config.yaml](../src/lucky/config/tetris_config.yaml)（手眼结果除外，它由
-`easy_handeye` 存到自己的目录，由 `publish.launch` 在运行时广播）。这些文件当作数据，
+`easy_handeye` 存到自己的目录，由 `publish.launch` 在运行时广播；TCP 偏置也除外，它存在 UF Studio
+固件 TCP 配置 + 各 launch 里的 `link6→link_tcp` 静态 TF）。这些文件当作数据，
 不要手改。
 
 > 机械臂重复精度不高，长时间测试后建议重新标定。
@@ -24,19 +25,81 @@
 
 | 阶段 | 工具 launch | 产物 | 何时重跑 |
 |------|-------------|------|----------|
-| 1. 相机内参验证（可选自检） | [verify_camera.launch](../src/lucky/launch/verify_camera.launch) | 仅打印/校验，不写盘 | 换相机或怀疑内参时 |
-| 2. 手眼标定 | [xarm_calibration_setup_moveit.launch](../src/lucky/launch/xarm_calibration_setup_moveit.launch)（自动采样，不推荐）或 [xarm_calibration_setup.launch](../src/lucky/launch/xarm_calibration_setup.launch)（手动 freehand） | `xarm6_realsense_calibration_eye_on_hand`（base↔camera） | 换相机/重装相机支架/移动相机后 |
-| 3. 白板标定（含抓取单应性） | [calibrate_tool.launch](../src/lucky/launch/calibrate_tool.launch) → [calibrate_board.py](../src/lucky/scripts/calibrate_board.py)（7 步） | `BOARD_POSE_BASE`、网格几何、放置 Z 图、`PICK_HOMOGRAPHY` 等 | 手眼变了、白板/发光板移动后 |
+| 1. 末端 TCP 标定（只标 yaw 相关的 XY 偏置） | UF Studio 手动 + 本文公式（无专用 launch） | 固件 TCP 偏置 + 各 launch 的 `link6→link_tcp` 静态 TF | 换/重装吸嘴、吸嘴被撞歪后 |
+| 2. 相机内参验证（可选自检） | [verify_camera.launch](../src/lucky/launch/verify_camera.launch) | 仅打印/校验，不写盘 | 换相机或怀疑内参时 |
+| 3. 手眼标定 | [xarm_calibration_setup_moveit.launch](../src/lucky/launch/xarm_calibration_setup_moveit.launch)（自动采样，不推荐）或 [xarm_calibration_setup.launch](../src/lucky/launch/xarm_calibration_setup.launch)（手动 freehand） | `xarm6_realsense_calibration_eye_on_hand`（base↔camera） | 换相机/重装相机支架/移动相机后 |
+| 4. 白板标定（含抓取单应性） | [calibrate_tool.launch](../src/lucky/launch/calibrate_tool.launch) → [calibrate_board.py](../src/lucky/scripts/calibrate_board.py)（7 步） | `BOARD_POSE_BASE`、网格几何、放置 Z 图、`PICK_HOMOGRAPHY` 等 | 手眼变了、白板/发光板移动后 |
 | 验证 · 抓偏诊断 | [pixel_touch_check.launch](../src/lucky/launch/pixel_touch_check.launch) → [pixel_touch_check.py](../src/lucky/scripts/pixel_touch_check.py) | 仅诊断（两条预测 vs 触点误差 + URDF↔固件系统差），只存 `/tmp` | 怀疑抓偏/吸偏、想定位偏差来源时 |
 | 验证 · 角速度标定 | [measure_tcp_omega.launch](../src/lucky/launch/measure_tcp_omega.launch) → [measure_tcp_omega.py](../src/lucky/scripts/measure_tcp_omega.py) | `ω/v_lin` 比值 → `path_planner` 的 `omega_per_v_lin_rad_per_m` | 改了 TCP 或关节加速度/jerk 后 |
 
-**依赖链（顺序不能乱）**：手眼标定是一切的基础——手眼一变，白板标定（尤其依赖
+**依赖链（顺序不能乱）**：TCP 是最底层——手眼标定的末端就是 `link_tcp`、白板标定的所有触点
+也都按 TCP 记录，**TCP 一变，手眼 + 白板全 7 步都要重跑**（`measure_tcp_omega` 也建议复测）。手眼标定是
+其余一切的基础——手眼一变，白板标定（尤其依赖
 `camera→base` TF 的步骤 2、抓取单应性）全部失配，必须重跑。白板标定内部步骤之间也有
 依赖：重跑步骤 2 会让 3/4/5/6 失配；重跑步骤 3（网格+坐标系）会让 4/5/6 失配，且必须重跑步骤 7。
 
 ---
 
-## 0. 相机内参验证 —— [verify_camera.launch](../src/lucky/launch/verify_camera.launch)
+## 1. 末端 TCP 标定（只标 yaw）
+
+生产抓放时吸嘴**恒竖直朝下**（roll=180°、pitch=0°），唯一会变的姿态自由度是 **yaw**（J6 旋转，
+含 180° 翻转）。所以 TCP 只需要标"吸嘴尖相对法兰旋转轴的**水平偏心**"，不用 UF Studio 那种要摆
+多个倾斜姿态的四点法：
+
+- **XY 偏置（要标）**：吸嘴尖不在法兰轴线上时，yaw 一转，尖端就绕法兰轴画圆，落点误差随 yaw
+  变化（最大 = 2×偏心，出现在 180° 翻转时）。这部分误差**无法被后续白板标定吸收**，因为标定时和
+  生产时的 yaw 不同。
+- **Z 偏置（不用标）**：只绕竖直轴转时 Z 偏置不可观测，也不影响结果——白板标定的所有高度都是用同一
+  个 TCP 触碰记录、生产又用同一个 TCP 执行，常值 Z 误差前后抵消。沿用名义值 68mm（卡尺量法兰面
+  到吸嘴尖即可）。
+- **姿态偏置**：恒为 0（`path_planner` 依赖此前提，见 `path_planner_node.cpp` 中"TCP 旋转偏置为 0"）。
+
+当前值：`link6→link_tcp = (0.8, 0.3, 68.0) mm`，即各 launch 里的
+`args="0.0008 0.0003 0.068 0 0 0 link6 link_tcp"`。
+
+### 原理（180° 对点法）
+
+记 UF Studio 当前 TCP 偏置为 $t_0$（法兰系），真实吸嘴尖偏置为 $t = t_0 + \Delta t$，上报位姿为
+$P'$（按 $t_0$ 算的"假 TCP"位置）。吸嘴朝下时法兰系 x/y 轴在 base 系的水平投影为
+
+$$x(\psi) = (\cos\psi,\ \sin\psi),\qquad y(\psi) = (\sin\psi,\ -\cos\psi)$$
+
+吸嘴尖真实位置 $P = P' + \Delta t_x\,x(\psi) + \Delta t_y\,y(\psi)$。让吸嘴尖在 yaw=$\psi_1$ 和
+$\psi_1+180°$ 下对准**同一个**物理点（两个姿态的 $x,y$ 恰好反号），得
+
+$$d = P'_2 - P'_1 = 2\,[\Delta t_x\,x(\psi_1) + \Delta t_y\,y(\psi_1)]$$
+
+$$\Delta t_x = \tfrac12\,(d_x\cos\psi_1 + d_y\sin\psi_1),\qquad
+  \Delta t_y = \tfrac12\,(d_x\sin\psi_1 - d_y\cos\psi_1)$$
+
+不用把 UF Studio 的 TCP 清零——直接在当前 TCP 下测、算出的是**修正量**。
+
+### 操作步骤（UF Studio，手动）
+
+1. **准备**：拆下波纹管，用**硬吸嘴尖**标（与白板标定一致，波纹管由白板步骤 6 单独补偿）。在工作区
+   固定一个**尖锐参考点**（锥尖/针尖粘在发光板上，或发光板上一个清晰小黑点），确认 UF Studio 中 TCP
+   姿态偏置为 0。J6 摇到中段，保证后续 ±180° 旋转不越限（见 [precautions.md](precautions.md)）。
+2. **第一姿态**：设 roll=180°、pitch=0°，yaw 取 $\psi_1$（如 0°）。微动 X/Y 让吸嘴尖正对参考点
+   （Z 下到几乎贴住，从两个侧面目视/放大镜对准），记录上报的 $x_1, y_1$（mm）和 $\psi_1$。
+3. **转 180°**：只改 yaw 到 $\psi_1\pm180°$（选让 J6 往中段走的方向），**不动 Z、roll、pitch**。若
+   TCP 已准，尖端应原地不动；否则只微动 X/Y 重新对准同一点，记录 $x_2, y_2$。
+4. **计算**：按上式得 $\Delta t_x, \Delta t_y$（mm），新偏置 $t = t_0 + \Delta t$（Z 不变）。
+   建议在 $\psi_1=0°$ 和 $\psi_1=90°$ 各做一组取平均，两组相差 >0.3mm 说明对点不准，重做。
+5. **写入**（两处必须一致）：
+   - UF Studio 的 TCP 偏置（mm），保存并设为当前 TCP；
+   - 所有发布 `link6→link_tcp` 静态 TF 的 launch（单位 m）：
+     [calibrate_tool.launch](../src/lucky/launch/calibrate_tool.launch)、
+     [pixel_touch_check.launch](../src/lucky/launch/pixel_touch_check.launch)、
+     [xarm_calibration_setup.launch](../src/lucky/launch/xarm_calibration_setup.launch)、
+     [xarm_calibration_setup_moveit.launch](../src/lucky/launch/xarm_calibration_setup_moveit.launch)。
+     （`calibrate_board` 启动时会核对固件 TCP 与该 TF，差 >1mm 会告警。）
+6. **验证**：用新 TCP 重复步骤 2→3：yaw 转 180° 时吸嘴尖应基本不离开参考点（<0.3mm）。
+
+> 做完 TCP 标定后，**必须重跑手眼标定与白板标定全 7 步**（见上方依赖链）。
+
+---
+
+## 2. 相机内参验证 —— [verify_camera.launch](../src/lucky/launch/verify_camera.launch)
 
 只起 RealSense + [verify_camera_intrinsics.py](../src/lucky/scripts/verify_camera_intrinsics.py)（[verify_camera.launch](../src/lucky/launch/verify_camera.launch)），**不需要机械臂**。用于在标定前确认相机
 内参/深度尺度可信。不写任何配置。
@@ -56,7 +119,7 @@ roslaunch lucky verify_camera.launch mode:=report
 
 ---
 
-## 1. 手眼标定（Eye-on-Hand）
+## 3. 手眼标定（Eye-on-Hand）
 
 手眼标定和单应性矩阵都可以试试，二者选其一也可以，标定用的 ChArUco 板打印文件：[calib.io_charuco_200x150_8x11_15_11_DICT_4X4.pdf](../src/lucky/config/calib.io_charuco_200x150_8x11_15_11_DICT_4X4.pdf)
 
@@ -66,8 +129,8 @@ roslaunch lucky verify_camera.launch mode:=report
 
 关键约定：
 - 标定末端用**真实吸盘尖端 `link_tcp`**（不是法兰盘 `link6`）。`link_tcp` 由静态 TF
-  `args="0.0008 0.0003 0.068 0 0 0 link6 link_tcp"` 挂在 `link6` 下（单位米；此偏移经
-  `pixel_touch_check` 侧向误差诊断精修，[calibrate_tool.launch](../src/lucky/launch/calibrate_tool.launch)、
+  `args="0.0008 0.0003 0.068 0 0 0 link6 link_tcp"` 挂在 `link6` 下（单位米；XY 偏置由 [§1 TCP 标定](#1-末端-tcp-标定只标-yaw)
+  得出，也可用 `pixel_touch_check` 侧向误差诊断精修，[calibrate_tool.launch](../src/lucky/launch/calibrate_tool.launch)、
   [pixel_touch_check.launch](../src/lucky/launch/pixel_touch_check.launch)、两个 `xarm_calibration_setup*.launch`
   保持一致）。
 - `namespace_prefix=xarm6_realsense_calibration`，结果存为
@@ -78,7 +141,7 @@ roslaunch lucky verify_camera.launch mode:=report
 
 有两种采样方式：
 
-### 1a. 自动采样（不推荐）—— [xarm_calibration_setup_moveit.launch](../src/lucky/launch/xarm_calibration_setup_moveit.launch)
+### 3a. 自动采样（不推荐）—— [xarm_calibration_setup_moveit.launch](../src/lucky/launch/xarm_calibration_setup_moveit.launch)
 
 一键起 **xArm6 MoveIt 真机栈（OMPL）+ RealSense + ChArUco 检测 + easy_handeye 自动采样**。
 easy_handeye 通过 MoveIt `move_group`（SRDF 组名 `xarm6`）自动遍历多姿态采样。
@@ -97,7 +160,7 @@ roslaunch lucky xarm_calibration_setup_moveit.launch robot_ip:=192.168.1.216
 流程：在 easy_handeye 的 rviz/GUI 里点 “Next/Take sample” 让臂自动走位并采样（一般 ≥15
 个姿态），采够后点 “Compute” 计算并 “Save”。
 
-### 1b. 手动 freehand 采样 —— [xarm_calibration_setup.launch](../src/lucky/launch/xarm_calibration_setup.launch)
+### 3b. 手动 freehand 采样 —— [xarm_calibration_setup.launch](../src/lucky/launch/xarm_calibration_setup.launch)
 
 纯 **xArm 原生驱动**（`xarm6_server`，无 MoveIt），手动拖动/示教臂到不同姿态，每个姿态
 手动 “Take sample”。适合不想起 MoveIt、或想完全手控的场合。
@@ -126,7 +189,7 @@ roslaunch lucky xarm_calibration_setup.launch robot_ip:=192.168.1.216
 
 ---
 
-## 2. 白板标定 —— [calibrate_tool.launch](../src/lucky/launch/calibrate_tool.launch)
+## 4. 白板标定 —— [calibrate_tool.launch](../src/lucky/launch/calibrate_tool.launch)
 
 [calibrate_tool.launch](../src/lucky/launch/calibrate_tool.launch) 起 **MoveIt 真机栈（`realMove_exec`，启动前 J1/J4/J6
 须远离 ±360°，见 [precautions.md §2.1](precautions.md)）+ RealSense + 手眼 TF + image_proc +
@@ -244,7 +307,7 @@ ROI / 平面拟合（相机被迫降低后调）：
 
 ---
 
-## 3. 抓偏来源诊断 —— [pixel_touch_check.launch](../src/lucky/launch/pixel_touch_check.launch)
+## 5. 抓偏来源诊断 —— [pixel_touch_check.launch](../src/lucky/launch/pixel_touch_check.launch)
 
 对比"像素 → base 预测"与"实际吸嘴尖触点"，定位抓偏/吸偏到底出在**感知**还是
 **单应性/视差/执行**。[pixel_touch_check.launch](../src/lucky/launch/pixel_touch_check.launch) 一键起 **MoveIt 真机栈 + 相机 + 手眼 TF +
@@ -278,7 +341,7 @@ roslaunch lucky pixel_touch_check.launch robot_ip:=192.168.1.216
 
 ---
 
-## 4. TCP 姿态角速度标定 —— [measure_tcp_omega.launch](../src/lucky/launch/measure_tcp_omega.launch)
+## 6. TCP 姿态角速度标定 —— [measure_tcp_omega.launch](../src/lucky/launch/measure_tcp_omega.launch)
 
 测 `move_line` 的 TCP 姿态角速度 ω，换算成 `path_planner` 代价直接吃的**比值**
 `ω/v_lin`（`omega_per_v_lin_rad_per_m`，rad/m），即"多少 rad 转动 ≈ 1m 平移"的时间当量。
@@ -315,21 +378,23 @@ roslaunch lucky measure_tcp_omega.launch robot_ip:=192.168.1.216 mvvelo:=200
 ## 快速参考
 
 ```bash
-# 0) 相机内参自检（可选）
+# 1) 末端 TCP 标定：UF Studio 手动 180° 对点法（见 §1），结果写入 UF Studio + 各 launch 静态 TF
+
+# 2) 相机内参自检（可选）
 roslaunch lucky verify_camera.launch mode:=report,points known_distance_m:=0.30
 
-# 1) 手眼标定（自动采样，不推荐）
+# 3) 手眼标定（自动采样，不推荐）
 roslaunch lucky xarm_calibration_setup_moveit.launch robot_ip:=192.168.1.216
 #    或手动 freehand：
 roslaunch lucky xarm_calibration_setup.launch robot_ip:=192.168.1.216
 
-# 2) 白板标定（全 7 步）
+# 4) 白板标定（全 7 步）
 roslaunch lucky calibrate_tool.launch robot_ip:=192.168.1.216
 #    只重跑部分：启动后在提示处输入如 4,5（或预先 rosparam set /calibrate_board/steps "4,5"）
 
-# 3) 抓偏来源诊断（感知 vs 单应性/视差/执行）
+# 5) 抓偏来源诊断（感知 vs 单应性/视差/执行）
 roslaunch lucky pixel_touch_check.launch robot_ip:=192.168.1.216
 
-# 4) TCP 姿态角速度标定 → path_planner 的 omega_per_v_lin_rad_per_m
+# 6) TCP 姿态角速度标定 → path_planner 的 omega_per_v_lin_rad_per_m
 roslaunch lucky measure_tcp_omega.launch robot_ip:=192.168.1.216 mvvelo:=200
 ```

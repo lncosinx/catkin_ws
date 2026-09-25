@@ -180,6 +180,9 @@ debug（默认 `link_base`），`board_state` 从不依赖它。
 `2` T、`3` L_left、`4` L_right、`5` Z_left、`6` Z_right。改这个枚举需要同步更新所有这些。
 
 标定流程（详见 [docs/calibrate.md](docs/calibrate.md)）：
+- **末端 TCP 标定（第一步）**：吸嘴恒竖直朝下、只有 yaw 旋转，故只标吸嘴尖相对法兰轴的 XY 偏心
+  （Z 不可观测且前后抵消，沿用 68mm）。UF Studio 手动 180° 对点法算修正量，写入 UF Studio TCP 与各 launch 的
+  `link6→link_tcp` 静态 TF（两处须一致）。**TCP 一变，手眼 + 白板全 7 步都要重跑。**
 - [xarm_calibration_setup.launch](src/lucky/launch/xarm_calibration_setup.launch)（原生驱动，手动 freehand）或
   [xarm_calibration_setup_moveit.launch](src/lucky/launch/xarm_calibration_setup_moveit.launch)（MoveIt 自动采样）
   → [calibrate_xarm.launch](src/lucky/launch/calibrate_xarm.launch) —— 以 ChArUco 板

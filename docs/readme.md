@@ -149,7 +149,7 @@ rosrun lucky xarm_controller_node
 
 | 文档 | 内容 |
 |---|---|
-| [calibrate.md](calibrate.md) | 手眼 + 白板 + 抓取单应性标定全流程 |
+| [calibrate.md](calibrate.md) | 末端 TCP + 手眼 + 白板 + 抓取单应性标定全流程 |
 | [vision.md](vision.md) | 视觉感知子系统（分割、分类、抓取点）|
 | [strategy.md](strategy.md) | 策略节点（精确覆盖 / DLX 求解）|
 | [path_plan.md](path_plan.md) | 路径规划节点（坐标解算、腕部翻转、路程优化）|
@@ -192,7 +192,7 @@ cmake -D CMAKE_BUILD_TYPE=RELEASE \
   [precautions.md §2.1](precautions.md#21-启动-moveit--realmove_exec-前j1j4j6-必须远离-360-边界)）。
 
 
-> 尽人事，听天命。最后，非常感谢往届学长学姐的帮助与支持。
+> 尽人事，听天命。最后，非常感谢老师以及往届学长学姐的帮助与支持。
 
 ## 附：团队设计草图
 
